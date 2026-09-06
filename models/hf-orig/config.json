@@ -1,0 +1,33 @@
+{
+  "a_low_rank_dim": 64,
+  "architectures": [
+    "Rwkv7ForCausalLM"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_rwkv7.Rwkv7Config",
+    "AutoModelForCausalLM": "modeling_rwkv7.Rwkv7ForCausalLM"
+  },
+  "bos_token_id": 0,
+  "decay_low_rank_dim": 64,
+  "dtype": "bfloat16",
+  "eos_token_id": 0,
+  "gate_low_rank_dim": 128,
+  "head_dim": 64,
+  "hidden_size": 768,
+  "intermediate_size": 3072,
+  "max_position_embeddings": 4096,
+  "model_type": "rwkv7",
+  "norm_bias": true,
+  "norm_eps": 1e-05,
+  "num_heads": 12,
+  "num_hidden_layers": 12,
+  "pad_token_id": 0,
+  "tie_word_embeddings": false,
+  "transformers_version": "5.15.0.dev0",
+  "use_cache": true,
+  "use_deep_embed": false,
+  "v_low_rank_dim": 32,
+  "vocab_size": 65536,
+  "wkv_implementation": "eager",
+  "wkv_state_dtype": "float32"
+}

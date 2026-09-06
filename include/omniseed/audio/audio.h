@@ -18,6 +18,7 @@
 // =============================================================================
 #pragma once
 
+#include "omniseed/core/gguf_loader.h"
 #include "omniseed/core/tensor.h"
 
 #include <string>
@@ -70,12 +71,25 @@ public:
     // (deterministic), so callers can be tested end-to-end.
     bool transcribe(const PcmAudio& audio, std::string& out_text) const;
 
+    // Real encoder pass (requires converted whisper-tiny sidecar weights):
+    // mel -> conv stem -> transformer blocks -> [T/2, 384] encoded frames.
+    bool encode(const PcmAudio& audio, Tensor& out) const;
+
 private:
+    // Owns the mmap the fp16 encoder views point into (must outlive them).
+    GgufLoader store_;
     WhisperHparams hp_{};
     Tensor mel_filters_;      // fp32 [n_mels, 201]
     bool  weights_loaded_ = false;
-    std::vector<Tensor> enc_tensors_;
-    Tensor vocab_;            // i32 token strings handled via Tokenizer
+    // encoder tensors (fp16, from whisper-tiny via tools/convert_senses.py)
+    Tensor conv1_w_, conv1_b_, conv2_w_, conv2_b_;
+    Tensor pos_embed_;        // [1500, 384]
+    Tensor enc_ln_w_, enc_ln_b_;
+    struct EncBlock {
+        Tensor q_w_, q_b_, k_w_, k_b_, v_w_, v_b_, o_w_, o_b_;
+        Tensor ln1_w_, ln1_b_, fc1_w_, fc1_b_, fc2_w_, fc2_b_, ln2_w_, ln2_b_;
+    };
+    std::vector<EncBlock> enc_blocks_;
     bool valid_ = false;
     mutable std::string error_;   // set even from const methods
 };

@@ -131,13 +131,16 @@ bool GgufLoader::read_metadata() {
 // Tensor directory: name, n_dims, ne[], dtype, offset (relative to data start)
 // ===========================================================================
 namespace {
+// Bytes per ELEMENT for GGUF tensor dtypes. TERNARY packs two weights per
+// byte, so it is reported in HALF-bytes: multiply by (numel + 1) / 2 at the
+// call site (see read_tensor_dir).
 size_t gguf_dtype_size(gguf::GgufDType t) {
     switch (t) {
         case gguf::GgufDType::F32:     return 4;
         case gguf::GgufDType::F16:     return 2;
         case gguf::GgufDType::I8:      return 1;
         case gguf::GgufDType::I32:     return 4;
-        case gguf::GgufDType::TERNARY: return 1;   // 2 weights/byte
+        case gguf::GgufDType::TERNARY: return 0;   // handled specially (2/byte)
         default:                       return 0;
     }
 }
@@ -185,14 +188,17 @@ bool GgufLoader::read_tensor_dir() {
         // Compute byte size; GGUF dims are reversed vs row-major.
         int64_t numel = 1;
         for (const int64_t d : info.dims) numel *= d;
+        const bool is_ternary = (ggtype == GgufDType::TERNARY);
         const size_t esz = gguf_dtype_size(ggtype);
-        if (esz == 0) {
+        if (esz == 0 && !is_ternary) {
             error_ = "tensor '" + info.name + "': unsupported dtype " +
                      std::to_string(static_cast<int>(ggtype));
             return false;
         }
         info.type   = ggtype;   // store raw GGUF dtype
-        info.nbytes = static_cast<uint64_t>(numel) * esz;
+        info.nbytes = is_ternary
+                          ? static_cast<uint64_t>((numel + 1) / 2)  // 2 weights/byte
+                          : static_cast<uint64_t>(numel) * esz;
 
         tensor_index_[info.name] = tensors_.size();
         tensors_.push_back(std::move(info));

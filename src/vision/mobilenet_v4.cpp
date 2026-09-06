@@ -161,11 +161,15 @@ void patch_features(const Image& in, int32_t grid, int32_t C,
 // GGUF loading
 // ---------------------------------------------------------------------------
 bool VisionEncoder::load(const std::string& gguf_path) {
-    GgufLoader gg;
-    if (!gg.open(gguf_path)) {
-        error_ = gg.error();
+    // Keep the loader (and its mmap) alive: proj_w_ below is a non-owning
+    // view into the mapped file. A local GgufLoader would unmap on return
+    // and leave proj_w_ dangling (same bug class as the Phase 7 loader fix).
+    store_.close();
+    if (!store_.open(gguf_path)) {
+        error_ = store_.error();
         return false;
     }
+    const GgufLoader& gg = store_;
 
     cfg_.input_size =
         static_cast<int32_t>(gg.get_u64("vision.input_size", 96));
@@ -186,8 +190,33 @@ bool VisionEncoder::load(const std::string& gguf_path) {
         proj_w_ = Tensor("vision.proj.weight",
                          {t.dim(0), t.dim(1)}, DType::TERNARY,
                          const_cast<void*>(t.data()));
+        // Debug: sweep the full packed region once at load time.
+        if (std::getenv("OMNISEED_DBG")) {
+            const uint8_t* p = proj_w_.packed();
+            if (p == nullptr) {
+                std::fprintf(stderr, "[sweep] proj NULL data n=%lld\n",
+                             (long long)proj_w_.numel());
+            } else {
+                uint64_t s = 0;
+                for (int64_t i = 0; i < static_cast<int64_t>(proj_w_.nbytes()); ++i) s += p[i];
+                std::fprintf(stderr, "[sweep] proj n=%lld bytes=%lld sum=%llu\n",
+                             (long long)proj_w_.numel(), (long long)proj_w_.nbytes(),
+                             (unsigned long long)s);
+            }
+            std::fflush(stderr);
+        }
+        // Per-row scales (fp32 tensor) are the accurate form; the f64
+        // metadata scalar is the legacy fallback.
+        if (gg.has_tensor("vision.proj.scale")) {
+            Tensor s = gg.tensor("vision.proj.scale");
+            if (s.dtype() == DType::F32 && s.numel() == t.dim(0)) {
+                proj_scales_ = Tensor("vision.proj.scale", s.shape(), DType::F32);
+                std::memcpy(proj_scales_.data(), s.data(), s.nbytes());
+            }
+        }
         proj_scale_ = static_cast<float>(
-            gg.get_f64("vision.proj.scale", 1.0));
+            gg.get_f64("vision.proj.scale_mean",
+                       gg.get_f64("vision.proj.scale", 1.0)));
         if (gg.has_tensor("vision.proj.bias")) {
             Tensor b = gg.tensor("vision.proj.bias");
             proj_bias_ = Tensor("vision.proj.bias", b.shape(), DType::F32);
@@ -195,7 +224,6 @@ bool VisionEncoder::load(const std::string& gguf_path) {
         }
     }
     // Backbone conv weights: loaded by the Phase 3 converter integration.
-
     valid_ = true;
     return true;
 }
@@ -239,15 +267,30 @@ bool VisionEncoder::encode(const Image& img, Tensor& out_tokens,
     out_tokens = Tensor("vision_out",
                         {M, static_cast<int64_t>(cfg_.out_dim)}, DType::F32);
 
-    if (proj_w_.numel() > 0) {
+    // NOTE: a default-constructed (absent) Tensor has numel()==1 with a null
+    // data pointer, so "optional tensor present" must be tested with numel() > 1.
+    if (proj_w_.numel() > 1) {
         for (int64_t i = 0; i < M; ++i) {
-            bitnet::bitlinear_forward(
-                proj_w_.packed(),
-                proj_bias_.numel() > 0 ? proj_bias_.f32() : nullptr,
-                proj_scale_,
-                m.f32() + i * cfg_.feat_channels,
-                out_tokens.f32() + i * cfg_.out_dim,
-                cfg_.out_dim, cfg_.feat_channels);
+            if (proj_scales_.numel() == cfg_.out_dim) {
+                bitnet::bitlinear_forward_rows(
+                    proj_w_.packed(), proj_scales_.f32(),
+                    m.f32() + i * cfg_.feat_channels,
+                    out_tokens.f32() + i * cfg_.out_dim,
+                    cfg_.out_dim, cfg_.feat_channels);
+                if (proj_bias_.numel() > 1) {
+                    float* dst = out_tokens.f32() + i * cfg_.out_dim;
+                    for (int32_t o = 0; o < cfg_.out_dim; ++o)
+                        dst[o] += proj_bias_.f32()[o];
+                }
+            } else {
+                bitnet::bitlinear_forward(
+                    proj_w_.packed(),
+                    proj_bias_.numel() > 1 ? proj_bias_.f32() : nullptr,
+                    proj_scale_,
+                    m.f32() + i * cfg_.feat_channels,
+                    out_tokens.f32() + i * cfg_.out_dim,
+                    cfg_.out_dim, cfg_.feat_channels);
+            }
         }
     } else {
         // Projection head not loaded: copy features into out_dim slice.

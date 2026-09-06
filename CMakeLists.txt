@@ -177,6 +177,18 @@ if(OMNISEED_BUILD_TESTS)
     endif()
     add_test(NAME omniseed_real_weights COMMAND omniseed_real_weights
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(omniseed_sides tests/test_sides.cpp)
+    target_include_directories(omniseed_sides PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_sides PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_sides PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_sides PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_sides COMMAND omniseed_sides
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # --------------------------------- CLI binary --------------------------------

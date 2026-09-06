@@ -240,7 +240,7 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
                            const_cast<void*>(t.data()));
             head_scales_ = load_f32(gg, "head.scale", error_, false);
             Tensor s = load_f32(gg, "head.scale0", error_, false);   // legacy
-            head_scale_ = s.numel() > 0 ? s.f32()[0] : 1.0f;
+            head_scale_ = s.numel() > 1 ? s.f32()[0] : 1.0f;
         } else if (t.dtype() == DType::I8) {
             // Preferred layout: per-row int8 + fp32 scales straight from the
             // GGUF — rides the AVX2/SSE i8 kernel, halves head memory.
@@ -471,7 +471,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
     }
 
     // ln0 (present in RWKV-7 world models)
-    if (ln0_w_.numel() > 0) {
+    if (ln0_w_.numel() > 1) {   // absent tensors: numel()==1, data()==nullptr
         Tensor xin("xin", {E}, DType::F32);
         Tensor xout("xout", {E}, DType::F32);
         std::memcpy(xin.f32(), x.data(), E * sizeof(float));

@@ -11,9 +11,8 @@
 //  Peak RAM for the vision path must stay under ~30 MB (blueprint budget).
 // =============================================================================
 #pragma once
-
 #include "omniseed/core/tensor.h"
-
+#include "omniseed/core/gguf_loader.h"
 #include <string>
 #include <vector>
 
@@ -86,6 +85,8 @@ public:
                 const UniCompress& compressor) const;
 
 private:
+    // Keeps the GGUF mmap alive: proj_w_ is a non-owning view into it.
+    GgufLoader store_;
     VisionConfig cfg_;
     bool valid_ = false;
     mutable std::string error_;   // set even from const encode()
@@ -94,6 +95,7 @@ private:
     std::vector<Tensor> conv_weights_;
     std::vector<Tensor> conv_scales_;
     Tensor proj_w_;     // ternary [out_dim, feat_channels]
+    Tensor proj_scales_;// fp32 [out_dim] per-row (preferred)
     float proj_scale_ = 1.0f;
     Tensor proj_bias_;  // fp32 [out_dim]
 };

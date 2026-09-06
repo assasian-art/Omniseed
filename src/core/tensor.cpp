@@ -97,6 +97,10 @@ int64_t Tensor::numel() const {
 }
 
 size_t Tensor::nbytes() const {
+    // TERNARY packs two weights per byte: the stored region is (numel+1)/2
+    // bytes, not numel. This must match GgufLoader::read_tensor_dir.
+    if (dtype_ == DType::TERNARY)
+        return static_cast<size_t>((numel() + 1) / 2);
     return static_cast<size_t>(numel()) * dtype_size(dtype_);
 }
 
