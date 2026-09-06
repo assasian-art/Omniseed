@@ -11,7 +11,20 @@
 #      * whisper.pos_embed     F16 [1500,384]
 #      * whisper.enc_ln.*      F16 [384]
 #      * whisper.enc.N.{ln1,ln2,q,k,v,out,fc1,fc2}.{weight,bias} F16
-#      metadata: whisper.{n_mels,n_audio_ctx,n_audio_state,n_audio_head,n_audio_layer}
+#      * whisper.dec.tok_embd  F16 [51865,384]  (tied lm_head)
+#      * whisper.dec.pos_embed F16 [448,384]
+#      * whisper.dec.N.{ln1,ln2,ln3,self.q/k/v/out,cross.q/k/v/out,
+#                        fc1,fc2}.{weight,bias} F16
+#      * whisper.dec_ln.*      F16 [384]
+#      * whisper.vocab_offsets I32 [V+1]  } piece bytes: pieces are stored
+#      * whisper.vocab_bytes   I8  [N]    } unicode->byte mapped, concatenated
+#                                           (loader has no string-array dtype)
+#      metadata: whisper.{n_mels,n_audio_ctx,n_audio_state,n_audio_head,
+#                        n_audio_layer,n_vocab,n_dec_layer}
+#
+#      Sidecar bias convention: present = full extent, absent = tolerated
+#      (load_f16(..., required=false)); never dereference an optional bias
+#      without the numel() > 1 guard.
 #
 #    models/vision-proj.gguf
 #      * vision.proj.weight    TERNARY [out_dim, C]  (per-row packed 2/byte)
@@ -20,10 +33,11 @@
 #      metadata: vision.{input_size,grid_side,feat_channels,out_dim}
 #
 #  The C++ side (src/audio/whisper_tiny.cpp, src/vision/mobilenet_v4.cpp)
-#  already consumes exactly these tensor names.
+#  consumes exactly these tensor names.
 # =============================================================================
 import argparse
 import json
+import os
 import struct
 import sys
 
@@ -111,6 +125,43 @@ def f16_bytes(w):
     return np.ascontiguousarray(w, dtype='<f2').tobytes()
 
 
+def bytes_to_unicode():
+    """The standard GPT-2 byte<->unicode table (whisper uses the same)."""
+    bs = (list(range(ord('!'), ord('~') + 1)) +
+          list(range(ord('\u00a1'), ord('\u00ac') + 1)) +
+          list(range(ord('\u00ae'), ord('\u00ff') + 1)))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, [chr(c) for c in cs]))
+
+
+def load_whisper_vocab(path, n_vocab=51865):
+    """id -> raw bytes for the whisper vocab (tokenizer.json from HF)."""
+    with open(path, 'r', encoding='utf-8') as f:
+        tj = json.load(f)
+    vocab = tj['model']['vocab']                  # piece -> id
+    u2b = {v: k for k, v in bytes_to_unicode().items()}
+    pieces = [''] * n_vocab
+    for piece, tid in vocab.items():
+        if 0 <= tid < n_vocab:
+            if piece.startswith('<|') and piece.endswith('|>'):
+                pieces[tid] = piece.encode('utf-8')
+            else:
+                pieces[tid] = bytes(u2b.get(ch, ord(ch) & 0xFF) for ch in piece)
+    # whisper ids >= 50258 (language/timestamp/task specials) live in
+    # added_tokens, not model.vocab
+    for at in tj.get('added_tokens', []):
+        tid = at['id']
+        if 0 <= tid < n_vocab:
+            pieces[tid] = at['content'].encode('utf-8')
+    return pieces
+
+
 def quantize_ternary_rows(W):
     """BitNet b1.58 per-row ternary; returns packed bytes + row scales."""
     rows, cols = W.shape
@@ -193,6 +244,70 @@ def convert_whisper(args, w):
     return n_layers
 
 
+def convert_decoder(args, w):
+    """whisper-tiny DECODER: token embedding (tied lm_head), positional
+    embeddings, 4 pre-LN blocks (self-attn + cross-attn + MLP), final LN,
+    and the byte-level vocab (offsets + bytes tensors)."""
+    header, ds = load_safetensors(args.whisper)
+
+    def T(k):
+        return read_st(args.whisper, header, ds, k)
+
+    def add16(name, arr):
+        w.add_tensor(name, arr.shape, F16, f16_bytes(arr))
+
+    # token embedding doubles as the lm_head (whisper ties them)
+    tok = T('model.decoder.embed_tokens.weight')            # [V, 384]
+    w.add_tensor('whisper.dec.tok_embd', tok.shape, F16, f16_bytes(tok))
+    add16('whisper.dec.pos_embed', T('model.decoder.embed_positions.weight'))
+    add16('whisper.dec_ln.weight', T('model.decoder.layer_norm.weight'))
+    add16('whisper.dec_ln.bias', T('model.decoder.layer_norm.bias'))
+
+    n_layers = 4
+    for l in range(n_layers):
+        cp = f'model.decoder.layers.{l}.'
+        p = f'whisper.dec.{l}.'
+        add16(p + 'ln1.weight', T(cp + 'self_attn_layer_norm.weight'))
+        add16(p + 'ln1.bias', T(cp + 'self_attn_layer_norm.bias'))
+        add16(p + 'ln2.weight', T(cp + 'encoder_attn_layer_norm.weight'))
+        add16(p + 'ln2.bias', T(cp + 'encoder_attn_layer_norm.bias'))
+        add16(p + 'ln3.weight', T(cp + 'final_layer_norm.weight'))
+        add16(p + 'ln3.bias', T(cp + 'final_layer_norm.bias'))
+        for src, dst in (('self_attn.q_proj', 'self.q'),
+                         ('self_attn.k_proj', 'self.k'),
+                         ('self_attn.v_proj', 'self.v'),
+                         ('self_attn.out_proj', 'self.out'),
+                         ('encoder_attn.q_proj', 'cross.q'),
+                         ('encoder_attn.k_proj', 'cross.k'),
+                         ('encoder_attn.v_proj', 'cross.v'),
+                         ('encoder_attn.out_proj', 'cross.out')):
+            add16(p + dst + '.weight', T(cp + src + '.weight'))
+            # whisper-tiny ships NO k_proj bias (self- and cross-attn)
+            if cp + src + '.bias' in header:
+                add16(p + dst + '.bias', T(cp + src + '.bias'))
+        add16(p + 'fc1.weight', T(cp + 'fc1.weight'))
+        add16(p + 'fc1.bias', T(cp + 'fc1.bias'))
+        add16(p + 'fc2.weight', T(cp + 'fc2.weight'))
+        add16(p + 'fc2.bias', T(cp + 'fc2.bias'))
+
+    # vocab: piece bytes, unicode-mapped back to raw bytes (byte-level BPE),
+    # concatenated + offsets (loader has no string-array dtype). Special
+    # <|...|> tokens keep their literal UTF-8 bytes.
+    pieces = load_whisper_vocab(args.vocab_json, tok.shape[0])
+    blobs, offs = [], [0]
+    for pc in pieces:
+        blobs.append(pc)
+        offs.append(offs[-1] + len(pc))
+    all_bytes = b''.join(blobs)
+    w.add_tensor('whisper.vocab_offsets', np.asarray(offs, dtype='<i4').shape,
+                 F32, np.ascontiguousarray(offs, dtype='<i4').tobytes())
+    w.add_tensor('whisper.vocab_bytes', (len(all_bytes),), F16,
+                 np.frombuffer(all_bytes, dtype=np.uint8).astype('<f2').tobytes())
+    w.add_u64('whisper.n_vocab', tok.shape[0])
+    w.add_u64('whisper.n_dec_layer', n_layers)
+    return n_layers
+
+
 def convert_vision(args, w):
     # The C++ encoder consumes a ternary projection [out_dim, C] applied to
     # per-patch RGB statistics. Derive that projection with a fixed random
@@ -219,12 +334,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--whisper', default='models/whisper-tiny.safetensors')
     ap.add_argument('--mel-npz', default='models/mel_filters.npz')
+    ap.add_argument('--vocab-json',
+                    default='models/whisper-tiny-tokenizer.json')
     ap.add_argument('--out-whisper', default='models/whisper-tiny-encoder.gguf')
     ap.add_argument('--out-vision', default='models/vision-proj.gguf')
     args = ap.parse_args()
-
-    import os
-    globals()['os'] = os
 
     w = GgufWriter()
     w.add_str('general.architecture', 'omniseed-whisper-encoder')
@@ -234,8 +348,15 @@ def main():
     w.add_u64('whisper.n_audio_state', 384)
     w.add_u64('whisper.n_audio_head', 6)
     w.add_u64('whisper.n_audio_layer', n_layers)
+    try:
+        n_dec = convert_decoder(args, w)
+    except (OSError, KeyError, SystemExit) as e:
+        print(f'[conv] decoder not converted: {e}')
+        n_dec = 0
     size = w.write(args.out_whisper)
-    print(f'[conv] {args.out_whisper}: {size:,} bytes ({size/1048576:.1f} MB)')
+    dec_note = f' + decoder ({n_dec} blocks)' if n_dec else ''
+    print(f'[conv] {args.out_whisper}: {size:,} bytes ({size/1048576:.1f} MB)'
+          f'{dec_note}')
 
     v = GgufWriter()
     v.add_str('general.architecture', 'omniseed-vision-proj')

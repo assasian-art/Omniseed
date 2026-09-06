@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <vector>
 
 using namespace omniseed;
@@ -105,6 +106,27 @@ int main() {
             for (int64_t i = 0; i < enc.numel(); ++i)
                 if (!std::isfinite(enc.f32()[i])) { finite = false; break; }
             CHECK(finite);
+
+            // ---- real greedy decoder (when the sidecar has it) ------------
+            if (wh.decoder_loaded()) {
+                std::printf("  decoder loaded — transcribing 5s silence…\n");
+                std::fflush(stdout);
+                PcmAudio silence = make_tone(0.0, 5.0);   // 0 Hz = digital silence
+                std::string text;
+                const std::clock_t t0 = std::clock();
+                CHECK(wh.transcribe(silence, text));
+                const double secs =
+                    static_cast<double>(std::clock() - t0) / CLOCKS_PER_SEC;
+                std::printf("  transcribe: \"%s\" (%.1fs)\n",
+                            text.c_str(), secs);
+                std::fflush(stdout);
+                CHECK(secs < 30.0);                       // no pathological loop
+                CHECK(text.size() < 4096);                // bounded output
+                for (const char c : text)                 // printable/UTF-8 bytes
+                    CHECK(static_cast<unsigned char>(c) >= 0x09);
+            } else {
+                std::printf("  [skip] sidecar has no decoder tensors\n");
+            }
         }
     } else {
         std::printf("  [skip] whisper sidecar not present\n");
