@@ -23,6 +23,7 @@
 
 #include "omniseed/core/tensor.h"
 #include "omniseed/core/bitlinear.h"
+#include "omniseed/core/fft.h"
 #include "omniseed/core/gguf_format.h"
 #include "omniseed/runtime/sensory.h"
 #include "omniseed/runtime/emotional.h"
@@ -277,6 +278,73 @@ static PcmAudio make_tone(double hz, double seconds, int32_t sr = 16000) {
     }
     return a;
 }
+
+static void test_fft_matches_dft() {
+    TEST("fft: Bluestein exact-bin DFT matches naive O(N^2) reference");
+    constexpr size_t N = 400, BINS = 201;
+
+    // deterministic pseudo-random signal (LCG)
+    std::vector<float> x(N);
+    uint32_t s = 42;
+    for (size_t i = 0; i < N; ++i) {
+        s = s * 1664525u + 1013904223u;
+        x[i] = static_cast<float>(static_cast<double>(s >> 8) / 8388608.0 - 1.0);
+    }
+
+    // naive reference: bins 0..BINS-1 of the length-N DFT
+    double ref_re[BINS], ref_im[BINS];
+    for (size_t k = 0; k < BINS; ++k) {
+        double re = 0.0, im = 0.0;
+        for (size_t t = 0; t < N; ++t) {
+            const double ang = -2.0 * 3.14159265358979323846 *
+                               static_cast<double>(k) * static_cast<double>(t) /
+                               static_cast<double>(N);
+            re += static_cast<double>(x[t]) * std::cos(ang);
+            im += static_cast<double>(x[t]) * std::sin(ang);
+        }
+        ref_re[k] = re;
+        ref_im[k] = im;
+    }
+
+    dsp::DftBins dft(N, BINS);
+    double got_re[BINS], got_im[BINS];
+    dft.run(x.data(), got_re, got_im);
+
+    double max_err = 0.0;
+    double scale = 0.0;
+    for (size_t k = 0; k < BINS; ++k) {
+        max_err = std::max(max_err, std::fabs(got_re[k] - ref_re[k]));
+        max_err = std::max(max_err, std::fabs(got_im[k] - ref_im[k]));
+        scale = std::max(scale, std::fabs(ref_re[k]));
+        scale = std::max(scale, std::fabs(ref_im[k]));
+    }
+    CHECK(max_err < 1e-6 * std::max(scale, 1.0));
+
+    // power-spectrum equivalence on a tone (mel front end uses |X|^2)
+    PcmAudio tone = make_tone(440.0, 0.5);
+    std::vector<float> sig(tone.samples.begin(), tone.samples.begin() + N);
+    dft.run(sig.data(), got_re, got_im);
+    double pk_got = 0.0, pk_ref = 0.0;
+    size_t k_got = 0, k_ref = 0;
+    for (size_t k = 1; k < BINS; ++k) {
+        const double pg = got_re[k] * got_re[k] + got_im[k] * got_im[k];
+        if (pg > pk_got) { pk_got = pg; k_got = k; }
+    }
+    for (size_t k = 1; k < BINS; ++k) {
+        double re = 0.0, im = 0.0;
+        for (size_t t = 0; t < N; ++t) {
+            const double ang = -2.0 * 3.14159265358979323846 *
+                               static_cast<double>(k) * static_cast<double>(t) /
+                               static_cast<double>(N);
+            re += static_cast<double>(sig[t]) * std::cos(ang);
+            im += static_cast<double>(sig[t]) * std::sin(ang);
+        }
+        const double pr = re * re + im * im;
+        if (pr > pk_ref) { pk_ref = pr; k_ref = k; }
+    }
+    CHECK(k_got == k_ref);
+}
+
 
 // Helper bridging the private safe_arithmetic through public behavior.
 // (defined before test_flash_skills_and_synthesis uses it)
@@ -757,6 +825,7 @@ int main() {
     test_ternary_matmul();
     test_bitlinear_train_step();
     test_gguf_magic();
+    test_fft_matches_dft();
 
     // Novel capabilities + extended stacks.
     test_sensory_fingerprint();

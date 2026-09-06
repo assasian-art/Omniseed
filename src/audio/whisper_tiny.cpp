@@ -5,6 +5,7 @@
 //  400-sample FFT window, 160-sample hop = 100 frames/s).
 // =============================================================================
 #include "omniseed/audio/audio.h"
+#include "omniseed/core/fft.h"
 #include "omniseed/core/gguf_loader.h"
 #include "omniseed/core/platform.h"
 
@@ -95,26 +96,10 @@ void hann_window(std::vector<float>& w, size_t n) {
     }
 }
 
-// Naive DFT power spectrum (N=400) — dependency-free; the Phase 3 pass swaps
-// in a precomputed twiddle-factor FFT. O(N^2) per frame is acceptable for
-// bring-up (400^2 * 3000 frames ~= 5e8 mults, ~1s).
-void dft_power(const float* frame, const std::vector<float>& win,
-               size_t n_fft, std::vector<float>& power) {
-    const size_t n_bins = n_fft / 2 + 1;   // 201
-    power.assign(n_bins, 0.0f);
-    for (size_t k = 0; k < n_bins; ++k) {
-        double re = 0.0, im = 0.0;
-        for (size_t t = 0; t < n_fft; ++t) {
-            const float s = frame[t] * win[t];
-            const double ang = -2.0 * 3.14159265358979323846 *
-                               static_cast<double>(k) * static_cast<double>(t) /
-                               static_cast<double>(n_fft);
-            re += s * std::cos(ang);
-            im += s * std::sin(ang);
-        }
-        power[k] = static_cast<float>(re * re + im * im);
-    }
-}
+// Bluestein/chirp-z DFT via radix-2 FFT (see omniseed/core/fft.h): evaluates
+// the exact N=400 bins 0..200 in O(N log N) — bit-compatible with the naive
+// DFT it replaces (same bin definition, same mel filterbank input).
+// (The Phase 3 O(N^2) placeholder lived here; TASK 4 replaced it.)
 
 // Slaney-style mel filterbank (matches whisper.cpp mel_filters defaults).
 std::vector<float> build_mel_filters(int n_mels, int n_fft, int sample_rate) {
@@ -207,10 +192,20 @@ bool WhisperTiny::compute_mel(const PcmAudio& audio, Tensor& mel) const {
                  DType::F32);
     std::vector<float> frame(kFft), power(n_bins);
 
+    // FFT-based exact-bin DFT (replaces the O(N^2) naive transform).
+    static const dsp::DftBins dft(static_cast<size_t>(kFft),
+                                  static_cast<size_t>(n_bins));
+    std::vector<double> fre(n_bins), fim(n_bins);
+
     for (size_t f = 0; f < n_frames; ++f) {
         for (int t = 0; t < kFft; ++t)
-            frame[static_cast<size_t>(t)] = audio.samples[f * kHop + t];
-        dft_power(frame.data(), win, kFft, power);
+            frame[static_cast<size_t>(t)] =
+                audio.samples[f * kHop + t] * win[static_cast<size_t>(t)];
+        dft.run(frame.data(), fre.data(), fim.data());
+        for (int b = 0; b < n_bins; ++b)
+            power[static_cast<size_t>(b)] = static_cast<float>(
+                fre[static_cast<size_t>(b)] * fre[static_cast<size_t>(b)] +
+                fim[static_cast<size_t>(b)] * fim[static_cast<size_t>(b)]);
 
         // mel projection + log10 with whisper.cpp's max-clamping semantics
         float max_mel = -1e30f;

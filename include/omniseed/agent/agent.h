@@ -171,6 +171,11 @@ public:
         int32_t  max_turns      = 6;
         int32_t  retrieve_k     = 3;     // crystals injected per turn
         bool     allow_tools    = true;
+        // Sampling (temperature <= 0 => greedy). Seeded SplitMix64 stream:
+        // deterministic across runs with the same seed.
+        float    temperature    = 0.0f;
+        int32_t  top_k          = 0;
+        uint64_t seed           = 42;
     };
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,

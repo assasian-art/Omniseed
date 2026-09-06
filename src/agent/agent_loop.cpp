@@ -58,10 +58,13 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
     std::string out;
     Tensor logits("logits", {model_.config().n_vocab}, DType::F32);
     int32_t cursor = seed_token;
+    uint64_t rng = cfg_.seed;
 
     for (int32_t i = 0; i < max_tokens; ++i) {
         model_.forward(cursor, st, logits);
-        const int32_t id = model_.greedy_pick(logits);
+        const int32_t id = cfg_.temperature > 0.0f
+            ? model_.sample_token(logits, cfg_.temperature, cfg_.top_k, rng)
+            : model_.greedy_pick(logits);
         if (id == Tokenizer::kEosId) break;
 
         const std::string piece = tok_.piece(id);

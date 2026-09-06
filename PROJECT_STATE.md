@@ -15,9 +15,11 @@ GLM-5.3-FLASH
   untested here.
 - **Build:** `build.bat` (auto-detects VS via vswhere) or
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
-- **Test:** `build\bin\omniseed_tests.exe` — **163/163 passing** (zero warnings /W4)
-- **Last updated:** Full spec audit complete; all 7 novel capabilities implemented;
-  master spec generated (`docs/OMNISEED_MASTER_SPEC.md` + `.html`)
+- **Test:** `build\bin\omniseed_tests.exe` — **165/165 passing** +
+  `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
+- **Last updated:** PHASE 7 COMPLETE — real RWKV-7 0.1B world weights converted,
+  loaded, and generating coherent English inside the <300 MB budget. GGUF loader
+  data-offset bug found & fixed. Sampling + FFT landed.
 
 ---
 
@@ -110,40 +112,59 @@ See AUDIT SUMMARY table above; plus `agent_intel.*`, `audio_events.*`,
 
 ---
 
+## 2b. PHASE 7 — REAL WEIGHTS + VALIDATION ✅ (committed: 4a695d2)
+
+**The kernel has a real brain.** `models/rwkv7-0.1B-ternary.gguf` (280 MB,
+RWKV-7 "World" 0.1B v2) loads in the pure-C++17 runtime and generates
+coherent English: greedy "Hello" → 160-token grammatical reply; sampled
+(temp 0.8, top-k 40) → "Hello! Thanks for using my chatbot. Can you provide
+me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
+300 MB); 12 layers/768 embd/65536 vocab; ~1.4 tok/s single-thread scalar.
+
+| Piece | Detail |
+|---|---|
+| Converter | `tools/convert_to_omniseed.py` (offline; venv at `.venv/` with torch). Maps `Hakureirm/rwkv7-0.1b-hf` safetensors (`rwkv7.` prefix, LoRA factors are raw `[E,rank]`/`[rank,E]` params applied `x@w1@w2`, stored **transposed** for C++ row-major) → OmniSeed GGUF: per-row int8 linears + fp32 `.scale` tensors, fp16 `token.embd`/`head.weight`, fp32 norms/mixes/biases/`k_k`/`k_a`/`r_k`/`gn`, packed 65,536-piece world vocab + special-id metadata (eos=0). `--check-prompt` runs a full fp32 torch reference forward. |
+| Quantization decision | **PTQ ternary b1.58 is too lossy without QAT** — verified in torch fp32 (`tools/quant_sim.py`): ternary model degenerates even with perfect math. Per-row symmetric int8 (1 byte/param, 2× smaller than fp16) reproduces the fp16 oracle near-exactly and stays coherent. LoRA factors currently ride along as int8 too. Ternary returns via QAT (NEXT STEPS). |
+| Roundtrip validator | `tools/check_gguf.py` — byte-parses the GGUF exactly like the C++ loader, dequantizes, diffs vs source safetensors: **220/220 tensors exact**. |
+| Oracle chain | `tools/oracle_hf.py` (official HF impl → coherent English), `tools/diff_vs_hf.py` (per-block hidden-state diff vs my numpy reference → matched to 1e-5 after fixing the unprefixed `head.weight` lookup). |
+| **Critical bug fixed** | `GgufLoader::read_tensor_dir` treated tensor offsets as relative to the **post-metadata** position; the GGUF spec places data after the **tensor directory**. Every tensor read was shifted into directory bytes → garbage/NaN weights. The synthetic test GGUF never caught it because its tests only checked metadata, not bytes. Fixed: `data_start_` = post-directory; bounds checked after. Symptom chain: NaN `sc_r` → NaN logits; traced with env-gated `OMNISEED_DEBUG_NAN=1` instrumentation (kept in `rwkv.cpp`). |
+| Sampling (TASK 4) | `RwkvModel::sample_token(logits, temperature, top_k, seed&)` — SplitMix64, deterministic per seed; `AgentLoop::Config{temperature, top_k, seed}`; CLI `--temperature/--top-k/--seed` on `gen`. Greedy default unchanged. |
+| FFT (TASK 4) | `include/omniseed/core/fft.h` — radix-2 + **Bluestein chirp-z** for exact N=400 bins 0..200 with M=1024 (O(N log N), same bins as the naive DFT it replaces). Wired into `whisper_tiny.cpp` log-mel. Test: matches naive DFT to 1e-6, identical tone bin. |
+| Real-weights test | `tests/test_real_weights.cpp` (13 checks): skips when the model file is absent; asserts config, finite logits, recorded greedy continuation (±2 tie window), sampling determinism, <300 MB RSS. Registered as ctest `omniseed_real_weights` (WD = repo root; `omniseed_platform` got the same fix). ctest: **2/2 suites pass**. |
+
 ## 3. NEXT STEPS (in order)
 
-1. **Weights converter** (`tools/convert_to_omniseed.py` — offline, NOT runtime):
-   RWKV-7 World `.pth` + tokenizer → ternary GGUF with the exact tensor names
-   `src/core/rwkv.cpp` expects (`blocks.N.att.{receptance,key,value,output,w1,w2,
-   a1,a2,g1,g2,v1,v2}.weight` + `.scale`, `blocks.N.att.{tmix_*,w_bias,a_bias,
-   v_bias,k_k,k_a,r_k,gn.*}`, `blocks.N.ffn.{tmix_v,key,value}`, `blocks.0.ln0.*`,
-   `ln_out.*`, `head.weight`+`head.scale`, `token.embd` fp16) and, later,
-   `vision.*`/`whisper.*`/`focal.*` tensors to retire the documented fallbacks.
-2. **Validate RWKV-7 forward numerically** against a real trained checkpoint
-   (math is reference-transcribed and line-checked, but no weights exist yet).
-3. **Optional polish:** temperature/top-k sampling in `RwkvModel`/`AgentLoop`,
-   FFT swap for the mel DFT, AVX2 paths in `bitlinear_forward`.
-4. **CI on Linux** (GCC/MinGW paths untested on this machine).
-5. **WebRTC (#19)** upgrade path: replace/augment `UdpBeacon` with libdatachannel
+1. **Vision/audio/focal weights**: extend the converter for MobileNetV4,
+   Whisper-tiny-encoder, FocalCodec codebooks; retire the documented fallback
+   paths in `mobilenet_v4.cpp` / `whisper_tiny.cpp` / `focal_codec.cpp`.
+2. **QAT for real ternary**: distill the int8 model into BitNet b1.58 weights
+   (the runtime kernels already support ternary + per-row scales; only
+   training-time lossy compression remains).
+3. **Speed**: current 1.4 tok/s is scalar; add AVX2 dot paths in
+   `bitlinear_forward_i8`, i8 dot with `_mm256_maddubs_epi16`, and batch the
+   head matmul with f16 conversion. Target: 8-15 tok/s on desktop.
+4. **Tie-window test note**: `test_real_weights` records a continuation with
+   a ±2-token tie window; if the reference drifts, re-record from a fresh run.
+5. **CI on Linux** (GCC/MinGW paths untested on this machine).
+6. **WebRTC (#19)** upgrade path: replace/augment `UdpBeacon` with libdatachannel
    if the budget allows; DESIGN-status features #29/#30/#81–100 graduate when a
    training pipeline lands.
 
 ## 4. UNRESOLVED ISSUES / BUGS
 
-- **No real model weights exist.** Runtime is complete; model-dependent commands
-  fail gracefully with a load error until the converter (NEXT STEPS #1) runs.
 - **Vision/audio backbones run documented fallback paths** (deterministic patch
-  statistics / spectral-hash codes) until converter tensors exist.
-- **`AgentLoop::generate` is greedy only**; sampling config structure exists.
-- **Naive DFT in mel front-end is O(N²)** (~1s per 30s window on desktop).
+  statistics / spectral-hash codes) until converter tensors exist (NEXT STEPS #1).
 - **Server is serialized** (one request at a time) — fine for edge use.
 - **MinGW/GCC builds untested** on this machine; MSVC `/W4` is clean.
 - **Windows console UTF-8**: consider `SetConsoleOutputCP(CP_UTF8)` in CLI main.
 - Persistence paths route under `./state/` (created on demand, verified).
+- `models/` (281 MB safetensors + 294 MB GGUF) is gitignored; the converter
+  re-creates the GGUF from the safetensors + vocab (download URLs in the tool).
 
 ## 5. VERIFICATION STATUS
 
-- `build\bin\omniseed_tests.exe` → **163/163 PASS**. Coverage: platform (mmap,
+- `build\bin\omniseed_tests.exe` → **165/165 PASS** (added: FFT-vs-DFT exactness,
+  tone-bin agreement). Coverage: platform (mmap,
   RSS, clocks), tensor, BitNet pack/matmul/QAT, GGUF, tokenizer, RWKV state,
   streaming window/retire, memory crystals, grammar decoder, tool registry,
   agent intel (intent/state/confidence/KG/feedback), compute throttle,
@@ -154,4 +175,7 @@ See AUDIT SUMMARY table above; plus `agent_intel.*`, `audio_events.*`,
   vision tasks (pointer, spatial, tracking, gestures, resolution).
 - CLI demos verified by hand: all 13 commands run; peak RSS **< 5 MB** each
   (no model loaded); `selftest` OK; `tools` emits valid JSON schemas.
+- **Real-model verification:** `gen --model models/rwkv7-0.1B-ternary.gguf`
+  greedy + sampled output coherent (see 2b); peak RSS 202.8 MB; ctest 2/2
+  suites green (`omniseed_platform`, `omniseed_real_weights`).
 - Fresh-clone build verified with wiped `build/`; zero compiler warnings.

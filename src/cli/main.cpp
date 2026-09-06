@@ -77,6 +77,9 @@ void print_usage() {
         "  --model PATH     model GGUF path (default: ./models/omniseed.gguf)\n"
         "  --prompt TEXT    input text\n"
         "  --max-tokens N   generation budget (default 160)\n"
+        "  --temperature T  sampling temperature, 0 = greedy (default 0)\n"
+        "  --top-k K        keep K highest-probability tokens (0 = all)\n"
+        "  --seed S         sampling seed, deterministic per seed\n"
         "  --quiet          suppress info logs\n");
 }
 
@@ -503,6 +506,9 @@ int cmd_dream() {
 struct Session {
     std::string model_path = "./models/omniseed.gguf";
     int32_t max_tokens = 160;
+    float temperature = 0.0f;   // 0 => greedy
+    int32_t top_k = 0;
+    uint64_t seed = 42;
     std::string prompt;
 
     Tokenizer tok;
@@ -593,6 +599,9 @@ int cmd_gen(Session& s) {
 
     AgentLoop::Config cfg;
     cfg.allow_tools = false;
+    cfg.temperature = s.temperature;
+    cfg.top_k = s.top_k;
+    cfg.seed = s.seed;
     static ToolRegistry dummy;
     static MemoryCrystals mem;
     static ComputeThrottle thr;
@@ -708,6 +717,12 @@ int main(int argc, char** argv) {
         else if (a == "--prompt" && i + 1 < argc) s.prompt = argv[++i];
         else if (a == "--max-tokens" && i + 1 < argc)
             s.max_tokens = std::atoi(argv[++i]);
+        else if (a == "--temperature" && i + 1 < argc)
+            s.temperature = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--top-k" && i + 1 < argc)
+            s.top_k = std::atoi(argv[++i]);
+        else if (a == "--seed" && i + 1 < argc)
+            s.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--quiet") platform::set_quiet(true);
         else if (!s.prompt.empty()) { /* positional handled below */ }
     }
