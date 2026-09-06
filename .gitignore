@@ -20,6 +20,9 @@ models/*.py
 models/config.json
 models/goose28_*.json
 models/goose28_modeling.py
+models/whisper-tiny-tokenizer.json
+
+__pycache__/
 
 # QAT training artifacts (checkpoint/masters are regenerable; corpus cache is
 # a deterministic transform of the wikitext-103 download + in-repo vocab)

@@ -433,7 +433,8 @@ def main():
                     help='independent windows per step')
     ap.add_argument('--clip', type=float, default=1.0)
     ap.add_argument('--eval-every', type=int, default=200)
-    ap.add_argument('--eval-tokens', type=int, default=4096)
+    ap.add_argument('--eval-tokens', type=int, default=2048,
+                    help='perplexity estimate length (32 parallel segments)')
     ap.add_argument('--time-budget', type=int, default=0,
                     help='seconds; stop the chunk early and exit 3 (0 = off)')
     ap.add_argument('--ckpt', default='models/qat_ckpt.pt',
@@ -505,17 +506,17 @@ def main():
         except OSError:
             pass
 
-    def perplexity(ids, float_masters=False, segments=8):
-        """Teacher-forced NLL over the stream, split into `segments`
-        independent chains run in one batch (near-identical estimate to a
-        single sequential chain, `segments`x faster on CPU)."""
+    def perplexity(ids, float_masters=False, segments=64, max_tok=16384):
+        """Teacher-forced NLL on val tokens, 64 parallel segments (much
+        larger effective sample than a single 2048-token chain)."""
         torch.set_grad_enabled(False)
         model.float_mode = float_masters
         model.begin_window(False)
         W = args.window
-        seg_len = max(W + 2, (len(ids) - 1) // segments)
+        n_all = min(len(ids) - 1, max_tok)
+        seg_len = max(W + 2, (n_all + segments - 1) // segments)
         n_seg = min(segments, (len(ids) - 1) // seg_len)
-        use = min(seg_len - 1, max(W + 1, args.eval_tokens // max(1, n_seg)))
+        use = min(seg_len - 1, max(W + 1, 512))
         total_nll, n_pred = 0.0, 0
         state = None
         for j in range(use):
