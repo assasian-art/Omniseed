@@ -1,0 +1,204 @@
+GLM-5.3-FLASH
+
+# PROJECT_STATE.md — OmniSeed Build State
+
+> **SINGLE SOURCE OF TRUTH.** After EVERY task/file, the active agent MUST update
+> this file: (1) what is complete, (2) exact next steps, (3) unresolved issues.
+> If a context limit is reached, the next agent resumes from the "NEXT STEPS"
+> section below without re-reading the whole codebase.
+
+- **Project:** OmniSeed — sub-300MB multi-modal micro-LLM agent kernel
+- **Root:** `C:\Users\sakim\OneDrive\Desktop\omniseed`
+- **Language/Standard:** Pure C++17, zero external dependencies, no Python at runtime
+- **Machine toolchain:** Windows 11 + Visual Studio 18 2026 (MSVC 19.50, cl.exe),
+  CMake 4.4.3. No g++/MinGW on this box — Linux/MinGW paths are wired but
+  untested here.
+- **Build:** `build.bat` (auto-detects VS via vswhere) or
+  `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
+- **Test:** `build\bin\omniseed_tests.exe` — **165/165 passing** +
+  `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
+- **Last updated:** PHASE 7 COMPLETE — real RWKV-7 0.1B world weights converted,
+  loaded, and generating coherent English inside the <300 MB budget. GGUF loader
+  data-offset bug found & fixed. Sampling + FFT landed.
+
+---
+
+## 1. AUDIT SUMMARY (this session)
+
+Audited the entire codebase against the 7 research TXT files
+(`C:\Users\sakim\Downloads\New folder\*.txt`, especially "Architecting the
+Unthinkable" — the 100-feature catalog). Findings and actions:
+
+**Stale/false claims found & fixed:**
+- `src/server/main.cpp` never compiled (missing `using namespace omniseed;`) — fixed.
+- `Dockerfile`, `render.yaml`, `docs/DEPLOYMENT.md`, `.gitignore` were claimed DONE
+  but did not exist — all created.
+- Test count claimed 43/43 while many modules had no coverage — extended to 163.
+
+**Entirely missing capabilities, now implemented (all with tests + CLI demos):**
+| Capability | Files |
+|---|---|
+| #3 Sensory Fingerprinting | `include/omniseed/runtime/sensory.h`, `src/runtime/sensory.cpp` |
+| #4 Emotional Resonance | `include/omniseed/runtime/emotional.h`, `src/runtime/emotional.cpp` |
+| #6 Zero-Shot Skill Synthesis + Flash Skill Pools (#8/#9/#34–36/#49–50) | `include/omniseed/agent/flash_skills.h`, `src/agent/flash_skills.cpp` |
+| #7 Collaborative Swarm Protocol (#43–44/#55–58) | `include/omniseed/runtime/swarm.h`, `src/runtime/swarm.cpp` (LoopbackMesh + UDP beacon + CRC32 codec) |
+
+**Extended modules (new files):**
+| Area | Files | Spec features |
+|---|---|---|
+| Audio tasks | `include/omniseed/audio/audio_events.h`, `src/audio/audio_events.cpp` | wake word (#15), sound events (#3), scene (#63), anomaly (#70) |
+| Vision tasks | `include/omniseed/vision/vision_tasks.h`, `src/vision/vision_tasks.cpp` | pointer perception (#2), spatial map (#54), tracking (#66), gestures (#61), dynamic res (#69) |
+| Agent intel | `include/omniseed/agent/agent_intel.h`, `src/agent/agent_intel.cpp` | intent (#23), dialogue state (#24), confidence (#16), hallucination risk (#17), thinking mode (#6), error recovery (#25), progressive disclosure (#26), feedback loop (#74), Sensory Interrupt System (#72), Knowledge Graph (#38), entity linking (#18) |
+
+**Bugs found and fixed during verification:**
+- Swarm `LoopbackMesh::send("")` broadcast dropped messages (no `""` mailbox) —
+  now fans out to every joined mailbox except the sender.
+- Swarm UDP XOR keystream was cipher-feedback (non-symmetric decode) — fixed to
+  position-keyed keystream.
+- `KnowledgeGraph::load` read `triples_[size()]` out of bounds (reindex before
+  push_back) — reordered.
+- `KnowledgeGraph::ingest_text` word-boundary walk looped on multi-word subjects —
+  rewritten as a bounded token scan.
+- Emotional fusion gate discarded strong valence (conf `wsum/2.0` too low for a
+  single channel) — gate now only fires when weak AND emotionally flat; anxious
+  classifier thresholds recalibrated; "please" removed from positive lexicon.
+- Sensory voice embedding was stat-order-blind (parallel vectors across users) —
+  replaced with Goertzel band-energy spectrum + random-Fourier projection;
+  same-user 1.00 vs impostor 0.845, gate 0.88.
+- Flash-skill store path / `state/` dir creation on Windows — fixed.
+
+---
+
+## 2. COMPLETED (all phases)
+
+### Phase 1 — Skeleton & Portability ✅
+`CMakeLists.txt`, `include|src/core/platform.*`, `build.bat`, `build.sh`,
+`tests/test_platform.cpp` (now 163 checks), `.gitignore`.
+
+### Phase 2 — Core Engine (RWKV-7 + BitNet 1.58-bit) ✅
+`tensor.*` (F32/F16/I8/TERNARY), `bitlinear.*` (2 weights/byte pack, mult-free
+forward, QAT STE step), `rwkv.*` (**exact RWKV-7 reference math**, O(1) streaming
+state), `gguf_format.h`/`gguf_loader.*` (v2/v3, zero-copy mmap views),
+`tokenizer.*` (SentencePiece-compatible + agent special tokens).
+
+### Phase 3 — Multi-Modal Encoders ✅ (structure + live pipeline)
+`vision.h`/`mobilenet_v4.cpp` (resize→patches→UniCompress→ternary; weights pending),
+`unicompress.cpp` (importance top-k, ≤4x token reduction), `audio.h`/
+`whisper_tiny.cpp` (log-mel via Hann+DFT+Slaney mel; decoder weights pending),
+`focal_codec.cpp` (24 Goertzel bands → semantic codes; codebook pending),
+`token_bus.*` (any-to-token fusion, #1).
+
+### Phase 4 — Agent Intelligence & Memory ✅
+`streaming_llm.cpp` (attention sinks + window + retirement, 1M logical tokens, #10),
+`memory_crystals.cpp` (salience crystallization, cosine retrieval, persistence),
+`grammar_decoder.cpp` (#5), `tool_registry.cpp` (#7, builtins calc/echo/time),
+`agent_loop.cpp` (perceive→think→act→observe, #21), `self_improvement.cpp`
+(trace replay + `dream()`, #33/#37), `compute_throttle.cpp` (#12).
+
+### Phase 5 — Novel capabilities, perception tasks, intel ✅ (this session)
+See AUDIT SUMMARY table above; plus `agent_intel.*`, `audio_events.*`,
+`vision_tasks.*`, `flash_skills.*`, `sensory.*`, `emotional.*`, `swarm.*`.
+
+### Phase 6 — Interfaces, deployment, docs ✅
+- `src/cli/main.cpp`: `info chat gen ask bench tools selftest dream demo-sensory
+  demo-emotional demo-skills demo-swarm demo-memory demo-audio demo-vision`.
+- `src/server/main.cpp`: compiles now; HTTP `/health` `/ask` `/gen` behind `OMNISEED_HTTP`.
+- `Dockerfile` (multi-stage Alpine, ~15 MB runtime image), `render.yaml`,
+  `docs/DEPLOYMENT.md`.
+- **`docs/OMNISEED_MASTER_SPEC.md` + `docs/OMNISEED_MASTER_SPEC.html`** — final
+  master document: architecture, 7 capabilities, 100-feature mapping table with
+  file locations, build/deploy guides, CLI demo catalog with sample outputs.
+  (`tools/md2html.py` regenerates the HTML; no PDF tooling on this box — HTML serves.)
+
+---
+
+## 2b. PHASE 7 — REAL WEIGHTS + VALIDATION ✅ (committed: 4a695d2)
+
+**The kernel has a real brain.** `models/rwkv7-0.1B-ternary.gguf` (280 MB,
+RWKV-7 "World" 0.1B v2) loads in the pure-C++17 runtime and generates
+coherent English: greedy "Hello" → 160-token grammatical reply; sampled
+(temp 0.8, top-k 40) → "Hello! Thanks for using my chatbot. Can you provide
+me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
+300 MB); 12 layers/768 embd/65536 vocab; ~1.4 tok/s single-thread scalar.
+
+| Piece | Detail |
+|---|---|
+| Converter | `tools/convert_to_omniseed.py` (offline; venv at `.venv/` with torch). Maps `Hakureirm/rwkv7-0.1b-hf` safetensors (`rwkv7.` prefix, LoRA factors are raw `[E,rank]`/`[rank,E]` params applied `x@w1@w2`, stored **transposed** for C++ row-major) → OmniSeed GGUF: per-row int8 linears + fp32 `.scale` tensors, fp16 `token.embd`/`head.weight`, fp32 norms/mixes/biases/`k_k`/`k_a`/`r_k`/`gn`, packed 65,536-piece world vocab + special-id metadata (eos=0). `--check-prompt` runs a full fp32 torch reference forward. |
+| Quantization decision | **PTQ ternary b1.58 is too lossy without QAT** — verified in torch fp32 (`tools/quant_sim.py`): ternary model degenerates even with perfect math. Per-row symmetric int8 (1 byte/param, 2× smaller than fp16) reproduces the fp16 oracle near-exactly and stays coherent. LoRA factors currently ride along as int8 too. Ternary returns via QAT (NEXT STEPS). |
+| Roundtrip validator | `tools/check_gguf.py` — byte-parses the GGUF exactly like the C++ loader, dequantizes, diffs vs source safetensors: **220/220 tensors exact**. |
+| Oracle chain | `tools/oracle_hf.py` (official HF impl → coherent English), `tools/diff_vs_hf.py` (per-block hidden-state diff vs my numpy reference → matched to 1e-5 after fixing the unprefixed `head.weight` lookup). |
+| **Critical bug fixed** | `GgufLoader::read_tensor_dir` treated tensor offsets as relative to the **post-metadata** position; the GGUF spec places data after the **tensor directory**. Every tensor read was shifted into directory bytes → garbage/NaN weights. The synthetic test GGUF never caught it because its tests only checked metadata, not bytes. Fixed: `data_start_` = post-directory; bounds checked after. Symptom chain: NaN `sc_r` → NaN logits; traced with env-gated `OMNISEED_DEBUG_NAN=1` instrumentation (kept in `rwkv.cpp`). |
+| Sampling (TASK 4) | `RwkvModel::sample_token(logits, temperature, top_k, seed&)` — SplitMix64, deterministic per seed; `AgentLoop::Config{temperature, top_k, seed}`; CLI `--temperature/--top-k/--seed` on `gen`. Greedy default unchanged. |
+| FFT (TASK 4) | `include/omniseed/core/fft.h` — radix-2 + **Bluestein chirp-z** for exact N=400 bins 0..200 with M=1024 (O(N log N), same bins as the naive DFT it replaces). Wired into `whisper_tiny.cpp` log-mel. Test: matches naive DFT to 1e-6, identical tone bin. |
+| Real-weights test | `tests/test_real_weights.cpp` (13 checks): skips when the model file is absent; asserts config, finite logits, recorded greedy continuation (±2 tie window), sampling determinism, <300 MB RSS. Registered as ctest `omniseed_real_weights` (WD = repo root; `omniseed_platform` got the same fix). ctest: **2/2 suites pass**. |
+
+## 2c. PHASE 8 — SPEED + REAL SENSES ✅ (TASK 1: earlier commit; TASK 2: ac42318)
+
+### TASK 1 — Speed (AVX2) ✅
+- AVX2 + SSE4.1 + scalar kernels for the per-row int8 dot (`src/core/bitlinear_avx2.cpp`, cpuid dispatch in `platform`, runtime-selected via function pointers). AVX2 kernel measured **7.3× the scalar** in isolation (0.45 → 3.25 GMAC/s).
+- Profiled: the fp16 head matmul was 68% of token time (scalar `half_to_float` on 50M values). Head is now stored **int8 with per-row scales in the GGUF** (converter writes i8 head; loader accepts it) → fp16 head conversion at load time removed.
+- **Result: 2.1 → 19.2 tok/s (9.1×), peak RSS 202.8 → 155 MB**, greedy continuation byte-identical to pre-change (numerics preserved).
+
+### TASK 2 — Real senses ✅
+- `tools/convert_senses.py` (offline): converts **openai/whisper-tiny** encoder safetensors + official `mel_filters.npz` (80×201) → `models/whisper-tiny-encoder.gguf` sidecar; **vision projection head** (ternary + per-row fp32 scales) → `models/vision-proj.gguf`.
+- `WhisperTiny`: loads the full encoder (conv stem, pos-embed, 4 post-LN blocks, ln) and runs a real forward: mel → conv1/gelu → conv2/gelu → +pos → blocks → [T/2, 384] (98 frames → 49×384, all finite). `weights_loaded_` now true when sidecar present; spectral-hash fallback remains only as fallback.
+- `VisionEncoder`: loads ternary `vision.proj.weight` + per-row scales; encode runs patch features → UniCompress → **real ternary BitLinear projection** (output varies with input; identity fallback retired).
+- Full load-time tensor sweeps (env `OMNISEED_DBG=1`) read every element of every sidecar tensor at load.
+- Sidecar bias convention: **present = full extent, absent = loader tolerates** (`load_f16(..., required=false)`); never dereference an optional bias without the guard below.
+
+### TASK 2 postmortem (three stacked bugs)
+1. `GgufLoader::read_tensor_dir` raised "unsupported dtype 40" for TERNARY: `gguf_dtype_size` returns 0 for ternary ("handled at call site") but the error fired **before** the call-site special case. Fixed the order.
+2. `Tensor::nbytes()` returned numel bytes for TERNARY (true stored size is packed `(numel+1)/2`) — any full-region scan walked 2× the mapped bytes. Fixed to match the loader.
+3. **The subtle one**: a default-constructed (absent) `Tensor` has `numel()==1` (empty-shape product) with `data()==nullptr`, so the widespread `numel() > 0` "optional present" guard **passed for missing tensors** and then dereferenced null (ASan: access-violation at the vision bias add). All optional-tensor guards now use `numel() > 1`. ASan build (`build/asan_build.bat` pattern: `/fsanitize=address` + MSVC asan DLL on PATH) found in one run what hours of Release-mode printf bisection could not.
+- Loader-ownership rule (3rd strike): **every component holding non-owning views must own its `GgufLoader`** (RwkvModel `store_`, WhisperTiny `store_`, VisionEncoder `store_`). A local loader unmaps on return and dangles.
+
+### Verification (Phase 8 so far)
+- `omniseed_tests` 165/165, `omniseed_real_weights` 13/13, new `omniseed_sides` **14/14** (registered ctest-side, skips cleanly when sidecars absent): mel [80×98], encode [49×384] finite, vision 768-dim projection finite + input-sensitive (gradient vs inverted differ > 1e-4).
+
+## 3. NEXT STEPS (in order)
+
+1. **Vision/audio/focal weights**: extend the converter for MobileNetV4,
+   Whisper-tiny-encoder, FocalCodec codebooks; retire the documented fallback
+   paths in `mobilenet_v4.cpp` / `whisper_tiny.cpp` / `focal_codec.cpp`.
+2. **QAT for real ternary**: distill the int8 model into BitNet b1.58 weights
+   (the runtime kernels already support ternary + per-row scales; only
+   training-time lossy compression remains).
+3. **Speed**: current 1.4 tok/s is scalar; add AVX2 dot paths in
+   `bitlinear_forward_i8`, i8 dot with `_mm256_maddubs_epi16`, and batch the
+   head matmul with f16 conversion. Target: 8-15 tok/s on desktop.
+4. **Tie-window test note**: `test_real_weights` records a continuation with
+   a ±2-token tie window; if the reference drifts, re-record from a fresh run.
+5. **CI on Linux** (GCC/MinGW paths untested on this machine).
+6. **WebRTC (#19)** upgrade path: replace/augment `UdpBeacon` with libdatachannel
+   if the budget allows; DESIGN-status features #29/#30/#81–100 graduate when a
+   training pipeline lands.
+
+## 4. UNRESOLVED ISSUES / BUGS
+
+- **Vision/audio backbones run documented fallback paths** (deterministic patch
+  statistics / spectral-hash codes) until converter tensors exist (NEXT STEPS #1).
+- **Server is serialized** (one request at a time) — fine for edge use.
+- **MinGW/GCC builds untested** on this machine; MSVC `/W4` is clean.
+- **Windows console UTF-8**: consider `SetConsoleOutputCP(CP_UTF8)` in CLI main.
+- Persistence paths route under `./state/` (created on demand, verified).
+- `models/` (281 MB safetensors + 294 MB GGUF) is gitignored; the converter
+  re-creates the GGUF from the safetensors + vocab (download URLs in the tool).
+
+## 5. VERIFICATION STATUS
+
+- `build\bin\omniseed_tests.exe` → **165/165 PASS** (added: FFT-vs-DFT exactness,
+  tone-bin agreement). Coverage: platform (mmap,
+  RSS, clocks), tensor, BitNet pack/matmul/QAT, GGUF, tokenizer, RWKV state,
+  streaming window/retire, memory crystals, grammar decoder, tool registry,
+  agent intel (intent/state/confidence/KG/feedback), compute throttle,
+  self-improvement + dream, flash skills (builtins, synthesis, persistence,
+  maturity/retire), sensory (enroll/verify, impostor reject), emotional
+  (channels, fusion, modulation), swarm (discovery, delegation, memory/skill
+  Xfer, codec, staleness), audio events (wake word, events, scene, anomaly),
+  vision tasks (pointer, spatial, tracking, gestures, resolution).
+- CLI demos verified by hand: all 13 commands run; peak RSS **< 5 MB** each
+  (no model loaded); `selftest` OK; `tools` emits valid JSON schemas.
+- **Real-model verification:** `gen --model models/rwkv7-0.1B-ternary.gguf`
+  greedy + sampled output coherent (see 2b); peak RSS 202.8 MB; ctest 2/2
+  suites green (`omniseed_platform`, `omniseed_real_weights`).
+- Fresh-clone build verified with wiped `build/`; zero compiler warnings.

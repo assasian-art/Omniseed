@@ -12,7 +12,18 @@ models/*.gguf
 models/*.ovocab
 *.ckpt
 *.pth
+*.pt
 *.safetensors
+
+# Downloaded reference sources (URLs documented in the converters)
+models/*.py
+models/config.json
+models/goose28_*.json
+models/goose28_modeling.py
+
+# Compiler intermediates (stray ad-hoc builds)
+*.obj
+*.pdb
 
 # Local runtime state (memory crystals, skills, fingerprints)
 state/
