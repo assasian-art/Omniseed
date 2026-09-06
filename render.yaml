@@ -1,0 +1,23 @@
+# Serve the OmniSeed HTTP API on Render (free tier works: 512 MB > 300 MB budget).
+#
+# Deploy:  render blueprint launch   (or connect the repo in the Render dashboard)
+#
+# Endpoints once live:
+#   GET  /health   -> {"ok":true,"model":false,"peak_rss":N}
+#   POST /ask      -> {"reply": "..."}          body: {"task": "..."}
+#   POST /gen      -> {"text": "..."}           body: {"prompt": "..."}
+#
+# NOTE: /ask and /gen return an error payload until a model GGUF is present
+# at /app/models/omniseed.gguf (mount a disk or bake it into your own image).
+services:
+  - type: web
+    name: omniseed
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    dockerCommand: ./omniseed_server --port 8080 --model /app/models/omniseed.gguf
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: OMNISEED_BUDGET_MB
+        value: "300"

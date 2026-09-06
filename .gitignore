@@ -1,0 +1,28 @@
+# =============================================================================
+#  OmniSeed — .gitignore
+# =============================================================================
+
+# Build trees
+build/
+build-*/
+out/
+
+# Model artifacts (large binaries are not checked in)
+models/*.gguf
+models/*.ovocab
+*.ckpt
+*.pth
+*.safetensors
+
+# Local runtime state (memory crystals, skills, fingerprints)
+state/
+
+# IDE / OS noise
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Freebuff client state
+.freebuff/
