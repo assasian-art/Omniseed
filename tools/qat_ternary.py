@@ -2,7 +2,7 @@
 # =============================================================================
 #  OmniSeed — qat_ternary.py   (OFFLINE training tool, never ships at runtime)
 #
-#  Phase 8 TASK 3: Quantization-Aware Training proof-of-concept that turns the
+#  Phase 9 TASK 2: full-scale Quantization-Aware Training that turns the
 #  RWKV-7 "World" 0.1B checkpoint's big linears into TRUE ternary {-1,0,+1}
 #  weights (BitNet b1.58 style, per-row absmean scales).
 #
@@ -16,20 +16,31 @@
 #      backward). Before any training this eval equals PTQ ternary; after
 #      training it is the QAT result — one code path, no mode switch.
 #    * Frozen: emb, head, norms, token-shift vectors, LoRA factors, biases.
-#    * Corpus: real English text already in the repo (PROJECT_STATE.md +
-#      docs + README), split 90/10 by paragraph.
-#    * Reports perplexity: bf16 baseline / ternary-PTQ / ternary-QAT.
+#    * Corpus (--corpus auto): wikitext-103-raw parquet from HuggingFace
+#      (train split for training, validation split for eval), tokenized once
+#      and cached to models/corpus/*.npy. Fallback: in-repo markdown.
+#    * Batched windows: B independent windows per step (same sequential core,
+#      bigger matmuls, several x throughput vs B=1). step_batch() is verified
+#      numerically identical to the reference single-window step().
+#    * AdamW + cosine LR schedule + warmup + gradient clipping.
+#    * Chunked execution for background friendliness: --time-budget stops a
+#      chunk and exits with code 3 ("more work remains"); tools/qat_watch.*
+#      loops chunks until done (exit 0). Checkpoint (masters + optimizer +
+#      global step + best ppl) persists across chunks.
+#    * Progress appended to qat_log.txt every eval.
 #    * Exports models/rwkv7-0.1B-ternary-qat.gguf (TERNARY linears, i8 LoRA
 #      + head, everything else identical to the default converter output).
 #
 #  Usage (from repo root, venv with torch on PATH):
-#    ./.venv/Scripts/python.exe tools/qat_ternary.py --steps 1000
+#    ./.venv/Scripts/python.exe tools/qat_ternary.py                # one chunk
+#    tools/qat_watch.bat            (Windows)  /  tools/qat_watch.sh (Unix)
 # =============================================================================
 import argparse
 import math
 import os
 import random
 import sys
+import time
 
 import numpy as np
 import torch
@@ -41,33 +52,99 @@ from convert_to_omniseed import (  # noqa: E402
 )
 
 ST_DEFAULT = 'models/model.safetensors'
-
-CORPUS_FILES = [
-    'PROJECT_STATE.md',
-    'docs/OMNISEED_MASTER_SPEC.md',
-    'README.md',
-]
+CORPUS_DIR = 'models/corpus'
+WIKITEXT_TRAIN = ('https://huggingface.co/datasets/Salesforce/wikitext/'
+                  'resolve/main/wikitext-103-raw-v1/'
+                  'train-00000-of-00002.parquet')
+WIKITEXT_VAL = ('https://huggingface.co/datasets/Salesforce/wikitext/'
+                'resolve/main/wikitext-103-raw-v1/'
+                'validation-00000-of-00001.parquet')
+REPO_FILES = ['PROJECT_STATE.md', 'docs/OMNISEED_MASTER_SPEC.md', 'README.md']
 
 INV_SQ_E = 1.0 / math.sqrt(math.e)
+EXIT_DONE, EXIT_MORE = 0, 3
 
 
 # -----------------------------------------------------------------------------
-# Corpus: real English paragraphs already in the repo. 90/10 split.
+# Corpus: wikitext-103-raw (auto-download + token cache), in-repo fallback.
 # -----------------------------------------------------------------------------
-def load_corpus():
+def _download(url, dest):
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    print(f'[qat] downloading {url}', flush=True)
+    import urllib.request
+    tmp = dest + '.part'
+    urllib.request.urlretrieve(url, tmp)
+    os.replace(tmp, dest)
+    return dest
+
+
+def _parquet_lines(path):
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    for batch in pf.iter_batches(batch_size=2048, columns=['text']):
+        for t in batch.column('text').to_pylist():
+            if t:
+                yield t
+
+
+def _tokenize_stream(lines, tok, cap_tokens):
+    """Tokenize a line stream up to cap_tokens; returns int32 np.array."""
+    ids, buf, count = [], [], 0
+    for line in lines:
+        buf.append(line.strip())
+        if sum(len(b) for b in buf) >= 4096:
+            chunk = '\n'.join(buf)
+            buf = []
+            got = tok.encode(chunk)
+            ids.extend(got)
+            count += len(got)
+            if count >= cap_tokens:
+                break
+    for b in buf:
+        ids.extend(tok.encode(b))
+    return np.asarray(ids, dtype=np.int32)
+
+
+def load_corpus_wikitext(tok, max_train_tokens, cache=True):
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+    train_np, val_np = (os.path.join(CORPUS_DIR, 'train.npy'),
+                        os.path.join(CORPUS_DIR, 'val.npy'))
+    if cache and os.path.exists(train_np) and os.path.exists(val_np):
+        print(f'[qat] corpus cache hit: {train_np} / {val_np}', flush=True)
+        return (np.load(train_np), np.load(val_np))
+    tr = _tokenize_stream(_parquet_lines(_download(WIKITEXT_TRAIN,
+                                                   CORPUS_DIR + '/train.parquet')),
+                          tok, max_train_tokens)
+    va = _tokenize_stream(_parquet_lines(_download(WIKITEXT_VAL,
+                                                   CORPUS_DIR + '/val.parquet')),
+                          tok, 400_000)
+    print(f'[qat] wikitext-103: train {len(tr):,} tokens, '
+          f'val {len(va):,} tokens', flush=True)
+    if cache:
+        np.save(train_np, tr)
+        np.save(val_np, va)
+    return tr, va
+
+
+def load_corpus_repo(tok):
+    """In-repo markdown fallback (Phase 8 PoC corpus). 90/10 by paragraph."""
     paras = []
-    for p in CORPUS_FILES:
+    for p in REPO_FILES:
         if not os.path.exists(p):
             continue
         text = open(p, 'r', encoding='utf-8', errors='replace').read()
         for chunk in text.split('\n\n'):
             chunk = chunk.strip()
-            if len(chunk) >= 120:               # skip tiny fragments/tables
+            if len(chunk) >= 120:
                 paras.append(chunk)
     random.seed(7)
     random.shuffle(paras)
     n_val = max(4, len(paras) // 10)
-    return paras[n_val:], paras[:n_val]
+    train = tok.encode('\n\n'.join(paras[n_val:]))
+    val = tok.encode('\n\n'.join(paras[:n_val]))
+    return np.asarray(train, dtype=np.int32), np.asarray(val, dtype=np.int32)
 
 
 class TernarySTE(torch.autograd.Function):
@@ -85,7 +162,11 @@ class TernarySTE(torch.autograd.Function):
 
 class RWKV7Ternary:
     """RWKV-7 forward mirroring convert_to_omniseed.reference_generate
-    (HF-verified), with ternary-STE linears for r/k/v/o + ffn key/value."""
+    (HF-verified), with ternary-STE linears for r/k/v/o + ffn key/value.
+
+    step()      — reference single-window path (Phase-8-verified).
+    step_batch()— B independent windows; verified equal to step() at B=1.
+    """
 
     def __init__(self, st_path, header, data_start):
         import torch
@@ -116,8 +197,6 @@ class RWKV7Ternary:
             for a in ('ln1.weight', 'ln1.bias', 'ln2.weight', 'ln2.bias'):
                 self.p[d + a] = self.T(s + a).float().reshape(-1)
             # x_* / w0 / a0 / v0 / k_k / k_a are [1,1,768]: reshape to [768]
-            # (a single [0] leaves [1,768] and broadcasts x into a phantom
-            #  leading axis — the bug this tool initially had).
             for a in ('x_r', 'x_w', 'x_k', 'x_v', 'x_a', 'x_g'):
                 self.p[d + a] = self.T(s + 'att.' + a).float().reshape(-1)
             for a in ('w1', 'w2', 'a1', 'a2', 'g1', 'g2', 'v1', 'v2'):
@@ -141,7 +220,6 @@ class RWKV7Ternary:
                 W0 = self.T(K(f'blocks.{l}.{name}.weight')).float()
                 self.masters[full] = W0.clone().requires_grad_(True)
         self.master_list = list(self.masters.values())
-        self.optimizer = torch.optim.SGD(self.master_list, lr=1e-3)
 
     def T(self, k):
         if k not in self.cache:
@@ -150,18 +228,17 @@ class RWKV7Ternary:
         return self.cache[k]
 
     def lin(self, name, x):
-        """x @ Wq.T where Wq is the true ternary of the master (STE).
-        float_mode (eval-only): use the raw bf16 master — the honest baseline
-        that validates the forward pass itself."""
-        if getattr(self, 'float_mode', False):
-            return x @ self.masters[name].t()
-        return x @ self.Wq[name].t()
+        """Batched x @ Wq.T. float_mode (eval-only): raw bf16 master — the
+        honest baseline that validates the forward pass itself."""
+        W = self.masters[name] if getattr(self, 'float_mode', False) \
+            else self.Wq[name]
+        return x @ W.t()
 
     def begin_window(self, use_grad):
-        """Ternarize all masters ONCE per window. Weights only change after an
-        optimizer step, so per-token ternarization is pure overhead (72 tiny
-        autograd graphs per token dominated runtime). The graph stays alive
-        across the window so STE gradients reach the masters at backward."""
+        """Ternarize all masters ONCE per window-batch. Weights only change
+        after an optimizer step, so per-token ternarization is pure overhead.
+        The graph stays alive across the window so STE gradients reach the
+        masters at backward."""
         if use_grad:
             self.Wq = {n: TernarySTE.apply(self.masters[n])
                        for n in self.masters}
@@ -174,8 +251,8 @@ class RWKV7Ternary:
         self.Wq = None
         self.float_mode = False
 
+    # -- reference single-window path (verified against the HF oracle) --------
     def step(self, tok, state):
-        """One token. state: list of (S[H,D,D], att_prev[E], ffn_prev[E])."""
         t = self.torch
         p, E, H, D, L = self.p, self.E, self.H, self.D, self.L
 
@@ -224,15 +301,12 @@ class RWKV7Ternary:
             wh = t.exp(w_log).view(H, D)
             ah = a.view(H, D)
 
-            # Batched over heads (72 tiny matmuls/token in python loops were
-            # the eval bottleneck): sa[h,j] = -sum_i kk[h,i]*S[h,i,j]
-            # (HF reference: S[h].T @ (-kk[h]) — the MINUS is load-bearing;
-            #  dropping it turns the a-rank1 term into positive feedback and
-            #  the state explodes to NaN).
+            # sa[h,j] = -sum_i kk[h,i]*S[h,i,j]  (HF reference: S[h].T @ -kk;
+            # the MINUS is load-bearing — dropping it explodes the state).
             sa = -t.einsum('hi,hij->hj', kk, S)                         # [H, D]
-            S = (wh.unsqueeze(-1) * S                                  # decay
-                 + (kk * ah).unsqueeze(-1) * sa.unsqueeze(1)           # a-rank1
-                 + kh.unsqueeze(-1) * vh.unsqueeze(1))                 # k outer v
+            S = (wh.unsqueeze(-1) * S
+                 + (kk * ah).unsqueeze(-1) * sa.unsqueeze(1)
+                 + kh.unsqueeze(-1) * vh.unsqueeze(1))
 
             y = t.einsum('hi,hij->hj', rh, S).reshape(E)
             yv = y.view(H, D)
@@ -255,6 +329,86 @@ class RWKV7Ternary:
         logits = p['head'] @ x_last
         return logits, state
 
+    # -- batched path: B independent windows ----------------------------------
+    def step_batch(self, toks, state):
+        """toks: [B] int64. state: list of (S[B,H,D,D], att[B,E], ffn[B,E]).
+        Returns logits [B,V] and the new state."""
+        t = self.torch
+        p, E, H, D, L = self.p, self.E, self.H, self.D, self.L
+
+        def ln(x, w, b, eps=1e-5):
+            m = x.mean(-1, keepdim=True)
+            v = x.var(-1, keepdim=True, unbiased=False)
+            return (x - m) / t.sqrt(v + eps) * w + b
+
+        B = toks.shape[0]
+        if state is None:
+            state = [(t.zeros(B, H, D, D), t.zeros(B, E), t.zeros(B, E))
+                     for _ in range(L)]
+        x = p['emb'][toks]                                  # [B, E]
+        x = ln(x, p['ln0w'], p['ln0b'])
+        v_first = None
+        for l in range(L):
+            S, att_prev, ffn_prev = state[l]
+            d = f'l{l}.'
+            lx = ln(x, p[d + 'ln1.weight'], p[d + 'ln1.bias'])
+            dx = att_prev - lx
+            xr = lx + p[d + 'x_r'] * dx
+            xw = lx + p[d + 'x_w'] * dx
+            xk = lx + p[d + 'x_k'] * dx
+            xv = lx + p[d + 'x_v'] * dx
+            xa = lx + p[d + 'x_a'] * dx
+            xg = lx + p[d + 'x_g'] * dx
+            att_prev = lx
+
+            r = self.lin(f'l{l}.att.receptance', xr)        # [B, E]
+            k = self.lin(f'l{l}.att.key', xk)
+            v = self.lin(f'l{l}.att.value', xv)
+
+            w_log = -INV_SQ_E * t.sigmoid(
+                t.tanh(xw @ p[d + 'w1']) @ p[d + 'w2'] + p[d + 'w0'])
+            a = t.sigmoid(xa @ p[d + 'a1'] @ p[d + 'a2'] + p[d + 'a0'])
+            g = t.sigmoid(xg @ p[d + 'g1']) @ p[d + 'g2']
+            if l == 0:
+                v_first = v
+            else:
+                vg = t.sigmoid(xv @ p[d + 'v1'] @ p[d + 'v2'] + p[d + 'v0'])
+                v = v + (v_first - v) * vg
+
+            kkk = k * p[d + 'k_k']
+            kk = kkk.view(B, H, D)
+            kk = kk / t.sqrt((kk * kk).sum(-1, keepdim=True) + 1e-12)
+            k = k + k * (a - 1) * p[d + 'k_a']
+            rh, kh, vh = r.view(B, H, D), k.view(B, H, D), v.view(B, H, D)
+            wh = t.exp(w_log).view(B, H, D)
+            ah = a.view(B, H, D)
+
+            sa = -t.einsum('bhid,bhi->bhd', S, kk)          # [B, H, D]
+            S = (wh.unsqueeze(-1) * S
+                 + t.einsum('bhi,bhj->bhij', kk * ah, sa)
+                 + t.einsum('bhi,bhj->bhij', kh, vh))       # BLENDED k, like ref
+
+            y = t.einsum('bhi,bhij->bhj', rh, S).reshape(B, E)
+            yv = y.view(B, H, D)
+            m_ = yv.mean(-1, keepdim=True)
+            var = yv.var(-1, keepdim=True, unbiased=False)
+            yn = ((yv - m_) / t.sqrt(var + 64e-5) * p[d + 'lnxw']
+                  + p[d + 'lnxb']).reshape(B, E)
+            bonus = ((rh * (k.view(B, H, D)) * p[d + 'r_k'])
+                     .sum(-1, keepdim=True) * vh).reshape(B, E)
+            x = x + self.lin(f'l{l}.att.output', (yn + bonus) * g)
+
+            lx2 = ln(x, p[d + 'ln2.weight'], p[d + 'ln2.bias'])
+            xk2 = lx2 + p[d + 'fxk'] * (ffn_prev - lx2)
+            ffn_prev = lx2
+            inner = self.lin(f'l{l}.ffn.key', xk2).relu() ** 2
+            x = x + self.lin(f'l{l}.ffn.value', inner)
+            state[l] = (S, att_prev, ffn_prev)
+
+        x_last = ln(x, p['lnow'], p['lnob'])
+        logits = x_last @ p['head'].t()                     # [B, V]
+        return logits, state
+
 
 def main():
     torch.set_grad_enabled(True)
@@ -264,23 +418,34 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument('--safetensors', default=ST_DEFAULT)
-    ap.add_argument('--steps', type=int, default=1000)
-    ap.add_argument('--lr', type=float, default=3e-4)
+    ap.add_argument('--corpus', default='auto', choices=['auto', 'wikitext', 'repo'])
+    ap.add_argument('--max-train-tokens', type=int, default=3_000_000)
+    ap.add_argument('--steps', type=int, default=10_000,
+                    help='total training steps (across chunks)')
+    ap.add_argument('--start-step', type=int, default=0,
+                    help='override the checkpoint global step (usually left 0; '
+                         'resume supplies it)')
+    ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--lr-min', type=float, default=1e-5)
+    ap.add_argument('--warmup', type=int, default=100)
     ap.add_argument('--window', type=int, default=32)
-    ap.add_argument('--eval-tokens', type=int, default=1024,
-                    help='cap perplexity eval length to bound runtime')
+    ap.add_argument('--batch', type=int, default=8,
+                    help='independent windows per step')
+    ap.add_argument('--clip', type=float, default=1.0)
+    ap.add_argument('--eval-every', type=int, default=200)
+    ap.add_argument('--eval-tokens', type=int, default=4096)
+    ap.add_argument('--time-budget', type=int, default=0,
+                    help='seconds; stop the chunk early and exit 3 (0 = off)')
+    ap.add_argument('--ckpt', default='models/qat_ckpt.pt',
+                    help='checkpoint: masters + optimizer + global step + best')
     ap.add_argument('--out', default='models/rwkv7-0.1B-ternary-qat.gguf')
     ap.add_argument('--seed', type=int, default=1234)
-    ap.add_argument('--start-step', type=int, default=0,
-                    help='resume offset for the stride walk (with --resume)')
-    ap.add_argument('--resume', default=None,
-                    help='torch.save file with master weights to resume from')
-    ap.add_argument('--save-masters', default='models/qat_masters.pt',
-                    help='where to checkpoint master weights after the run')
-    ap.add_argument('--no-export', action='store_true',
-                    help='skip GGUF export (intermediate chunks)')
-    ap.add_argument('--no-eval', action='store_true',
-                    help='skip perplexity evals (intermediate chunks)')
+    ap.add_argument('--log-file', default='qat_log.txt')
+    ap.add_argument('--export-always', action='store_true',
+                    help='export the GGUF even when the chunk ends early')
+    ap.add_argument('--no-export', action='store_true')
+    ap.add_argument('--verify-batch', action='store_true',
+                    help='assert step_batch(B=1) == step() and exit')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -291,93 +456,189 @@ def main():
     from hf_rwkv_tokenizer import RwkvTokenizer
     tok = RwkvTokenizer(vocab_file='models/rwkv_vocab_v20230424.txt')
 
-    header, data_start = load_safetensors(args.safetensors)
-    train_paras, val_paras = load_corpus()
-    train_ids = tok.encode('\n\n'.join(train_paras))
-    val_ids = tok.encode('\n\n'.join(val_paras))
+    if args.corpus in ('auto', 'wikitext'):
+        try:
+            train_ids, val_ids = load_corpus_wikitext(tok, args.max_train_tokens)
+        except Exception as e:                               # noqa: BLE001
+            print(f'[qat] wikitext unavailable ({e}); falling back to repo corpus')
+            if args.corpus == 'wikitext':
+                raise
+            train_ids, val_ids = load_corpus_repo(tok)
+    else:
+        train_ids, val_ids = load_corpus_repo(tok)
     print(f'[qat] corpus: train {len(train_ids):,} tokens, '
           f'val {len(val_ids):,} tokens')
 
+    header, data_start = load_safetensors(args.safetensors)
     model = RWKV7Ternary(args.safetensors, header, data_start)
+    optimizer = torch.optim.AdamW(model.master_list, lr=args.lr,
+                                  weight_decay=0.0, betas=(0.9, 0.95))
 
-    def perplexity(ids, float_masters=False):
-        """Teacher-forced NLL over the first --eval-tokens after a warmup."""
+    def cosine_lr(step):
+        if step < args.warmup:
+            return args.lr * (step + 1) / max(1, args.warmup)
+        t_ = (step - args.warmup) / max(1, args.steps - args.warmup)
+        t_ = min(1.0, t_)
+        return args.lr_min + 0.5 * (args.lr - args.lr_min) * (1 + math.cos(math.pi * t_))
+
+    global_step = args.start_step
+    best = {'ppl': float('inf'), 'step': -1}
+    if os.path.exists(args.ckpt) and args.start_step == 0:
+        ck = torch.load(args.ckpt, map_location='cpu', weights_only=True)
+        with torch.no_grad():
+            for n, t_ in ck['masters'].items():
+                model.masters[n].copy_(t_)
+        if 'optim' in ck:
+            optimizer.load_state_dict(ck['optim'])
+        global_step = ck['global_step']
+        best = {'ppl': ck.get('best_ppl', float('inf')),
+                'step': ck.get('best_step', -1)}
+        print(f'[qat] resumed from {args.ckpt} (global step {global_step}, '
+              f'best val ppl {best["ppl"]:.2f})')
+
+    def log_line(text):
+        print(text, flush=True)
+        try:
+            with open(args.log_file, 'a', encoding='utf-8') as f:
+                stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                f.write(f'[{stamp}] {text}\n')
+        except OSError:
+            pass
+
+    def perplexity(ids, float_masters=False, segments=8):
+        """Teacher-forced NLL over the stream, split into `segments`
+        independent chains run in one batch (near-identical estimate to a
+        single sequential chain, `segments`x faster on CPU)."""
         torch.set_grad_enabled(False)
         model.float_mode = float_masters
         model.begin_window(False)
         W = args.window
-        n = min(len(ids) - 1, args.eval_tokens)
+        seg_len = max(W + 2, (len(ids) - 1) // segments)
+        n_seg = min(segments, (len(ids) - 1) // seg_len)
+        use = min(seg_len - 1, max(W + 1, args.eval_tokens // max(1, n_seg)))
         total_nll, n_pred = 0.0, 0
         state = None
-        for i in range(n):
-            logits, state = model.step(ids[i], state)
-            if i >= W:
-                logp = torch.log_softmax(logits.float(), -1)
-                total_nll += -logp[ids[i + 1]].item()
-                n_pred += 1
+        for j in range(use):
+            toks = torch.tensor(
+                [int(ids[b * seg_len + j]) for b in range(n_seg)],
+                dtype=torch.long)
+            logits, state = model.step_batch(toks, state)
+            if j >= W:
+                logp = torch.log_softmax(logits.float(), -1)   # [B, V]
+                for b in range(n_seg):
+                    total_nll += -logp[b, int(ids[b * seg_len + j + 1])].item()
+                n_pred += n_seg
         model.end_window()
         torch.set_grad_enabled(True)
         return math.exp(total_nll / max(1, n_pred))
 
-    if args.resume and os.path.exists(args.resume):
-        sd = torch.load(args.resume, map_location='cpu', weights_only=True)
-        with torch.no_grad():
-            for n, t_ in sd.items():
-                model.masters[n].copy_(t_)
-        print(f'[qat] resumed masters from {args.resume} '
-              f'({len(sd)} tensors)')
+    def evaluate_and_log(tag):
+        ppl_bf16 = perplexity(train_ids, float_masters=True)
+        ppl_val = perplexity(val_ids)
+        log_line(f'[qat] {tag}: bf16(train) ppl={ppl_bf16:.2f} '
+                 f'ternary val ppl={ppl_val:.2f} '
+                 f'ratio={ppl_val / max(ppl_bf16, 1e-9):.2f}x '
+                 f'best={min(best["ppl"], ppl_val):.2f}')
+        return ppl_bf16, ppl_val
 
-    if args.no_eval:
-        ppl_bf16_tr = ppl_ptq_val = float('nan')
-    else:
-        ppl_bf16_tr = perplexity(train_ids, float_masters=True)
-        ppl_ptq_val = perplexity(val_ids)
-        print(f'[qat] bf16          train ppl = {ppl_bf16_tr:.2f}')
-        print(f'[qat] ternary-PTQ   val   ppl = {ppl_ptq_val:.2f}')
+    if args.verify_batch:
+        ref_ids = [int(x) for x in train_ids[:24]]
+        s1, st1 = None, None
+        model.float_mode = False
+        model.begin_window(False)
+        for i in ref_ids:
+            lg, st1 = model.step(i, st1)
+        s2, st2 = None, None
+        for i in ref_ids:
+            lg2, st2 = model.step_batch(torch.tensor([i], dtype=torch.long), st2)
+        d = (lg - lg2).abs().max().item()
+        smax = max((a - b).abs().max().item()
+                   for (a, _, _), (b, _, _) in zip(st1, st2))
+        print(f'[verify] max|dlogits|={d:.2e} max|dstate|={smax:.2e} '
+              f'{"OK" if d < 1e-3 and smax < 1e-3 else "MISMATCH"}')
+        sys.exit(0 if d < 1e-3 and smax < 1e-3 else 1)
 
-    if args.steps > args.start_step:
-        W = args.window
-        starts = list(range(0, len(train_ids) - W - 1, max(1, W // 4)))
-        for step in range(args.start_step, args.steps):
-            s = starts[(step * 7919) % len(starts)]     # prime stride walk
-            model.begin_window(True)
-            state = None
-            total_loss = 0.0
-            for j in range(s, s + W):
-                logits, state = model.step(train_ids[j], state)
-                loss = torch.nn.functional.cross_entropy(
-                    logits.float().unsqueeze(0),
-                    torch.tensor([train_ids[j + 1]]))
-                total_loss = total_loss + loss
-                state = [(S.detach(), a.detach(), f.detach())
-                         for S, a, f in state]
-            # One backward through the whole window: the shared ternary graph
-            # (TernarySTE nodes) is traversed once, STE grads reach masters.
-            (total_loss / W).backward()
-            torch.nn.utils.clip_grad_norm_(model.master_list, 1.0)
-            for pg in model.optimizer.param_groups:
-                pg['lr'] = args.lr
-            model.optimizer.step()
-            model.optimizer.zero_grad()
-            model.end_window()
-            if step % 25 == 0 or step == args.steps - 1:
-                print(f'[qat] step {step}/{args.steps} '
-                      f'loss {(total_loss / W).item():.3f}', flush=True)
+    if args.eval_every > 0 and global_step == 0 and not os.path.exists(args.ckpt):
+        evaluate_and_log('baseline')
 
-        if not args.no_eval:
-            ppl_qat_val = perplexity(val_ids)
-            print(f'[qat] ternary-QAT   val   ppl = {ppl_qat_val:.2f}')
-            print(f'[qat] SUMMARY: bf16(train)={ppl_bf16_tr:.2f} '
-                  f'ptq(val)={ppl_ptq_val:.2f} qat(val)={ppl_qat_val:.2f}')
-        torch.save({n: t_.detach().clone() for n, t_ in model.masters.items()},
-                   args.save_masters)
-        print(f'[qat] masters saved to {args.save_masters}')
-    else:
-        print('[qat] SUMMARY: bf16(train)=%.2f ptq(val)=%.2f '
-              '(--steps 0: eval-only run)' % (ppl_bf16_tr, ppl_ptq_val))
+    started = time.time()
+    W, B = args.window, args.batch
+    n_starts = max(1, len(train_ids) - W - 2)
 
-    if not args.no_export:
-        export_gguf(model, args)
+    def lr_at(step):
+        lr = cosine_lr(step)
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+        return lr
+
+    while global_step < args.steps:
+        lr_at(global_step)
+        # B independent CONTIGUOUS windows; element b runs tokens
+        # starts[b] .. starts[b]+W-1 through its own RNN state.
+        starts = [(global_step * 7919 + b * 104729) % n_starts
+                  for b in range(B)]
+        model.begin_window(True)
+        state = None
+        total_loss = torch.zeros(())
+        for j in range(W):
+            toks = torch.tensor([int(train_ids[s + j]) for s in starts],
+                                dtype=torch.long)
+            logits, state = model.step_batch(toks, state)
+            tgt = torch.tensor([int(train_ids[s + j + 1]) for s in starts],
+                               dtype=torch.long)
+            loss = torch.nn.functional.cross_entropy(logits.float(), tgt)
+            total_loss = total_loss + loss
+            state = [(S.detach(), a.detach(), f.detach()) for S, a, f in state]
+        (total_loss / W).backward()
+        torch.nn.utils.clip_grad_norm_(model.master_list, args.clip)
+        optimizer.step()
+        optimizer.zero_grad()
+        model.end_window()
+        global_step += 1
+
+        if args.eval_every > 0 and (global_step % args.eval_every == 0
+                                    or global_step >= args.steps):
+            ppl_val = perplexity(val_ids)
+            if ppl_val < best['ppl']:
+                best = {'ppl': ppl_val, 'step': global_step}
+                torch.save({n: t_.detach().clone() for n, t_ in model.masters.items()},
+                           args.ckpt.replace('.pt', '-best.pt'))
+            log_line(f'[qat] step {global_step}/{args.steps} '
+                     f'loss {(total_loss / W).item():.3f} lr={lr_at(global_step):.2e} '
+                     f'val_ppl={ppl_val:.2f} best={best["ppl"]:.2f}'
+                     f'@{best["step"]}')
+
+        if args.time_budget and time.time() - started > args.time_budget \
+                and global_step < args.steps:
+            log_line(f'[qat] chunk time budget reached at step {global_step}')
+            break
+
+    # ---- persist checkpoint (masters + optimizer + progress + best) ----------
+    torch.save({'masters': {n: t_.detach().clone()
+                            for n, t_ in model.masters.items()},
+                'optim': optimizer.state_dict(),
+                'global_step': global_step,
+                'best_ppl': best['ppl'], 'best_step': best['step']},
+               args.ckpt)
+    log_line(f'[qat] checkpoint saved: {args.ckpt} (step {global_step}, '
+             f'best {best["ppl"]:.2f}@{best["step"]})')
+
+    done = global_step >= args.steps
+    if done or args.export_always:
+        if not args.no_export:
+            if best['ppl'] < float('inf') and os.path.exists(
+                    args.ckpt.replace('.pt', '-best.pt')):
+                bb = torch.load(args.ckpt.replace('.pt', '-best.pt'),
+                                map_location='cpu', weights_only=True)
+                with torch.no_grad():
+                    for n, t_ in bb.items():
+                        model.masters[n].copy_(t_)
+                log_line(f'[qat] exporting BEST masters '
+                         f'(ppl {best["ppl"]:.2f} @ step {best["step"]})')
+            export_gguf(model, args)
+    if args.eval_every > 0 and (done or args.export_always):
+        evaluate_and_log(f'final @ step {global_step}')
+    sys.exit(EXIT_DONE if done else EXIT_MORE)
 
 
 def export_gguf(model, args):
@@ -480,7 +741,8 @@ def export_gguf(model, args):
     add_i8('head', T(hkey))
 
     size = w.write(args.out)
-    print(f'[qat] wrote {args.out}: {size:,} bytes ({size / 1048576:.1f} MB)')
+    print(f'[qat] wrote {args.out}: {size:,} bytes ({size / 1048576:.1f} MB)',
+          flush=True)
 
 
 if __name__ == '__main__':

@@ -21,6 +21,12 @@ models/config.json
 models/goose28_*.json
 models/goose28_modeling.py
 
+# QAT training artifacts (checkpoint/masters are regenerable; corpus cache is
+# a deterministic transform of the wikitext-103 download + in-repo vocab)
+models/corpus/
+models/qat_ckpt*.pt
+qat_log.txt
+
 # Compiler intermediates (stray ad-hoc builds)
 *.obj
 *.pdb
