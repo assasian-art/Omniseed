@@ -35,8 +35,10 @@ FROM alpine:3.20
 RUN apk add --no-cache libstdc++ && adduser -D -H omniseed
 
 WORKDIR /app
-COPY --from=builder /src/build/bin/omniseed /app/omniseed
-COPY --from=builder /src/build/bin/omniseed_server /app/omniseed_server
+# Single-config CMake generators (Ninja/unix-makefiles) emit binaries into
+# build/ directly (build/bin/ is only the VS multi-config layout).
+COPY --from=builder /src/build/omniseed /app/omniseed
+COPY --from=builder /src/build/omniseed_server /app/omniseed_server
 
 USER omniseed
 EXPOSE 8080

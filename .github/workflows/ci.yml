@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-gcc:
+    name: ubuntu-latest (gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+                  -DOMNISEED_BUILD_TESTS=ON
+                  -DOMNISEED_BUILD_CLI=ON
+                  -DOMNISEED_BUILD_SERVER=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j"$(nproc)"
+
+      - name: Unit tests (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke — model-less CLI
+        run: |
+          ./build/bin/omniseed selftest
+          ./build/bin/omniseed info
+          ./build/bin/omniseed bench
+
+      - name: Smoke — server /health (no model attached)
+        run: |
+          ./build/bin/omniseed_server --port 8099 &
+          SERVER_PID=$!
+          sleep 2
+          curl -sf http://127.0.0.1:8099/health
+          echo
+          curl -sf http://127.0.0.1:8099/ | head -c 200
+          echo
+          kill $SERVER_PID
+
+  windows-msvc:
+    name: windows-latest (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+                  -DOMNISEED_BUILD_TESTS=ON
+                  -DOMNISEED_BUILD_CLI=ON
+                  -DOMNISEED_BUILD_SERVER=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Unit tests (ctest)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke — model-less CLI
+        run: |
+          ./build/bin/omniseed selftest
+          ./build/bin/omniseed info
+          ./build/bin/omniseed bench
+        shell: bash
