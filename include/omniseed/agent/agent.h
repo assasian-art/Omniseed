@@ -176,6 +176,9 @@ public:
         float    temperature    = 0.0f;
         int32_t  top_k          = 0;
         uint64_t seed           = 42;
+        // Streaming: invoked per decoded piece during generate() (chat UI).
+        // nullptr = buffered (default). Must not throw.
+        std::function<void(const std::string&)> on_token;
     };
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,

@@ -679,6 +679,14 @@ int cmd_chat(Session& s) {
 
     AgentLoop::Config cfg;
     cfg.max_new_tokens = s.max_tokens;
+    cfg.temperature = s.temperature;
+    cfg.top_k = s.top_k;
+    // Streaming: print each piece as it is decoded, then finish the line
+    // after generation completes (Result.reply holds the same text).
+    cfg.on_token = [](const std::string& piece) {
+        std::fputs(piece.c_str(), stdout);
+        std::fflush(stdout);
+    };
     AgentLoop loop(*s.model, s.tok, tools, mem, thr, imp, cfg);
 
     RwkvState st;
@@ -693,7 +701,7 @@ int cmd_chat(Session& s) {
         if (line.empty()) continue;
 
         const AgentLoop::Result r = loop.run(line);
-        std::printf("%s\n", r.reply.c_str());
+        std::printf("\n");
         for (const std::string& t : r.tool_trace)
             std::printf("[tool] %s\n", t.c_str());
     }

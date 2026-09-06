@@ -164,6 +164,11 @@ private:
     bool load_meta(const GgufLoader& gg);
     bool load_weights(const GgufLoader& gg);
 
+  public:
+    // Access to the model's own GGUF store (kept alive for tensor views).
+    // Used to load the embedded tokenizer without reopening the file.
+    const GgufLoader& gguf_store() const { return store_; }
+
     // Owns the mmap the ternary/f16 tensor views point into. MUST outlive
     // every view: a local GgufLoader in load() unmaps on return and the
     // first forward() segfaults.

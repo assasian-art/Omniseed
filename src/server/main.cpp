@@ -100,6 +100,9 @@ std::string json_field(const std::string& body, const std::string& key) {
 int main(int argc, char** argv) {
     int port = kPort;
     std::string model_path = "./models/omniseed.gguf";
+    // Documented deployment env (see Dockerfile): OMNISEED_MODEL is the
+    // fallback default; an explicit --model flag wins.
+    if (const char* env = std::getenv("OMNISEED_MODEL")) model_path = env;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = std::atoi(argv[++i]);
@@ -142,9 +145,18 @@ int main(int argc, char** argv) {
 
     // Model + agent bundle (single session; request loop is serialized).
     Tokenizer tok;
-    tok.build_minimal();
     RwkvModel model;
     const bool have_model = model.load(model_path);
+    if (have_model) {
+        // Prefer the world vocab embedded in the GGUF over the minimal
+        // byte-level tokenizer (chat-quality decoding requires it).
+        if (!tok.load_from_gguf(model.gguf_store())) {
+            platform::log_warn("GGUF tokenizer missing — falling back to minimal");
+            tok.build_minimal();
+        }
+    } else {
+        tok.build_minimal();
+    }
     if (!have_model) {
         platform::log_warn("model not loaded: %s — /health only",
                            model.error().c_str());

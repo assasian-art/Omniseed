@@ -77,6 +77,9 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
 
         out += piece;
 
+        // streaming hook (chat UI): invoked after the piece is committed
+        if (cfg_.on_token) cfg_.on_token(piece);
+
         bool stop = false;
         for (const int32_t sp : stop_pieces) {
             if (sp == id) { stop = true; break; }
