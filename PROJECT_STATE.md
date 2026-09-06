@@ -212,6 +212,44 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
   paths corrected to `build/omniseed_server`, single-config CMake), live
   verification (wake the model first!), budget notes.
 
+### TASK 3 — Real whisper decoder (end-to-end ASR) ✅ (commit 1939cd9)
+- `tools/convert_senses.py` now exports the full **decoder**: tied
+  `whisper.dec.tok_embd` [51865,384] (doubles as lm_head), learned pos table
+  [448,384], 4 pre-LN blocks (self-attn + cross-attn + MLP, whisper-tiny ships
+  **no k_proj biases** — converter writes biases only when present), final LN,
+  and the **byte-level vocab** as `whisper.vocab_offsets` (I32-as-F32 container)
+  + `whisper.vocab_bytes` (bytes in an F16 container — piece byte i = low byte
+  of element i; the loader has no string-array dtype). Specials (ids 50258+)
+  come from tokenizer.json `added_tokens`. Sidecar: 72.9 MB.
+- `WhisperTiny` (pure C++17):
+  - **encoder upgraded to real bidirectional MHA** (6 heads; per-block K/V
+    caches) — the old per-token value shortcut produced garbage cross-attn
+    context; HF's **final encoder layer_norm** is now applied to the output
+    (the decoder cross-attends to that normalized output).
+  - **`decode_greedy`**: forced prompt `<|startoftranscript|><|en|>
+    <|transcribe|><|notimestamps|>` (ids 50258/50259/50359/50363 — note
+    `<|en|>` is 50259, NOT 50262), causal self-attention with incremental
+    per-layer K/V caches, cross-attention K/V precomputed once per layer from
+    the encoder frames, tied-embedding lm_head + argmax, greedy until
+    `<|endoftext|>` (50257) or the 224-token cap.
+  - Verified: 5 s of silence → **EOT at step 0 → ""** (correct); debug top-5
+    (env `OMNISEED_DBG=1`) shows 50257 as the top token. Encoder-only sidecars
+    still work (documented `<|audio|> frames` fallback; decoder load failures
+    never invalidate the encoder).
+- Tests: `omniseed_sides` **17/17** (decoder coverage added: bounded runtime,
+  bounded output, printable bytes); 165/165 + 13/13 unchanged.
+
+### TASK 4 — CI portability proof ✅ (commit 5250268)
+- `.github/workflows/ci.yml`: **ubuntu-latest (gcc)** + **windows-latest
+  (MSVC VS2022, x64)** — Release configure/build, `ctest` both OSes, plus
+  model-less smokes: `omniseed selftest/info/bench` (all exit 0 without a
+  model) and, on Linux, `omniseed_server` + `curl /health` + `GET /`.
+- Static Linux audit passed (no g++/Docker on this box — the CI run is the
+  real proof): platform guards `OMNISEED_PLATFORM_*`, GCC `__builtin_cpu_*`
+  cpuid path, per-TU `-mavx2;-mfma` flags, POSIX RSS via `/proc/self/status`,
+  portable mkdir in flash_skills. Dockerfile COPY paths fixed (single-config
+  generators emit into `build/`, not `build/bin/`).
+
 ### TASK 2 — Full-scale QAT (tooling ✅; long run IN PROGRESS)
 - `tools/qat_ternary.py` rewritten for full scale: **wikitext-103-raw**
   auto-download + token cache (`models/corpus/*.npy`, gitignored), **batched

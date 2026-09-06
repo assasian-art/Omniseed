@@ -1,8 +1,10 @@
 # OmniSeed — Master Specification
 
-**Version:** 2.0 (real weights) · **Date:** 2026-09-06 · **Language:** pure C++17
+**Version:** 2.1 (Phase 9 — deploy, decoder ASR, CI) · **Date:** 2026-09-07 ·
+**Language:** pure C++17
 **Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
-RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2)**
+RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 115 MB on the
+ternary-QAT path**
 
 OmniSeed is a self-improving, multi-modal **micro-LLM agent kernel** designed from the
 ground up for the 100–300 MB RAM frontier described in the seven project research
@@ -230,10 +232,13 @@ Artifacts: `build/bin/omniseed.exe` (CLI), `build/bin/omniseed_tests.exe`,
 `build/bin/omniseed_real_weights.exe`, `build/bin/omniseed_sides.exe`,
 `build/bin/omniseed_server.exe` (HTTP control plane), `lib/omniseed_core`.
 
-Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`
-(SSE chat service), `docs/DEPLOYMENT.md` (Render/Fly/local guides). The server
-honors `--model` or `OMNISEED_MODEL`, loads the world tokenizer straight from the
-GGUF, and `/health` reports `model:true` + `peak_rss_mb`.
+Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`,
+`docs/DEPLOYMENT.md` + `docs/RENDER_LIVE_CHECKLIST.md` (push → blueprint →
+model attach → verify). The server honors `--model` or `OMNISEED_MODEL`, loads
+the world tokenizer straight from the GGUF, serves a **browser demo console at
+`GET /`** (inline HTML, calls `/gen`, polls `/health`), and `/health` reports
+`model:true` + `peak_rss_mb`. CI: `.github/workflows/ci.yml` builds + ctests on
+ubuntu (gcc) and windows (MSVC) with model-less server smokes.
 
 **Model & weights (offline Python tooling; never shipped at runtime):**
 
@@ -241,8 +246,8 @@ GGUF, and `/health` reports `model:true` + `peak_rss_mb`.
 |---|---|
 | `tools/convert_to_omniseed.py` | Hakureirm/BlinkDL RWKV-7 World checkpoints → OmniSeed GGUF (i8 or ternary linears, fp16 embedding/head, embedded world vocab) |
 | `tools/convert_goose28.py` | Official `RWKV/RWKV7-Goose-World2.8-0.1B-HF` (fla naming) → same GGUF; proven bit-identical weights to the Hakureirm 0.1B |
-| `tools/convert_senses.py` | OpenAI whisper-tiny encoder + mel filters → `models/whisper-tiny-encoder.gguf`; vision projection → `models/vision-proj.gguf` |
-| `tools/qat_ternary.py` | STE-based QAT toward true ternary (PoC: PTQ ppl 479,871 → 230,013 after 150 toy steps; bf16 baseline 41.9) |
+| `tools/convert_senses.py` | OpenAI whisper-tiny **encoder + decoder** + mel filters → `models/whisper-tiny-encoder.gguf` (72.9 MB, byte-level vocab embedded); vision projection → `models/vision-proj.gguf` |
+| `tools/qat_ternary.py` | Full-scale STE QAT on **wikitext-103** (auto-download, batched training, AdamW+cosine, resumable `--time-budget` chunks, best-checkpoint tracking, `qat_log.txt`); `tools/qat_watch.bat`/`.sh` loop chunks in the background |
 | `tools/check_gguf.py` | GGUF structural/dtype validator |
 
 **Benchmark (x64, MSVC Release, 0.1B model loaded):** 2.1 tok/s scalar →
@@ -287,9 +292,10 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
   audio, vision, swarm (`tests/test_platform.cpp`) — **165 passed / 0 failed**.
 - **Real-weights suite** (`tests/test_real_weights.cpp`, skips if no GGUF):
   **13/13** — loader integrity, finite logits, stable greedy continuation, RSS cap.
-- **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **14/14** —
-  whisper encoder end-to-end on synthetic mel, ternary vision projection,
-  all-finite outputs.
+- **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **17/17** —
+  whisper encoder end-to-end on synthetic mel (real bidirectional MHA),
+  **greedy decoder transcription** (silence → EOT → empty transcript,
+  bounded runtime), ternary vision projection, all-finite outputs.
 - **Warnings:** zero under MSVC `/W4` (Release); AddressSanitizer clean on the
   senses suite after the null-optional-bias + mmap-lifetime fixes.
 - **Checkpoint equivalence:** official Goose-2.8 0.1B and Hakureirm 0.1B proven
@@ -300,10 +306,12 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
 ## 9. Known Limitations & Roadmap
 
 1. **True ternary at quality** — the runtime's ternary path is fully functional and
-   QAT is proven (2.1× perplexity recovery in 150 toy steps), but matching the i8
-   model's quality needs a real corpus and thousands of steps of QAT on CPU.
-2. **Whisper decoder** — the encoder is real and loaded from sidecar weights; the
-   autoregressive text decoder is still algorithmic.
+   full-scale QAT runs (wikitext-103, resumable chunks; trajectory in `qat_log.txt`:
+   bf16 31.16 → PTQ 257,402 → 538.85 @ step 200, falling); reaching the ≤1.25×
+   target needs the remaining ~3,800 steps (~13 h CPU) via `tools/qat_watch.bat`.
+2. **Whisper decoder language coverage** — end-to-end greedy ASR works in pure C++
+   (silence → EOT verified; real MHA encoder feeds real cross-attention); true
+   speech transcripts need audio test fixtures and optional timestamp handling.
 3. **WebRTC (#19)** — replaced by the leaner UDP beacon in-budget; a libdatachannel
    integration is the natural upgrade when the 300 MB cap is relaxed.
 4. **Catalog III (#81–100)** — research-frontier items; interfaces reserved as noted.
