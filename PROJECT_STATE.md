@@ -212,6 +212,31 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
   paths corrected to `build/omniseed_server`, single-config CMake), live
   verification (wake the model first!), budget notes.
 
+### TASK 2 — Full-scale QAT (tooling ✅; long run IN PROGRESS)
+- `tools/qat_ternary.py` rewritten for full scale: **wikitext-103-raw**
+  auto-download + token cache (`models/corpus/*.npy`, gitignored), **batched
+  training** (`step_batch`: B independent contiguous windows per step —
+  verified **bitwise identical** to the reference `step()` via `--verify-batch`;
+  fixed an outer-product that used the pre-blend k instead of the blended k),
+  AdamW + cosine LR + warmup + grad-clip, periodic eval (32 parallel segments),
+  best-checkpoint tracking, `qat_log.txt`, `--time-budget` chunks that exit 3.
+- `tools/qat_chunk.py` + `tools/qat_watch.bat` / `tools/qat_watch.sh`: loop
+  chunks until the target step count; resume from `models/qat_ckpt.pt`
+  (masters + optimizer + global step + best). Restart-safe.
+- Throughput: ~8.5 tok/s training (B=8/W=16, single-thread — multi-thread is
+  5× slower on this box; B=16 improves tok/s but halves updates/step).
+- **Trajectory (wikitext-103 val, 2048-token estimate):** bf16 baseline
+  **31.16** → ternary-PTQ **257,402** → step 175 **607.18** → step 200
+  **538.85** … (falling; log in `qat_log.txt`). Export/load chain re-verified:
+  `models/rwkv7-0.1B-ternary-qat.gguf` (192.1 MB) loads in C++ at **115 MB
+  peak** and already samples wikitext-domain words ("the 1950s…") — coherent
+  prose expected only near the ≤1.25×-of-bf16 (~39) target.
+- **Resume command** (needs ~13 h at 12.5 s/step to 4000):
+  `tools\qat_watch.bat 3000` (Windows) / `./tools/qat_watch.sh 3000` (Unix),
+  or single chunks:
+  `./.venv/Scripts/python.exe -u tools/qat_ternary.py --corpus wikitext
+  --steps 4000 --eval-every 50 --window 16 --batch 8 --time-budget 470`
+
 ## 3. NEXT STEPS (in order)
 
 1. **Full-scale QAT**: real corpus (multi-GB), 10k+ steps, lr schedule → make
