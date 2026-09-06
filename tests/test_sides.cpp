@@ -113,13 +113,10 @@ int main() {
     // --------------------------- vision proj ---------------------------------
     if (file_exists("models/vision-proj.gguf")) {
         VisionEncoder vis;
-        std::printf("  before vis load\n"); std::fflush(stdout);
         if (!vis.load("models/vision-proj.gguf"))
             std::printf("  vision load error: %s\n", vis.error().c_str());
-        std::printf("  after vis load\n"); std::fflush(stdout);
         CHECK(vis.valid());
         if (vis.valid()) {
-            std::printf("  before vis encode\n"); std::fflush(stdout);
             UniCompress comp;
             Image im = make_gradient(96, 96);
             Tensor out;

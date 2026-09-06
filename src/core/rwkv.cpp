@@ -497,6 +497,9 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         const float* last = st.tmix_state[static_cast<size_t>(l)].f32();
 
         std::vector<float> xr(E), xw(E), xk(E), xv(E), xa(E), xg(E);
+        // token-shift blend: xs = lx + mix*(lx_prev - lx), state stores the NORMED lx
+        // (identical for BlinkDL and official-HF/fla checkpoints — verified against
+        // transformers' Rwkv7TokenShift + fused_addcmul algebra).
         for (int32_t i = 0; i < E; ++i) {
             const float d = last[i] - lx[i];
             xr[i] = lx[i] + w.tmix_r.f32()[i] * d;
@@ -686,6 +689,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         const float* last2 = st.ffn_state[static_cast<size_t>(l)].f32();
 
         std::vector<float> xv2(E);
+        // ffn token-shift: same blend form as the attention stream.
         for (int32_t i = 0; i < E; ++i)
             xv2[i] = lx2[i] + w.F_mix_v.f32()[i] * (last2[i] - lx2[i]);
         std::memcpy(st.ffn_state[static_cast<size_t>(l)].f32(), lx2,

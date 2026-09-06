@@ -41,6 +41,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -510,6 +512,8 @@ struct Session {
     int32_t top_k = 0;
     uint64_t seed = 42;
     std::string prompt;
+    std::string eval_file;      // ppl: corpus file (else --prompt text)
+    int32_t    eval_tokens = 2048;  // ppl: token budget
 
     Tokenizer tok;
     std::unique_ptr<RwkvModel> model;
@@ -645,6 +649,73 @@ int cmd_ask(Session& s) {
     return 0;
 }
 
+// Teacher-forced cross-entropy over a corpus: the honest apples-to-apples
+// quality metric for comparing checkpoints/quantizations.
+int cmd_ppl(Session& s) {
+    if (!s.load()) return 1;
+
+    std::vector<int32_t> ids;
+    if (!s.eval_file.empty()) {
+        std::ifstream f(s.eval_file, std::ios::binary);
+        if (!f) {
+            std::printf("cannot open eval file: %s\n", s.eval_file.c_str());
+            return 1;
+        }
+        std::stringstream ss;
+        ss << f.rdbuf();
+        ids = s.tok.encode(ss.str(), /*add_bos=*/true);
+    } else {
+        const std::string text = s.prompt.empty()
+            ? "The quick brown fox jumps over the lazy dog. "
+              "Language models predict the next token from context. "
+              "Perplexity measures how surprised the model is. "
+              "Lower is better. "
+            : s.prompt;
+        ids = s.tok.encode(text, /*add_bos=*/true);
+    }
+    if (s.eval_tokens > 0 &&
+        static_cast<size_t>(s.eval_tokens) + 1 < ids.size()) {
+        ids.resize(static_cast<size_t>(s.eval_tokens) + 1);
+    }
+    if (ids.size() < 8) {
+        std::printf("eval text too short (%zu ids)\n", ids.size());
+        return 1;
+    }
+
+    RwkvState st;
+    s.model->init_state(st);
+    Tensor logits("logits", {s.model->config().n_vocab}, DType::F32);
+
+    double nll = 0.0;
+    int64_t n_pred = 0;
+    int32_t prev = ids[0];
+    const auto t0 = platform::now_ms();
+    for (size_t i = 1; i < ids.size(); ++i) {
+        s.model->forward(prev, st, logits);
+        const int32_t tgt = ids[i];
+        const float* l = logits.f32();
+        float mx = l[0];
+        for (int32_t v = 1; v < s.model->config().n_vocab; ++v)
+            if (l[v] > mx) mx = l[v];
+        double sum = 0.0;
+        for (int32_t v = 0; v < s.model->config().n_vocab; ++v)
+            sum += std::exp(static_cast<double>(l[v] - mx));
+        nll -= std::log(std::exp(static_cast<double>(l[tgt] - mx)) / sum);
+        ++n_pred;
+        prev = tgt;
+    }
+    const double ms = platform::now_ms() - t0;
+    const double ppl = std::exp(nll / static_cast<double>(n_pred));
+    std::printf("tokens=%lld nll=%.4f bits/token=%.4f PPL=%.2f (%.0f ms, %.1f tok/s, peak %.1f MB)\n",
+                static_cast<long long>(n_pred),
+                nll / static_cast<double>(n_pred),
+                nll / static_cast<double>(n_pred) / std::log(2.0),
+                ppl, ms,
+                static_cast<double>(n_pred) / (ms / 1000.0),
+                static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
+    return 0;
+}
+
 int cmd_bench(Session& s) {
     if (!s.load()) return 1;
 
@@ -731,6 +802,9 @@ int main(int argc, char** argv) {
             s.top_k = std::atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc)
             s.seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];
+        else if (a == "--eval-tokens" && i + 1 < argc)
+            s.eval_tokens = std::atoi(argv[++i]);
         else if (a == "--quiet") platform::set_quiet(true);
         else if (!s.prompt.empty()) { /* positional handled below */ }
     }
@@ -761,6 +835,7 @@ int main(int argc, char** argv) {
     if (cmd == "ask")      { if (s.prompt.empty()) { print_usage(); return 1; }
                              return cmd_ask(s); }
     if (cmd == "bench")    { return cmd_bench(s); }
+    if (cmd == "ppl")      { return cmd_ppl(s); }
     if (cmd == "chat")     { return cmd_chat(s); }
 
     print_usage();

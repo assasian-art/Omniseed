@@ -63,6 +63,10 @@ struct RwkvConfig {
     int32_t rank_a        = 64;   // in-context-learning rate LoRA
     int32_t rank_g        = 128;  // gate LoRA
     int32_t rank_v        = 32;   // value-residual LoRA
+    // Token-shift parameterization of the source checkpoint family:
+    //   false (Hakureirm/BlinkDL):  xs = lx + mix * (lx_prev - lx)
+    //   true  (fla/official HF):    xs = x    + mix * x_prev
+    // Different math for the same parameter names — selected per file.
     bool    version_known = false;
 };
 
