@@ -2,7 +2,8 @@
 //  OmniSeed — server/main.cpp
 //  Optional HTTP server (OMNISEED_HTTP). Vendored minimal socket loop —
 //  no external dependencies. Endpoints:
-//    GET  /health         -> {"ok":true}
+//    GET  /               -> one-page HTML demo console (talks to /gen)
+//    GET  /health         -> {"ok":true,"model":bool,"peak_rss":MB}
 //    POST /ask            -> one agent turn (json body: {"task": "..."})
 //    POST /gen            -> raw generation (json body: {"prompt": "..."})
 //
@@ -93,6 +94,106 @@ std::string json_field(const std::string& body, const std::string& key) {
     const auto q2 = body.find('"', q1 + 1);
     if (q1 == std::string::npos || q2 == std::string::npos) return "";
     return body.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// One-page demo console: a browser chat box against POST /gen. No assets,
+// no CDNs — everything inline so it works on an air-gapped LAN too.
+const char* demo_page() {
+    return R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OmniSeed Console</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; flex-direction:column;
+         font:15px/1.5 system-ui, sans-serif; background:#0e1116; color:#e6e6e6; }
+  header { padding:14px 20px; border-bottom:1px solid #232a35;
+           display:flex; align-items:baseline; gap:12px; }
+  header h1 { margin:0; font-size:17px; letter-spacing:.4px; }
+  header .tag { font-size:12px; color:#8b98a8; }
+  header .dot { margin-left:auto; font-size:12px; color:#8b98a8; }
+  #log { flex:1; overflow-y:auto; padding:20px; max-width:820px; width:100%;
+         margin:0 auto; }
+  .msg { margin:0 0 14px; padding:10px 14px; border-radius:10px;
+         white-space:pre-wrap; word-break:break-word; }
+  .you { background:#1d2a45; align-self:flex-end; }
+  .bot { background:#1a2029; }
+  .bot.pending::after { content:'\25cf'; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.2; } }
+  form { display:flex; gap:8px; padding:14px 20px; border-top:1px solid #232a35;
+         max-width:820px; width:100%; margin:0 auto; }
+  input { flex:1; padding:10px 12px; border-radius:8px; border:1px solid #2c3644;
+          background:#161c25; color:#e6e6e6; font:inherit; }
+  input:focus { outline:none; border-color:#4a7dd4; }
+  button { padding:10px 18px; border:0; border-radius:8px; background:#2f6fed;
+           color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { background:#243247; cursor:wait; }
+  .err { color:#ff8484; font-size:12px; margin:-8px 0 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#127790; OmniSeed</h1>
+  <span class="tag">sub-300 MB multi-modal micro-LLM &mdash; RWKV-7 &middot; ternary/int8 &middot; pure C++17</span>
+  <span class="dot" id="health">checking&hellip;</span>
+</header>
+<div id="log"></div>
+<form id="f" autocomplete="off">
+  <input id="p" placeholder="Say something&hellip;" autofocus>
+  <button id="b">Send</button>
+</form>
+<script>
+const log = document.getElementById('log'), p = document.getElementById('p'),
+      b = document.getElementById('b'), health = document.getElementById('health');
+function add(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+async function checkHealth() {
+  try {
+    const h = await (await fetch('/health')).json();
+    health.textContent = 'model: ' + (h.model ? 'loaded' : 'missing') +
+                         ' | peak RSS: ' + h.peak_rss + ' MB';
+  } catch { health.textContent = 'unreachable'; }
+}
+checkHealth(); setInterval(checkHealth, 30000);
+
+document.getElementById('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = p.value.trim();
+  if (!text || b.disabled) return;
+  add('you', text);
+  p.value = '';
+  b.disabled = true;
+  const bot = add('bot pending', '');
+  try {
+    const r = await fetch('/gen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: text })
+    });
+    const j = await r.json();
+    bot.classList.remove('pending');
+    bot.textContent = (j.text || j.error || '(empty response)').replace(/\n+/g, ' ').trim();
+  } catch (err) {
+    bot.classList.remove('pending');
+    bot.textContent = 'error: ' + err;
+    bot.classList.add('err');
+  }
+  b.disabled = false;
+  p.focus();
+  log.scrollTop = log.scrollHeight;
+});
+</script>
+</body>
+</html>)HTML";
 }
 
 } // namespace
@@ -198,7 +299,9 @@ int main(int argc, char** argv) {
         const std::string body = body_pos == std::string::npos
             ? "" : req.substr(body_pos + 4);
 
-        if (path == "/health") {
+        if (path == "/" || path == "/index.html") {
+            respond(client, demo_page(), "text/html; charset=utf-8");
+        } else if (path == "/health") {
             std::string b = std::string("{\"ok\":true,\"model\":") +
                             (have_model ? "true" : "false") +
                             ",\"peak_rss\":" +
