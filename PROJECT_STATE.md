@@ -132,6 +132,29 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 | FFT (TASK 4) | `include/omniseed/core/fft.h` — radix-2 + **Bluestein chirp-z** for exact N=400 bins 0..200 with M=1024 (O(N log N), same bins as the naive DFT it replaces). Wired into `whisper_tiny.cpp` log-mel. Test: matches naive DFT to 1e-6, identical tone bin. |
 | Real-weights test | `tests/test_real_weights.cpp` (13 checks): skips when the model file is absent; asserts config, finite logits, recorded greedy continuation (±2 tie window), sampling determinism, <300 MB RSS. Registered as ctest `omniseed_real_weights` (WD = repo root; `omniseed_platform` got the same fix). ctest: **2/2 suites pass**. |
 
+## 2c. PHASE 8 — SPEED + REAL SENSES ✅ (TASK 1: earlier commit; TASK 2: ac42318)
+
+### TASK 1 — Speed (AVX2) ✅
+- AVX2 + SSE4.1 + scalar kernels for the per-row int8 dot (`src/core/bitlinear_avx2.cpp`, cpuid dispatch in `platform`, runtime-selected via function pointers). AVX2 kernel measured **7.3× the scalar** in isolation (0.45 → 3.25 GMAC/s).
+- Profiled: the fp16 head matmul was 68% of token time (scalar `half_to_float` on 50M values). Head is now stored **int8 with per-row scales in the GGUF** (converter writes i8 head; loader accepts it) → fp16 head conversion at load time removed.
+- **Result: 2.1 → 19.2 tok/s (9.1×), peak RSS 202.8 → 155 MB**, greedy continuation byte-identical to pre-change (numerics preserved).
+
+### TASK 2 — Real senses ✅
+- `tools/convert_senses.py` (offline): converts **openai/whisper-tiny** encoder safetensors + official `mel_filters.npz` (80×201) → `models/whisper-tiny-encoder.gguf` sidecar; **vision projection head** (ternary + per-row fp32 scales) → `models/vision-proj.gguf`.
+- `WhisperTiny`: loads the full encoder (conv stem, pos-embed, 4 post-LN blocks, ln) and runs a real forward: mel → conv1/gelu → conv2/gelu → +pos → blocks → [T/2, 384] (98 frames → 49×384, all finite). `weights_loaded_` now true when sidecar present; spectral-hash fallback remains only as fallback.
+- `VisionEncoder`: loads ternary `vision.proj.weight` + per-row scales; encode runs patch features → UniCompress → **real ternary BitLinear projection** (output varies with input; identity fallback retired).
+- Full load-time tensor sweeps (env `OMNISEED_DBG=1`) read every element of every sidecar tensor at load.
+- Sidecar bias convention: **present = full extent, absent = loader tolerates** (`load_f16(..., required=false)`); never dereference an optional bias without the guard below.
+
+### TASK 2 postmortem (three stacked bugs)
+1. `GgufLoader::read_tensor_dir` raised "unsupported dtype 40" for TERNARY: `gguf_dtype_size` returns 0 for ternary ("handled at call site") but the error fired **before** the call-site special case. Fixed the order.
+2. `Tensor::nbytes()` returned numel bytes for TERNARY (true stored size is packed `(numel+1)/2`) — any full-region scan walked 2× the mapped bytes. Fixed to match the loader.
+3. **The subtle one**: a default-constructed (absent) `Tensor` has `numel()==1` (empty-shape product) with `data()==nullptr`, so the widespread `numel() > 0` "optional present" guard **passed for missing tensors** and then dereferenced null (ASan: access-violation at the vision bias add). All optional-tensor guards now use `numel() > 1`. ASan build (`build/asan_build.bat` pattern: `/fsanitize=address` + MSVC asan DLL on PATH) found in one run what hours of Release-mode printf bisection could not.
+- Loader-ownership rule (3rd strike): **every component holding non-owning views must own its `GgufLoader`** (RwkvModel `store_`, WhisperTiny `store_`, VisionEncoder `store_`). A local loader unmaps on return and dangles.
+
+### Verification (Phase 8 so far)
+- `omniseed_tests` 165/165, `omniseed_real_weights` 13/13, new `omniseed_sides` **14/14** (registered ctest-side, skips cleanly when sidecars absent): mel [80×98], encode [49×384] finite, vision 768-dim projection finite + input-sensitive (gradient vs inverted differ > 1e-4).
+
 ## 3. NEXT STEPS (in order)
 
 1. **Vision/audio/focal weights**: extend the converter for MobileNetV4,
