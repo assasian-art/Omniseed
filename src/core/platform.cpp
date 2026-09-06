@@ -12,6 +12,10 @@
 #include <new>
 #include <string>
 
+#if defined(_MSC_VER) && (defined(__x86_64__) || defined(_M_X64))
+#include <intrin.h>   // __cpuid, __cpuidex, _xgetbv
+#endif
+
 // ---------------------------------------------------------------------------
 // Windows includes
 // ---------------------------------------------------------------------------
@@ -386,6 +390,49 @@ void log_error(const char* fmt, ...) {
     va_end(args);
 }
 void set_quiet(bool quiet) { g_quiet = quiet; }
+
+// ---------------------------------------------------------------------------
+// CPU feature detection
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define OMNISEED_X86_ 1
+#else
+#define OMNISEED_X86_ 0
+#endif
+
+CpuFeatures cpu_features() {
+    CpuFeatures f;
+#if OMNISEED_X86_
+#if defined(_MSC_VER)
+    int regs[4];
+    __cpuid(regs, 0);
+    const int max_leaf = regs[0];
+    if (max_leaf >= 1) {
+        __cpuid(regs, 1);
+        // ECX: bit 19 = SSE4.1, bit 27 = OSXSAVE, bit 28 = AVX, bit 12 = FMA
+        f.sse41 = (regs[2] & (1u << 19)) != 0;
+        const bool avx      = (regs[2] & (1u << 28)) != 0;
+        const bool osxsave  = (regs[2] & (1u << 27)) != 0;
+        const bool fma_flag = (regs[2] & (1u << 12)) != 0;
+        if (avx && osxsave && max_leaf >= 7) {
+            // OS must have enabled YMM state before AVX2/FMA execution
+            const unsigned long long xcr = _xgetbv(0);
+            const bool ymm_saved = (xcr & 0x6ull) == 0x6ull;
+            __cpuidex(regs, 7, 0);
+            const bool avx2 = (regs[1] & (1u << 5)) != 0;   // EBX bit 5
+            f.avx2 = ymm_saved && avx2;
+            f.fma  = ymm_saved && fma_flag;
+        }
+    }
+#elif defined(__GNUC__)
+    __builtin_cpu_init();
+    f.sse41 = __builtin_cpu_supports("sse4.1") != 0;
+    f.avx2 = __builtin_cpu_supports("avx2") != 0;
+    f.fma = __builtin_cpu_supports("fma") != 0;
+#endif
+#endif // OMNISEED_X86_
+    return f;
+}
 
 } // namespace platform
 } // namespace omniseed

@@ -161,5 +161,17 @@ void log_error(const char* fmt, ...);
 // Set to false to silence info logs (errors always print).
 void set_quiet(bool quiet);
 
+// ---------------------------------------------------------------------------
+// CPU feature detection (CPUID on x86/x64; conservative on other arches).
+// Used for runtime SIMD kernel dispatch — a machine without AVX2 must never
+// execute AVX2 code, independent of what the build compiled.
+// ---------------------------------------------------------------------------
+struct CpuFeatures {
+    bool sse41 = false;
+    bool avx2  = false;
+    bool fma   = false;
+};
+CpuFeatures cpu_features();
+
 } // namespace platform
 } // namespace omniseed

@@ -33,6 +33,30 @@ inline bool dbg_nan() {
     static const bool on = std::getenv("OMNISEED_DEBUG_NAN") != nullptr;
     return on;
 }
+inline bool dbg_prof() {
+    static const bool on = std::getenv("OMNISEED_PROFILE") != nullptr;
+    return on;
+}
+// Accumulated per-section timings (ms) across calls.
+struct ProfSections {
+    double proj = 0, gates = 0, srec = 0, readout = 0, ffn = 0, head = 0, emb = 0;
+    int    calls = 0;
+    void dump() {
+        if (calls == 0) return;
+        std::fprintf(stderr,
+                     "[prof] calls=%d proj=%.1fms gates=%.1f srec=%.1f "
+                     "readout=%.1f ffn=%.1f head=%.1f emb=%.1f  "
+                     "(per call: proj=%.2f gates=%.2f srec=%.2f readout=%.2f "
+                     "ffn=%.2f head=%.2f emb=%.2f)\n",
+                     calls, proj, gates, srec, readout, ffn, head, emb,
+                     proj / calls, gates / calls, srec / calls,
+                     readout / calls, ffn / calls, head / calls, emb / calls);
+    }
+};
+ProfSections& prof() {
+    static ProfSections p;
+    return p;
+}
 inline void dbg_check(const char* tag, const float* p, int64_t n) {
     if (!dbg_nan()) return;
     for (int64_t i = 0; i < n; ++i) {
@@ -217,9 +241,37 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
             head_scales_ = load_f32(gg, "head.scale", error_, false);
             Tensor s = load_f32(gg, "head.scale0", error_, false);   // legacy
             head_scale_ = s.numel() > 0 ? s.f32()[0] : 1.0f;
-        } else if (t.dtype() == DType::F16) {
-            head_ = Tensor("head.weight", {t.dim(0), t.dim(1)}, DType::F16,
+        } else if (t.dtype() == DType::I8) {
+            // Preferred layout: per-row int8 + fp32 scales straight from the
+            // GGUF — rides the AVX2/SSE i8 kernel, halves head memory.
+            head_ = Tensor("head.weight", {t.dim(0), t.dim(1)}, DType::I8,
                            const_cast<void*>(t.data()));
+            head_scales_ = load_f32(gg, "head.scale", error_, false);
+            if (!error_.empty()) return false;
+        } else if (t.dtype() == DType::F16) {
+            // Convert fp16 head -> per-row int8 at load time. The head is the
+            // single biggest matmul (V*E); int8 rides the AVX2/SSE kernel and
+            // halves its memory (50 MB vs 100 MB for the 0.1B model).
+            const int64_t rows = t.dim(0), cols = t.dim(1);
+            Tensor q("head.weight", {rows, cols}, DType::I8);
+            std::vector<float> scales(static_cast<size_t>(rows));
+            const uint16_t* src = t.f16();
+            for (int64_t r = 0; r < rows; ++r) {
+                const uint16_t* row = src + r * cols;
+                float mx = 0.0f;
+                for (int64_t c = 0; c < cols; ++c)
+                    mx = std::max(mx, std::fabs(half_to_float(row[c])));
+                const float s = (mx > 0.0f) ? mx / 127.0f : 1e-12f;
+                scales[static_cast<size_t>(r)] = s;
+                int8_t* dst = q.i8() + r * cols;
+                for (int64_t c = 0; c < cols; ++c)
+                    dst[c] = static_cast<int8_t>(std::lround(
+                        half_to_float(row[c]) / s));
+            }
+            head_ = std::move(q);
+            head_scales_ = Tensor("head.scale", {rows}, DType::F32);
+            std::memcpy(head_scales_.f32(), scales.data(),
+                        static_cast<size_t>(rows) * sizeof(float));
         } else {
             error_ = "head.weight: unsupported dtype";
             return false;
@@ -458,6 +510,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
                     E * sizeof(float));
 
         // ---- main projections (ternary) --------------------------------------
+        const double p0 = dbg_prof() ? platform::now_ms() : 0.0;
         std::vector<float> r(E), k(E), kk(E), v(E), g(E);
         project(w.W_r, w.sc_r, w.r_scale, xr.data(), r.data(), E, E);  // raw (no sigmoid)
         project(w.W_k, w.sc_k, w.k_scale, xk.data(), k.data(), E, E);
@@ -471,6 +524,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
             dbg_check("sc_r", w.sc_r.f32(), E);
             dbg_check("W_r.i8", reinterpret_cast<const float*>(w.W_r.i8()), 64);
         }
+        const double p_proj = dbg_prof() ? platform::now_ms() : 0.0;
 
         // g = sigmoid(xg @ Wg1) @ Wg2   (sigmoid BETWEEN projections)
         {
@@ -531,6 +585,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
             kk[i] *= w.k_k.f32()[i];
             k2[i] = k[i] * (1.0f + (a[i] - 1.0f) * w.k_a.f32()[i]);
         }
+        const double p_gates = dbg_prof() ? platform::now_ms() : 0.0;
 
         float* S_base = st.attn_state[static_cast<size_t>(l)].f32();
 
@@ -574,6 +629,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         }
 
         // ---- y = group_norm(S @ r); extra residue; out = Wo @ (y*g) ----------
+        const double p_srec = dbg_prof() ? platform::now_ms() : 0.0;
         std::vector<float> y(E), yn(E), yg(E);
         for (int32_t h = 0; h < H; ++h) {
             const float* S  = S_base + static_cast<size_t>(h) * D * D;
@@ -602,6 +658,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
             for (int32_t i = 0; i < D; ++i) ynh[i] += s * vh[i];
         }
         for (int32_t i = 0; i < E; ++i) yg[i] = yn[i] * g[i];
+        const double p_readout = dbg_prof() ? platform::now_ms() : 0.0;
 
         std::vector<float> attn_out(E);
         project(w.W_o, w.sc_o, w.o_scale, yg.data(), attn_out.data(), E, E);
@@ -639,8 +696,15 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         for (int32_t i = 0; i < cfg_.ffn_inter; ++i) fk[i] = squared_relu(fk[i]);
         project(w.F_value, w.sc_fv, w.fv_scale, fk.data(), fv.data(), E, cfg_.ffn_inter);
         for (int32_t i = 0; i < E; ++i) x[i] += fv[i];
+        if (dbg_prof()) {
+            ProfSections& p = prof();
+            const double now = platform::now_ms();
+            p.proj += p_proj - p0;
+            p.gates += p_gates - p_proj;
+            p.srec += p_srec - p_gates;
+            p.readout += now - p_readout;
+        }
     }
-
     // ------------------------------- head -------------------------------------
     Tensor xl3("xl3", {E}, DType::F32);
     {
@@ -648,11 +712,11 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         std::memcpy(xin3.f32(), x.data(), E * sizeof(float));
         tensor_ops::layer_norm(xin3, &ln_out_w_, &ln_out_b_, xl3);
     }
-    if (dbg_nan()) dbg_check("x_final", x.data(), E);
 
     const int64_t V_head = head_.dim(0);
     const int64_t V_out  = std::min<int64_t>(logits.numel(), V_head);
     logits.zero();
+    const double p_head = dbg_prof() ? platform::now_ms() : 0.0;
     if (head_ternary_) {
         if (head_scales_.numel() == V_out) {
             bitnet::bitlinear_forward_rows(head_.packed(), head_scales_.f32(),
@@ -661,17 +725,16 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
             bitnet::bitlinear_forward(head_.packed(), nullptr, head_scale_,
                                       xl3.f32(), logits.f32(), V_out, E);
         }
-    } else {
-        const uint16_t* wp = head_.f16();
-        const float*    xp = xl3.f32();
-        float*          lp = logits.f32();
-        for (int64_t row = 0; row < V_out; ++row) {
-            const uint16_t* wr = wp + row * E;
-            float acc = 0.0f;
-            for (int32_t i = 0; i < E; ++i)
-                acc += half_to_float(wr[i]) * xp[i];
-            lp[row] = acc;
-        }
+    } else if (head_.dtype() == DType::I8) {
+        // fp16 head converted to per-row i8 at load time (see load_weights).
+        bitnet::bitlinear_forward_i8(head_.i8(), head_scales_.f32(),
+                                     xl3.f32(), logits.f32(), V_out, E);
+    }
+    if (dbg_prof()) {
+        ProfSections& p = prof();
+        p.calls += 1;
+        p.head += platform::now_ms() - p_head;
+        p.dump();
     }
     st.tokens_seen += 1;
 }

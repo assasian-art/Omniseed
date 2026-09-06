@@ -51,6 +51,7 @@ set(OMNISEED_CORE_SOURCES
     src/core/rwkv.cpp
     src/core/gguf_loader.cpp
     src/core/tokenizer.cpp
+    src/core/bitlinear_avx2.cpp
     src/vision/mobilenet_v4.cpp
     src/vision/unicompress.cpp
     src/vision/vision_tasks.cpp
@@ -84,6 +85,20 @@ target_include_directories(omniseed_core
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 target_compile_features(omniseed_core PUBLIC cxx_std_17)
+
+# x86/x64: compile the SIMD TU with AVX2 and export the arch macro the
+# runtime dispatcher tests. Other targets simply keep the scalar kernels.
+if((CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)|(e2k)") AND
+   (CMAKE_CXX_COMPILER_ID MATCHES "MSVC|GNU|Clang|AppleClang"))
+    target_compile_definitions(omniseed_core PRIVATE OMNISEED_X86=1)
+    if(MSVC)
+        set_source_files_properties(src/core/bitlinear_avx2.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
+    else()
+        set_source_files_properties(src/core/bitlinear_avx2.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mfma")
+    endif()
+endif()
 
 # --------------------------- Per-compiler warnings ---------------------------
 if(MSVC)

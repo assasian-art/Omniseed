@@ -312,6 +312,19 @@ void layer_norm(const Tensor& x, const Tensor* weight, const Tensor* bias,
     var /= static_cast<double>(n);
 
     const float inv_std = static_cast<float>(1.0 / std::sqrt(var + eps));
+
+    // Fast path: fp32 weight+bias (the hot case — 25+ layer_norm calls per
+    // token with fp32 tensors straight from the GGUF).
+    if (weight != nullptr && bias != nullptr &&
+        weight->dtype() == DType::F32 && bias->dtype() == DType::F32 &&
+        weight->numel() == n && bias->numel() == n) {
+        const float* wp = weight->f32();
+        const float* bp = bias->f32();
+        for (int64_t i = 0; i < n; ++i)
+            yp[i] = (xp[i] - static_cast<float>(mean)) * inv_std * wp[i] + bp[i];
+        return;
+    }
+
     for (int64_t i = 0; i < n; ++i) {
         const float w = weight ? weight->get_as_float(i) : 1.0f;
         const float b = bias ? bias->get_as_float(i) : 0.0f;

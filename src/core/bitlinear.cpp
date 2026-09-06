@@ -2,6 +2,12 @@
 //  OmniSeed — bitlinear.cpp
 //  Ternary weight kernels: pack/unpack, quantize, matmul-without-multiply,
 //  and the QAT training step with straight-through estimator gradients.
+//
+//  SIMD (Phase 8): the i8 per-row kernel dispatches at runtime through a
+//  function pointer selected once by CPUID: AVX2 (32-wide via vpmovsxbd +
+//  FMA) -> SSE4.1 (16-wide) -> scalar. bitlinear_avx2.cpp is compiled with
+//  /arch:AVX2 (-mavx2) for exactly one translation unit; everything else
+//  stays baseline-compatible.
 // =============================================================================
 #include "omniseed/core/bitlinear.h"
 #include "omniseed/core/platform.h"
@@ -10,6 +16,52 @@
 
 namespace omniseed {
 namespace bitnet {
+
+// ---------------------------------------------------------------------------
+// Runtime dispatch (Phase 8 speed work). The kernel symbols live at bitnet
+// scope (not anonymous): fwd_i8_scalar is defined in this TU, fwd_i8_avx2 /
+// fwd_i8_sse41 in src/core/bitlinear_avx2.cpp (compiled with /arch:AVX2).
+// ---------------------------------------------------------------------------
+namespace {
+
+using I8ForwardFn = void (*)(const int8_t*, const float*, const float*,
+                             float*, int64_t, int64_t);
+
+I8ForwardFn g_i8_fn = nullptr;
+bool g_simd_init = false;
+
+} // namespace
+
+void fwd_i8_scalar(const int8_t* W, const float* scales, const float* x,
+                   float* y, int64_t out_dim, int64_t in_dim);
+#if defined(OMNISEED_X86)
+void fwd_i8_avx2(const int8_t* W, const float* scales, const float* x,
+                 float* y, int64_t out_dim, int64_t in_dim);
+void fwd_i8_sse41(const int8_t* W, const float* scales, const float* x,
+                  float* y, int64_t out_dim, int64_t in_dim);
+#endif
+
+namespace {
+
+void init_simd_dispatch() {
+    if (g_simd_init) return;
+    g_simd_init = true;
+    g_i8_fn = fwd_i8_scalar;
+#if defined(OMNISEED_X86)
+    platform::CpuFeatures f = platform::cpu_features();
+    if (f.avx2)      g_i8_fn = fwd_i8_avx2;
+    else if (f.sse41) g_i8_fn = fwd_i8_sse41;
+#endif
+    // otherwise: scalar (already the default)
+}
+
+} // namespace
+
+// Diagnostic hook for the microbenchmark: returns the selected kernel.
+I8ForwardFn simd_selected_fn() {
+    init_simd_dispatch();
+    return g_i8_fn;
+}
 
 // ===========================================================================
 // Packing: 2 ternary weights per byte (4 bits each), low nibble = even index.
@@ -119,6 +171,14 @@ void bitlinear_forward_rows(const uint8_t* W_packed, const float* scales,
 void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
                           const float* x, float* y,
                           int64_t out_dim, int64_t in_dim) {
+    init_simd_dispatch();
+    g_i8_fn(W_i8, scales, x, y, out_dim, in_dim);
+}
+
+// scalar reference used as the baseline impl (and by tests)
+void fwd_i8_scalar(const int8_t* W_i8, const float* scales,
+                   const float* x, float* y,
+                   int64_t out_dim, int64_t in_dim) {
     for (int64_t r = 0; r < out_dim; ++r) {
         const int8_t* row = W_i8 + r * in_dim;
         float acc = 0.0f;

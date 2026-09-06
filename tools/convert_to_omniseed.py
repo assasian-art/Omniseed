@@ -483,7 +483,9 @@ def main():
     if args.ternary_head:
         add_ternary('head', T(hkey))          # add_ternary appends '.weight'
     else:
-        add_f16('head.weight', T(hkey))       # add_f16 takes the FULL name
+        # Head stored as per-row int8 + fp32 scales: rides the AVX2 i8 kernel
+        # (the head is the largest single matmul) and halves its memory.
+        add_i8('head', T(hkey))               # add_i8 appends '.weight'
 
     size = w.write(args.out)
     print(f'[conv] tensors: i8={n_i8} ternary={n_ternary} fp16={n_f16} fp32={n_f32}')
