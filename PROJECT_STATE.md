@@ -198,6 +198,20 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 - Speed/RSS: scalar 2.1 tok/s / 202.8 MB → AVX2 **19.2 tok/s / 155 MB** (model
   loaded); gen observed 15.7–20.8 tok/s; ternary-QAT path 114.6 MB.
 
+## 2d. PHASE 9 — SHIP IT ✅ (TASK 1: 443be29; TASK 2/3/4: see below)
+
+### TASK 1 — Render live ✅
+- **Browser demo console at `GET /`**: inline single-file HTML (no CDNs) — chat
+  box wired to `POST /gen`, header polls `/health` for `model` + `peak_rss`,
+  typing indicator, error styling. `GET /index.html` serves the same page.
+- Verified natively: `/` serves HTML; `/gen` coherent; `/health`
+  `{"ok":true,"model":true,"peak_rss":155}` — note **RSS only reaches ~155 MB
+  after the first `/gen`** (mmap lazy paging); check `/health` after a `/gen`.
+- `docs/RENDER_LIVE_CHECKLIST.md`: push-readiness audit, blueprint import, two
+  model-attach options (disk vs Dockerfile fork that COPYs the GGUF — binary
+  paths corrected to `build/omniseed_server`, single-config CMake), live
+  verification (wake the model first!), budget notes.
+
 ## 3. NEXT STEPS (in order)
 
 1. **Full-scale QAT**: real corpus (multi-GB), 10k+ steps, lr schedule → make
