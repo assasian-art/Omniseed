@@ -98,6 +98,38 @@ void bitlinear_forward_batched(const uint8_t* W_packed, const float* bias,
     }
 }
 
+void bitlinear_forward_rows(const uint8_t* W_packed, const float* scales,
+                            const float* x, float* y,
+                            int64_t out_dim, int64_t in_dim) {
+    for (int64_t r = 0; r < out_dim; ++r) {
+        const int64_t wbase = r * in_dim;
+        float acc = 0.0f;
+        for (int64_t c = 0; c < in_dim; ++c) {
+            const int64_t wi = wbase + c;
+            const uint8_t b = W_packed[static_cast<size_t>(wi >> 1)];
+            const int8_t nib = (wi & 1) ? static_cast<int8_t>(b >> 4)
+                                        : static_cast<int8_t>(b & 0x0F);
+            if (nib == 1)       acc += x[c];
+            else if (nib == 15) acc -= x[c];
+        }
+        y[r] = acc * scales[r];
+    }
+}
+
+void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
+                          const float* x, float* y,
+                          int64_t out_dim, int64_t in_dim) {
+    for (int64_t r = 0; r < out_dim; ++r) {
+        const int8_t* row = W_i8 + r * in_dim;
+        float acc = 0.0f;
+        for (int64_t c = 0; c < in_dim; ++c) {
+            const int8_t w = row[c];
+            if (w != 0) acc += static_cast<float>(w) * x[c];
+        }
+        y[r] = acc * scales[r];
+    }
+}
+
 // ===========================================================================
 // Training step
 // ===========================================================================

@@ -145,7 +145,23 @@ if(OMNISEED_BUILD_TESTS)
     else()
         target_compile_options(omniseed_tests PRIVATE -Wall -Wextra)
     endif()
-    add_test(NAME omniseed_platform COMMAND omniseed_tests)
+    add_test(NAME omniseed_platform COMMAND omniseed_tests
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Real-weights validation: skips cleanly when the converted GGUF is not
+    # present (fresh clones / CI), asserts coherence when it is.
+    add_executable(omniseed_real_weights tests/test_real_weights.cpp)
+    target_include_directories(omniseed_real_weights PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_real_weights PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_real_weights PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_real_weights PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_real_weights COMMAND omniseed_real_weights
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # --------------------------------- CLI binary --------------------------------

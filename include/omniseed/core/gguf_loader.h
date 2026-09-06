@@ -66,6 +66,9 @@ public:
 
     // Raw pointer info for a tensor (for kernels that want raw bytes).
     const void* tensor_data(const std::string& name) const;
+
+    // Debug: file offset where tensor data begins (byte-level validation).
+    uint64_t debug_data_start() const { return data_start_; }
     size_t      tensor_size(const std::string& name) const;
 
     // Underlying mapping (advanced: custom views over the file).

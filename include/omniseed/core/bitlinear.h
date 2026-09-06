@@ -63,6 +63,18 @@ void bitlinear_forward_batched(const uint8_t* W_packed, const float* bias,
                                float scale, const float* x, float* y,
                                int64_t batch, int64_t out_dim, int64_t in_dim);
 
+// Per-ROW scales (real converted checkpoints): y[r] = scales[r] * (W . x).
+// scales has out_dim fp32 entries (the row's master-weight absmean).
+void bitlinear_forward_rows(const uint8_t* W_packed, const float* scales,
+                            const float* x, float* y,
+                            int64_t out_dim, int64_t in_dim);
+
+// Per-row int8: W_i8 has out_dim*in_dim signed bytes; scale[r] = max|row|/127.
+// y[r] = scale[r] * sum_c W_i8[r,c] * x[c].
+void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
+                          const float* x, float* y,
+                          int64_t out_dim, int64_t in_dim);
+
 // ---------------------------------------------------------------------------
 // Training path (BitLinear QAT / LoRA fine-tuning support)
 // ---------------------------------------------------------------------------

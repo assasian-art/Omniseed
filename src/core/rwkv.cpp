@@ -17,6 +17,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -26,6 +28,21 @@ namespace omniseed {
 // Helpers
 // ===========================================================================
 namespace {
+
+inline bool dbg_nan() {
+    static const bool on = std::getenv("OMNISEED_DEBUG_NAN") != nullptr;
+    return on;
+}
+inline void dbg_check(const char* tag, const float* p, int64_t n) {
+    if (!dbg_nan()) return;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(p[i])) {
+            std::fprintf(stderr, "[nan] %s at i=%lld val=%g\n", tag,
+                         static_cast<long long>(i), p[i]);
+            return;
+        }
+    }
+}
 
 inline float lerp(float a, float b, float t) { return a + t * (b - a); }
 
@@ -122,7 +139,9 @@ Tensor load_f32(const GgufLoader& gg, const std::string& name,
     return out;
 }
 
-// Zero-copy ternary view straight into the mapped GGUF region.
+// Zero-copy ternary OR int8 view straight into the mapped GGUF region.
+// (Converted checkpoints default to per-row int8 for the big matrices:
+// PTQ ternary b1.58 loses coherence without QAT — verified in tools/quant_sim.py.)
 Tensor load_ternary_view(const GgufLoader& gg, const std::string& name,
                          const std::vector<int64_t>& shape2d,
                          std::string& err, bool required = true) {
@@ -131,12 +150,12 @@ Tensor load_ternary_view(const GgufLoader& gg, const std::string& name,
         return Tensor();
     }
     Tensor t = gg.tensor(name);
-    if (t.dtype() != DType::TERNARY) {
-        err = "tensor " + name + ": expected ternary, got " +
+    if (t.dtype() != DType::TERNARY && t.dtype() != DType::I8) {
+        err = "tensor " + name + ": expected ternary/int8, got " +
               dtype_name(t.dtype());
         return Tensor();
     }
-    return Tensor(name, shape2d, DType::TERNARY, const_cast<void*>(t.data()));
+    return Tensor(name, shape2d, t.dtype(), const_cast<void*>(t.data()));
 }
 
 } // namespace
@@ -167,6 +186,23 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
     ln_out_b_ = load_f32(gg, "ln_out.bias", error_);
     if (!error_.empty()) return false;
 
+    if (dbg_nan()) {
+        const GgufLoader& gg2 = gg;
+        std::fprintf(stderr, "[dbg] data_start=%llu\n",
+                     static_cast<unsigned long long>(gg2.debug_data_start()));
+        const Tensor sc = gg.tensor("blocks.0.att.receptance.scale");
+        std::fprintf(stderr, "[dbg] sc_r numel=%d dtype=%s\n",
+                     static_cast<int>(sc.numel()), dtype_name(sc.dtype()));
+        if (sc.numel() >= 5)
+            std::fprintf(stderr, "[dbg] sc_r first5: %.6g %.6g %.6g %.6g %.6g\n",
+                         sc.f32()[0], sc.f32()[1], sc.f32()[2], sc.f32()[3],
+                         sc.f32()[4]);
+        const Tensor kk = gg.tensor("blocks.0.att.k_k");
+        if (kk.numel() >= 3)
+            std::fprintf(stderr, "[dbg] k_k first3: %.6g %.6g %.6g\n",
+                         kk.f32()[0], kk.f32()[1], kk.f32()[2]);
+    }
+
     // Output head: ternary (preferred) or fp16 fallback.
     if (!gg.has_tensor("head.weight")) {
         error_ = "missing tensor: head.weight";
@@ -178,7 +214,8 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
             head_ternary_ = true;
             head_ = Tensor("head.weight", {t.dim(0), t.dim(1)}, DType::TERNARY,
                            const_cast<void*>(t.data()));
-            Tensor s = load_f32(gg, "head.scale", error_, false);
+            head_scales_ = load_f32(gg, "head.scale", error_, false);
+            Tensor s = load_f32(gg, "head.scale0", error_, false);   // legacy
             head_scale_ = s.numel() > 0 ? s.f32()[0] : 1.0f;
         } else if (t.dtype() == DType::F16) {
             head_ = Tensor("head.weight", {t.dim(0), t.dim(1)}, DType::F16,
@@ -208,12 +245,17 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
         w.tmix_g = load_f32(gg, p + "att.tmix_g", error_);
         if (!error_.empty()) return false;
 
-        // Main ternary projections [E, E].
+        // Main ternary projections [E, E] + per-row scale tensors.
         const std::vector<int64_t> ee = {E, E};
         w.W_r = load_ternary_view(gg, p + "att.receptance.weight", ee, error_);
         w.W_k = load_ternary_view(gg, p + "att.key.weight", ee, error_);
         w.W_v = load_ternary_view(gg, p + "att.value.weight", ee, error_);
         w.W_o = load_ternary_view(gg, p + "att.output.weight", ee, error_);
+        if (!error_.empty()) return false;
+        w.sc_r = load_f32(gg, p + "att.receptance.scale", error_, false);
+        w.sc_k = load_f32(gg, p + "att.key.scale", error_, false);
+        w.sc_v = load_f32(gg, p + "att.value.scale", error_, false);
+        w.sc_o = load_f32(gg, p + "att.output.scale", error_, false);
         if (!error_.empty()) return false;
         w.r_scale = static_cast<float>(gg.get_f64(p + "att.receptance.scale", 1.0));
         w.k_scale = static_cast<float>(gg.get_f64(p + "att.key.scale", 1.0));
@@ -237,6 +279,15 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
         w.W_g2 = load_ternary_view(gg, p + "att.g2.weight", rg2, error_);
         w.W_v1 = load_ternary_view(gg, p + "att.v1.weight", rv1, error_);
         w.W_v2 = load_ternary_view(gg, p + "att.v2.weight", rv2, error_);
+        if (!error_.empty()) return false;
+        w.sc_w1 = load_f32(gg, p + "att.w1.scale", error_, false);
+        w.sc_w2 = load_f32(gg, p + "att.w2.scale", error_, false);
+        w.sc_a1 = load_f32(gg, p + "att.a1.scale", error_, false);
+        w.sc_a2 = load_f32(gg, p + "att.a2.scale", error_, false);
+        w.sc_g1 = load_f32(gg, p + "att.g1.scale", error_, false);
+        w.sc_g2 = load_f32(gg, p + "att.g2.scale", error_, false);
+        w.sc_v1 = load_f32(gg, p + "att.v1.scale", error_, false);
+        w.sc_v2 = load_f32(gg, p + "att.v2.scale", error_, false);
         if (!error_.empty()) return false;
         w.w1_scale = static_cast<float>(gg.get_f64(p + "att.w1.scale", 1.0));
         w.w2_scale = static_cast<float>(gg.get_f64(p + "att.w2.scale", 1.0));
@@ -267,6 +318,9 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
         w.F_key   = load_ternary_view(gg, p + "ffn.key.weight", fe, error_);
         w.F_value = load_ternary_view(gg, p + "ffn.value.weight", ef, error_);
         if (!error_.empty()) return false;
+        w.sc_fk = load_f32(gg, p + "ffn.key.scale", error_, false);
+        w.sc_fv = load_f32(gg, p + "ffn.value.scale", error_, false);
+        if (!error_.empty()) return false;
         w.fk_scale = static_cast<float>(gg.get_f64(p + "ffn.key.scale", 1.0));
         w.fv_scale = static_cast<float>(gg.get_f64(p + "ffn.value.scale", 1.0));
     }
@@ -275,13 +329,14 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
 }
 
 bool RwkvModel::load(const std::string& path) {
-    GgufLoader gg;
-    if (!gg.open(path)) {
-        error_ = gg.error();
+    // store_ owns the mmap; tensor views taken below point into it and must
+    // stay valid for the model's lifetime.
+    if (!store_.open(path)) {
+        error_ = store_.error();
         return false;
     }
-    if (!load_meta(gg)) return false;
-    if (!load_weights(gg)) return false;
+    if (!load_meta(store_)) return false;
+    if (!load_weights(store_)) return false;
     valid_ = true;
     return true;
 }
@@ -325,6 +380,25 @@ void RwkvModel::copy_state(const RwkvState& src, RwkvState& dst) {
 void RwkvModel::project(const Tensor& W, float scale, const float* x,
                         float* y, int64_t out_dim, int64_t in_dim) const {
     bitnet::bitlinear_forward(W.packed(), nullptr, scale, x, y,
+                              out_dim, in_dim);
+}
+
+void RwkvModel::project(const Tensor& W, const Tensor& scales,
+                        float scalar_scale, const float* x, float* y,
+                        int64_t out_dim, int64_t in_dim) const {
+    if (scales.numel() == out_dim) {
+        if (W.dtype() == DType::I8) {
+            // int8: dequantize the row on the fly (i8 kernel handles the
+            // sign + accumulate; multiply by the row scale at the end).
+            bitnet::bitlinear_forward_i8(W.i8(), scales.f32(), x, y,
+                                         out_dim, in_dim);
+            return;
+        }
+        bitnet::bitlinear_forward_rows(W.packed(), scales.f32(), x, y,
+                                       out_dim, in_dim);
+        return;
+    }
+    bitnet::bitlinear_forward(W.packed(), nullptr, scalar_scale, x, y,
                               out_dim, in_dim);
 }
 
@@ -385,18 +459,26 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
 
         // ---- main projections (ternary) --------------------------------------
         std::vector<float> r(E), k(E), kk(E), v(E), g(E);
-        project(w.W_r, w.r_scale, xr.data(), r.data(), E, E);    // raw (no sigmoid)
-        project(w.W_k, w.k_scale, xk.data(), k.data(), E, E);
+        project(w.W_r, w.sc_r, w.r_scale, xr.data(), r.data(), E, E);  // raw (no sigmoid)
+        project(w.W_k, w.sc_k, w.k_scale, xk.data(), k.data(), E, E);
         std::memcpy(kk.data(), k.data(), E * sizeof(float));     // kk = k * k_k below
-        project(w.W_v, w.v_scale, xv.data(), v.data(), E, E);
+        project(w.W_v, w.sc_v, w.v_scale, xv.data(), v.data(), E, E);
+        if (dbg_nan() && l == 0) {
+            dbg_check("xr", xr.data(), E);
+            dbg_check("proj_r", r.data(), E);
+            dbg_check("proj_k", k.data(), E);
+            dbg_check("proj_v", v.data(), E);
+            dbg_check("sc_r", w.sc_r.f32(), E);
+            dbg_check("W_r.i8", reinterpret_cast<const float*>(w.W_r.i8()), 64);
+        }
 
         // g = sigmoid(xg @ Wg1) @ Wg2   (sigmoid BETWEEN projections)
         {
             const int32_t rg = cfg_.rank_g;
             std::vector<float> g1(rg);
-            project(w.W_g1, w.g1_scale, xg.data(), g1.data(), rg, E);
+            project(w.W_g1, w.sc_g1, w.g1_scale, xg.data(), g1.data(), rg, E);
             for (int32_t i = 0; i < rg; ++i) g1[i] = sigmoidf(g1[i]);
-            project(w.W_g2, w.g2_scale, g1.data(), g.data(), E, rg);
+            project(w.W_g2, w.sc_g2, w.g2_scale, g1.data(), g.data(), E, rg);
         }
 
         // ---- w = exp(-sigmoid(tanh(Ww1 x) @ Ww2 + w_bias)/sqrt(e)) -----------
@@ -404,9 +486,9 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         {
             const int32_t rw = cfg_.rank_w;
             std::vector<float> w1(rw), w2(E);
-            project(w.W_w1, w.w1_scale, xw.data(), w1.data(), rw, E);
+            project(w.W_w1, w.sc_w1, w.w1_scale, xw.data(), w1.data(), rw, E);
             for (int32_t i = 0; i < rw; ++i) w1[i] = std::tanh(w1[i]);
-            project(w.W_w2, w.w2_scale, w1.data(), w2.data(), E, rw);
+            project(w.W_w2, w.sc_w2, w.w2_scale, w1.data(), w2.data(), E, rw);
             const float inv_sqrte = 1.0f / std::sqrt(2.718281828459045f);
             for (int32_t i = 0; i < E; ++i) {
                 wdec[i] = std::exp(
@@ -418,8 +500,8 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         {
             const int32_t rv = cfg_.rank_v;
             std::vector<float> v1(rv), v2(E);
-            project(w.W_v1, w.v1_scale, xv.data(), v1.data(), rv, E);
-            project(w.W_v2, w.v2_scale, v1.data(), v2.data(), E, rv);
+            project(w.W_v1, w.sc_v1, w.v1_scale, xv.data(), v1.data(), rv, E);
+            project(w.W_v2, w.sc_v2, w.v2_scale, v1.data(), v2.data(), E, rv);
             if (!have_v0) {
                 // Block 0: v0 = v (residual is a no-op this token).
                 std::memcpy(v0.data(), v.data(), E * sizeof(float));
@@ -437,8 +519,8 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         {
             const int32_t ra = cfg_.rank_a;
             std::vector<float> a1(ra), a2(E);
-            project(w.W_a1, w.a1_scale, xa.data(), a1.data(), ra, E);
-            project(w.W_a2, w.a2_scale, a1.data(), a2.data(), E, ra);
+            project(w.W_a1, w.sc_a1, w.a1_scale, xa.data(), a1.data(), ra, E);
+            project(w.W_a2, w.sc_a2, w.a2_scale, a1.data(), a2.data(), E, ra);
             for (int32_t i = 0; i < E; ++i)
                 a[i] = sigmoidf(a2[i] + w.a_bias.f32()[i]);
         }
@@ -506,11 +588,12 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         }
         group_norm_heads(y.data(), H, D, w.gn_w, w.gn_b, yn.data());
 
-        // extra residue: per-head scalar sum_d(r[d]*k[d]*r_k[d]) times v[i]
-        // (HF reference: bonus = (r*k*r_k).sum(-1) * v  — RAW k, pre-blend)
+        // extra residue: per-head scalar sum_d(r[d]*k2[d]*r_k[d]) times v[i]
+        // (numpy + HF references both apply k += k*(a-1)*k_a BEFORE the bonus,
+        //  so the bonus contracts with the BLENDED key k2)
         for (int32_t h = 0; h < H; ++h) {
             const float* rh  = r.data()  + static_cast<size_t>(h) * D;
-            const float* kh  = k.data()  + static_cast<size_t>(h) * D;
+            const float* kh  = k2.data() + static_cast<size_t>(h) * D;
             const float* rkh = w.r_k.f32() + static_cast<size_t>(h) * D;
             const float* vh  = v.data()  + static_cast<size_t>(h) * D;
             float*       ynh = yn.data() + static_cast<size_t>(h) * D;
@@ -521,8 +604,19 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         for (int32_t i = 0; i < E; ++i) yg[i] = yn[i] * g[i];
 
         std::vector<float> attn_out(E);
-        project(w.W_o, w.o_scale, yg.data(), attn_out.data(), E, E);
+        project(w.W_o, w.sc_o, w.o_scale, yg.data(), attn_out.data(), E, E);
+        if (dbg_nan() && l == 0) {
+            dbg_check("y", y.data(), E);
+            dbg_check("yn", yn.data(), E);
+            dbg_check("yg", yg.data(), E);
+            dbg_check("attn_out", attn_out.data(), E);
+            dbg_check("wdec", wdec.data(), E);
+            dbg_check("a", a.data(), E);
+            dbg_check("k2", k2.data(), E);
+            dbg_check("S_block0", S_base, static_cast<int64_t>(D) * D);
+        }
         for (int32_t i = 0; i < E; ++i) x[i] += attn_out[i];
+        if (dbg_nan() && l == 0) dbg_check("x_after_block0", x.data(), E);
 
         // ======================= channel mixing ==============================
         Tensor xl2("xl2", {E}, DType::F32);
@@ -541,9 +635,9 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
                     E * sizeof(float));
 
         std::vector<float> fk(cfg_.ffn_inter), fv(E);
-        project(w.F_key, w.fk_scale, xv2.data(), fk.data(), cfg_.ffn_inter, E);
+        project(w.F_key, w.sc_fk, w.fk_scale, xv2.data(), fk.data(), cfg_.ffn_inter, E);
         for (int32_t i = 0; i < cfg_.ffn_inter; ++i) fk[i] = squared_relu(fk[i]);
-        project(w.F_value, w.fv_scale, fk.data(), fv.data(), E, cfg_.ffn_inter);
+        project(w.F_value, w.sc_fv, w.fv_scale, fk.data(), fv.data(), E, cfg_.ffn_inter);
         for (int32_t i = 0; i < E; ++i) x[i] += fv[i];
     }
 
@@ -554,13 +648,19 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         std::memcpy(xin3.f32(), x.data(), E * sizeof(float));
         tensor_ops::layer_norm(xin3, &ln_out_w_, &ln_out_b_, xl3);
     }
+    if (dbg_nan()) dbg_check("x_final", x.data(), E);
 
     const int64_t V_head = head_.dim(0);
     const int64_t V_out  = std::min<int64_t>(logits.numel(), V_head);
     logits.zero();
     if (head_ternary_) {
-        bitnet::bitlinear_forward(head_.packed(), nullptr, head_scale_,
-                                  xl3.f32(), logits.f32(), V_out, E);
+        if (head_scales_.numel() == V_out) {
+            bitnet::bitlinear_forward_rows(head_.packed(), head_scales_.f32(),
+                                           xl3.f32(), logits.f32(), V_out, E);
+        } else {
+            bitnet::bitlinear_forward(head_.packed(), nullptr, head_scale_,
+                                      xl3.f32(), logits.f32(), V_out, E);
+        }
     } else {
         const uint16_t* wp = head_.f16();
         const float*    xp = xl3.f32();
@@ -585,6 +685,52 @@ int32_t RwkvModel::greedy_pick(const Tensor& logits) const {
         if (p[i] > bv) { bv = p[i]; best = static_cast<int32_t>(i); }
     }
     return best;
+}
+
+int32_t RwkvModel::sample_token(const Tensor& logits, float temperature,
+                                int32_t top_k, uint64_t& seed) const {
+    const float* p = logits.f32();
+    const int64_t n = std::min<int64_t>(logits.numel(), cfg_.n_vocab);
+    if (n <= 0) return 0;
+    if (temperature <= 0.0f) return greedy_pick(logits);
+
+    // top-k indices (keep all if top_k <= 0 or >= n)
+    std::vector<int32_t> idx;
+    idx.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) idx.push_back(static_cast<int32_t>(i));
+    if (top_k > 0 && top_k < n) {
+        std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+                          [&](int32_t a, int32_t b) { return p[a] > p[b]; });
+        idx.resize(static_cast<size_t>(top_k));
+    }
+    const int32_t k = static_cast<int32_t>(idx.size());
+
+    // softmax over the kept logits
+    float mx = -1e30f;
+    for (int32_t i = 0; i < k; ++i) mx = std::max(mx, p[idx[static_cast<size_t>(i)]]);
+    double sum = 0.0;
+    std::vector<double> prob(static_cast<size_t>(k));
+    for (int32_t i = 0; i < k; ++i) {
+        const float t = (p[idx[static_cast<size_t>(i)]] - mx) /
+                        std::max(temperature, 1e-4f);
+        prob[static_cast<size_t>(i)] = std::exp(static_cast<double>(t));
+        sum += prob[static_cast<size_t>(i)];
+    }
+
+    // SplitMix64 next() — deterministic per seed
+    seed += 0x9E3779B97F4A7C15ull;
+    uint64_t z = seed;
+    z = (z ^ (z >> 30ull)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27ull)) * 0x94D049BB133111EBull;
+    z ^= (z >> 31ull);
+    const double u = static_cast<double>(z >> 11ull) * (1.0 / 9007199254740992.0);
+
+    double acc = 0.0;
+    for (int32_t i = 0; i < k; ++i) {
+        acc += prob[static_cast<size_t>(i)] / sum;
+        if (u < acc) return idx[static_cast<size_t>(i)];
+    }
+    return idx[static_cast<size_t>(k - 1)];
 }
 
 } // namespace omniseed

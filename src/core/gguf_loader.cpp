@@ -67,6 +67,24 @@ bool GgufLoader::read_metadata() {
                 cursor += 4;
                 val.elem_count = gguf::read_u64(base, cursor);
                 cursor += 8;
+
+                // Variable-length element: keep the raw [u64 len][bytes] wire
+                // format in val.raw (Tokenizer::load_from_gguf parses this).
+                if (val.elem_type == GgufType::STRING) {
+                    val.raw.reserve(val.elem_count * 8);   // + actual bytes below
+                    for (uint64_t e = 0; e < val.elem_count; ++e) {
+                        const uint64_t len = gguf::read_u64(base, cursor);
+                        if (cursor + 8 + len > file_.size()) {
+                            error_ = "string array out of bounds for key " + key;
+                            return false;
+                        }
+                        const uint8_t* start = base + cursor;
+                        val.raw.insert(val.raw.end(), start, start + 8 + len);
+                        cursor += 8 + static_cast<size_t>(len);
+                    }
+                    break;
+                }
+
                 const size_t esz = [&] {
                     switch (val.elem_type) {
                         case GgufType::UINT8: case GgufType::INT8:
@@ -176,17 +194,25 @@ bool GgufLoader::read_tensor_dir() {
         info.type   = ggtype;   // store raw GGUF dtype
         info.nbytes = static_cast<uint64_t>(numel) * esz;
 
-        const uint64_t abs_off = data_start_ + info.offset;
-        if (abs_off + info.nbytes > file_.size()) {
-            error_ = "tensor '" + info.name + "' out of file bounds";
-            return false;
-        }
-
         tensor_index_[info.name] = tensors_.size();
         tensors_.push_back(std::move(info));
     }
 
-    for (const TensorInfo& t : tensors_) tensor_names_.push_back(t.name);
+    // GGUF v2/v3 spec: tensor data begins immediately AFTER the tensor
+    // directory, and each info.offset is relative to that point (alignment
+    // padding between tensors is optional; OmniSeed honors explicit offsets).
+    // The previous code kept data_start_ at the post-metadata position, which
+    // shifted every tensor read into the directory bytes -> garbage weights.
+    data_start_ = static_cast<uint64_t>(cursor);
+
+    for (const TensorInfo& t : tensors_) {
+        const uint64_t abs_off = data_start_ + t.offset;
+        if (abs_off + t.nbytes > file_.size()) {
+            error_ = "tensor '" + t.name + "' out of file bounds";
+            return false;
+        }
+        tensor_names_.push_back(t.name);
+    }
     return true;
 }
 

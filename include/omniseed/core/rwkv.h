@@ -36,6 +36,7 @@
 #pragma once
 
 #include "omniseed/core/bitlinear.h"
+#include "omniseed/core/gguf_loader.h"
 #include "omniseed/core/tensor.h"
 
 #include <string>
@@ -77,28 +78,30 @@ struct RwkvLayerWeights {
     // Token-shift mix vectors (post-LN stream), fp32 [E]
     Tensor tmix_r, tmix_w, tmix_k, tmix_v, tmix_a, tmix_g;
 
-    // Main projections: ternary [E, E] with fp32 scalar scales
-    Tensor W_r;  float r_scale  = 1.0f;      // receptance
-    Tensor W_k;  float k_scale  = 1.0f;      // key
-    Tensor W_v;  float v_scale  = 1.0f;      // value
-    Tensor W_o;  float o_scale  = 1.0f;      // output
+    // Main projections: ternary [E, E]. Scales are PER-ROW fp32 tensors
+    // [out_dim] from the converter; the scalar float is a legacy fallback
+    // (used only when the per-row tensor is absent).
+    Tensor W_r;  Tensor sc_r;  float r_scale  = 1.0f;      // receptance
+    Tensor W_k;  Tensor sc_k;  float k_scale  = 1.0f;      // key
+    Tensor W_v;  Tensor sc_v;  float v_scale  = 1.0f;      // value
+    Tensor W_o;  Tensor sc_o;  float o_scale  = 1.0f;      // output
 
     // Low-rank MLPs: W_w1 [rank_w,E], W_w2 [E,rank_w], etc. (ternary + scale).
     // Shapes come from GGUF metadata; real world checkpoints use
     // w=64 a=64 g=128 v=32 and an FFN hidden size of 4*E.
-    Tensor W_w1; float w1_scale = 1.0f;
-    Tensor W_w2; float w2_scale = 1.0f;
+    Tensor W_w1; Tensor sc_w1; float w1_scale = 1.0f;
+    Tensor W_w2; Tensor sc_w2; float w2_scale = 1.0f;
     Tensor w_bias;                           // fp32 [E]
 
-    Tensor W_a1; float a1_scale = 1.0f;
-    Tensor W_a2; float a2_scale = 1.0f;
+    Tensor W_a1; Tensor sc_a1; float a1_scale = 1.0f;
+    Tensor W_a2; Tensor sc_a2; float a2_scale = 1.0f;
     Tensor a_bias;                           // fp32 [E]
 
-    Tensor W_g1; float g1_scale = 1.0f;
-    Tensor W_g2; float g2_scale = 1.0f;
+    Tensor W_g1; Tensor sc_g1; float g1_scale = 1.0f;
+    Tensor W_g2; Tensor sc_g2; float g2_scale = 1.0f;
 
-    Tensor W_v1; float v1_scale = 1.0f;      // value-residual MLP
-    Tensor W_v2; float v2_scale = 1.0f;
+    Tensor W_v1; Tensor sc_v1; float v1_scale = 1.0f;      // value-residual MLP
+    Tensor W_v2; Tensor sc_v2; float v2_scale = 1.0f;
     Tensor v_bias;                           // fp32 [E]
 
     // Per-channel extra parameters, fp32 [E]
@@ -110,8 +113,8 @@ struct RwkvLayerWeights {
     // Channel mixing (RWKV-7: no receptance; hidden = ffn_inter, usually 4*E)
     Tensor F_mix;                float f_mix  = 0.0f;   // unused; kept for shape sym
     Tensor F_mix_v;                                           // fp32 [E]
-    Tensor F_key;   float fk_scale = 1.0f;                // ternary [ffn_inter, E]
-    Tensor F_value; float fv_scale = 1.0f;                // ternary [E, ffn_inter]
+    Tensor F_key;   Tensor sc_fk; float fk_scale = 1.0f;  // ternary [ffn_inter, E]
+    Tensor F_value; Tensor sc_fv; float fv_scale = 1.0f;  // ternary [E, ffn_inter]
 };
 
 // ---------------------------------------------------------------------------
@@ -151,13 +154,28 @@ public:
 
     int32_t greedy_pick(const Tensor& logits) const;
 
+    // Temperature/top-k sampling (TASK 4). top_k <= 0 disables the cut;
+    // temperature <= 0 degenerates to greedy. Deterministic per (seed, logits):
+    // a 64-bit SplitMix64 stream seeded from `seed`.
+    int32_t sample_token(const Tensor& logits, float temperature, int32_t top_k,
+                         uint64_t& seed) const;
+
 private:
     bool load_meta(const GgufLoader& gg);
     bool load_weights(const GgufLoader& gg);
 
+    // Owns the mmap the ternary/f16 tensor views point into. MUST outlive
+    // every view: a local GgufLoader in load() unmaps on return and the
+    // first forward() segfaults.
+    GgufLoader store_;
+
     // helpers used by forward()
     void project(const Tensor& W, float scale, const float* x, float* y,
                  int64_t out_dim, int64_t in_dim) const;
+    // Per-row-scale variant; falls back to the scalar path when `scales`
+    // is empty or its length mismatches out_dim.
+    void project(const Tensor& W, const Tensor& scales, float scalar_scale,
+                 const float* x, float* y, int64_t out_dim, int64_t in_dim) const;
 
     RwkvConfig cfg_;
     std::vector<RwkvLayerWeights> layers_;
@@ -165,7 +183,8 @@ private:
     Tensor ln0_w_, ln0_b_;       // pre-block-0 layernorm
     Tensor ln_out_w_, ln_out_b_;
     Tensor head_;                // fp16 or ternary [n_vocab, n_embd]
-    float  head_scale_ = 1.0f;
+    Tensor head_scales_;         // per-row fp32 [n_vocab] (ternary head)
+    float  head_scale_ = 1.0f;   // legacy scalar fallback
     bool   head_ternary_ = false;
 
     bool valid_ = false;

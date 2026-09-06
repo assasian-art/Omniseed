@@ -36,6 +36,7 @@
 #include "omniseed/vision/vision.h"
 #include "omniseed/vision/vision_tasks.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -508,22 +509,75 @@ struct Session {
     std::unique_ptr<RwkvModel> model;
 
     bool load() {
-        if (!tok.build_minimal()) {
-            platform::log_error("tokenizer build failed");
-            return false;
-        }
         model = std::make_unique<RwkvModel>();
         if (!model->load(model_path)) {
             platform::log_error("model load failed: %s",
                                 model->error().c_str());
             return false;
         }
-        platform::log_info("model loaded: %d layers, %d embd, %d vocab",
+
+        // Real vocab + special ids from the model's own GGUF metadata.
+        bool vocab_ok = false;
+        {
+            GgufLoader gg;
+            if (gg.open(model_path)) {
+                vocab_ok = tok.load_from_gguf(gg);
+                if (vocab_ok) {
+                    tok.set_special_ids(
+                        static_cast<int32_t>(gg.get_u64("omniseed.bos_token_id", -1)),
+                        static_cast<int32_t>(gg.get_u64("omniseed.user_start_token_id", -1)),
+                        static_cast<int32_t>(gg.get_u64("omniseed.user_end_token_id", -1)),
+                        static_cast<int32_t>(gg.get_u64("omniseed.assistant_start_token_id", -1)),
+                        static_cast<int32_t>(gg.get_u64("omniseed.assistant_end_token_id", -1)));
+                    eos_id = static_cast<int32_t>(
+                        gg.get_u64("omniseed.eos_token_id", Tokenizer::kEosId));
+                }
+            }
+        }
+        if (!vocab_ok) {
+            platform::log_info("no GGUF vocab, using minimal byte tokenizer");
+            if (!tok.build_minimal()) {
+                platform::log_error("tokenizer build failed");
+                return false;
+            }
+        }
+
+        platform::log_info("model loaded: %d layers, %d embd, %d vocab, eos=%d",
                            model->config().n_layers, model->config().n_embd,
-                           model->config().n_vocab);
+                           model->config().n_vocab, eos_id);
         return true;
     }
+
+    int32_t eos_id = Tokenizer::kEosId;
 };
+
+int cmd_logits(Session& s) {
+    if (!s.load()) return 1;
+    auto ids = s.tok.encode_chat(s.prompt);
+    std::printf("prompt ids (%zu):", ids.size());
+    for (size_t i = 0; i < ids.size() && i < 24; ++i)
+        std::printf(" %d", ids[i]);
+    std::printf("\n");
+
+    RwkvState st;
+    s.model->init_state(st);
+    Tensor logits("logits", {s.model->config().n_vocab}, DType::F32);
+    for (const int32_t id : ids) s.model->forward(id, st, logits);
+
+    // top-8
+    std::vector<int32_t> idx(static_cast<size_t>(s.model->config().n_vocab));
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int32_t>(i);
+    std::partial_sort(idx.begin(), idx.begin() + 8, idx.end(),
+                      [&](int32_t a, int32_t b) {
+                          return logits.f32()[a] > logits.f32()[b];
+                      });
+    std::printf("top8:");
+    for (int i = 0; i < 8; ++i)
+        std::printf(" (%d, %.3f)", idx[static_cast<size_t>(i)],
+                    logits.f32()[idx[static_cast<size_t>(i)]]);
+    std::printf("\n");
+    return 0;
+}
 
 int cmd_gen(Session& s) {
     if (!s.load()) return 1;
@@ -546,7 +600,7 @@ int cmd_gen(Session& s) {
     AgentLoop loop(*s.model, s.tok, dummy, mem, thr, imp, cfg);
 
     const std::string out =
-        loop.generate(st, seed, s.max_tokens, {Tokenizer::kEosId}, nullptr);
+        loop.generate(st, seed, s.max_tokens, {s.eos_id}, nullptr);
     const double ms = platform::now_ms() - t0;
 
     std::printf("%s\n", out.c_str());
@@ -679,6 +733,8 @@ int main(int argc, char** argv) {
     }
     if (cmd == "gen")      { if (s.prompt.empty()) { print_usage(); return 1; }
                              return cmd_gen(s); }
+    if (cmd == "logits")   { if (s.prompt.empty()) { print_usage(); return 1; }
+                             return cmd_logits(s); }
     if (cmd == "ask")      { if (s.prompt.empty()) { print_usage(); return 1; }
                              return cmd_ask(s); }
     if (cmd == "bench")    { return cmd_bench(s); }
