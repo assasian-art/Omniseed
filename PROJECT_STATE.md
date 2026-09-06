@@ -132,7 +132,7 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 | FFT (TASK 4) | `include/omniseed/core/fft.h` — radix-2 + **Bluestein chirp-z** for exact N=400 bins 0..200 with M=1024 (O(N log N), same bins as the naive DFT it replaces). Wired into `whisper_tiny.cpp` log-mel. Test: matches naive DFT to 1e-6, identical tone bin. |
 | Real-weights test | `tests/test_real_weights.cpp` (13 checks): skips when the model file is absent; asserts config, finite logits, recorded greedy continuation (±2 tie window), sampling determinism, <300 MB RSS. Registered as ctest `omniseed_real_weights` (WD = repo root; `omniseed_platform` got the same fix). ctest: **2/2 suites pass**. |
 
-## 2c. PHASE 8 — SPEED + REAL SENSES ✅ (TASK 1: earlier commit; TASK 2: ac42318)
+## 2c. PHASE 8 — SPEED + REAL SENSES ✅ (TASK 1: c084868; TASK 2: ac42318; TASK 3: 1d93c60; TASK 4: 3066030 + 4575fac)
 
 ### TASK 1 — Speed (AVX2) ✅
 - AVX2 + SSE4.1 + scalar kernels for the per-row int8 dot (`src/core/bitlinear_avx2.cpp`, cpuid dispatch in `platform`, runtime-selected via function pointers). AVX2 kernel measured **7.3× the scalar** in isolation (0.45 → 3.25 GMAC/s).
@@ -152,20 +152,61 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 3. **The subtle one**: a default-constructed (absent) `Tensor` has `numel()==1` (empty-shape product) with `data()==nullptr`, so the widespread `numel() > 0` "optional present" guard **passed for missing tensors** and then dereferenced null (ASan: access-violation at the vision bias add). All optional-tensor guards now use `numel() > 1`. ASan build (`build/asan_build.bat` pattern: `/fsanitize=address` + MSVC asan DLL on PATH) found in one run what hours of Release-mode printf bisection could not.
 - Loader-ownership rule (3rd strike): **every component holding non-owning views must own its `GgufLoader`** (RwkvModel `store_`, WhisperTiny `store_`, VisionEncoder `store_`). A local loader unmaps on return and dangles.
 
-### Verification (Phase 8 so far)
-- `omniseed_tests` 165/165, `omniseed_real_weights` 13/13, new `omniseed_sides` **14/14** (registered ctest-side, skips cleanly when sidecars absent): mel [80×98], encode [49×384] finite, vision 768-dim projection finite + input-sensitive (gradient vs inverted differ > 1e-4).
+### TASK 3 — QAT true-ternary PoC ✅ (commit 1d93c60)
+- `tools/qat_ternary.py` (offline, PyTorch CPU): loads the Hakureirm checkpoint,
+  reuses the converter's verified reference forward, ternarizes the 8 big linears
+  per layer with **STE** (masters in fp32, straight-through to {-1,0,+1}), trains
+  on an in-repo markdown corpus, evals val perplexity, exports a QAT GGUF.
+- **Numbers:** bf16 baseline PPL **41.9** → PTQ-ternary **479,871** (destroyed, as
+  predicted) → after only **150 toy steps** (window 8, lr 1e-3, chunked/resumable):
+  **230,013** — a 2.1× recovery; training loss 15.4 → ~9.5. Quality parity needs a
+  real corpus and thousands of steps (CPU autograd ≈ 23 s/step at window 16).
+- `models/rwkv7-0.1B-ternary-qat.gguf` loads through the **C++ ternary path**
+  (peak RSS **114.6 MB** — ternary is ~3× smaller than i8); output degenerate at
+  PoC quality, as expected.
+- Gotchas encoded in the tool: this checkpoint family stores 1-D norms with a
+  leading `[1,...]` dim (strip ALL leading dims or x broadcasts to [1,768]);
+  ternarize once per window (weights only change at optimizer step); torch
+  single-thread for these tiny ops.
+
+### TASK 4 — Product polish ✅ (commits 3066030, 4575fac)
+- **Streaming chat:** `AgentLoop::Config.on_token` callback prints pieces as they
+  are generated (`omniseed chat`).
+- **Server:** loads the **world tokenizer from the model GGUF** (was a minimal
+  byte tokenizer → degenerate replies), honors `--model` or `OMNISEED_MODEL`,
+  `/health` reports `model:true` + `peak_rss_mb`; `/gen` verified coherent.
+  Docker unavailable on this box — Dockerfile verified by inspection (same flags
+  + `/health` contract tested natively).
+- **Checkpoint shootout:** added `omniseed ppl` (teacher-forced cross-entropy over
+  a corpus) and `tools/convert_goose28.py` for the official
+  `RWKV/RWKV7-Goose-World2.8-0.1B-HF` (fla naming). Result: after fixing a
+  lora.2 **transposition bug** (fla `nn.Linear` weights are ALREADY in C++
+  storage form — no transposes anywhere), the Goose model generates coherent
+  English, and **both 0.1B checkpoints proved bit-identical** (per-tensor
+  max|diff| = 0.0; identical NLL to 4 decimals over 2048 tokens, PPL ≈ 32.9 on
+  in-repo markdown) → existing model stays the default.
+- **fla token-shift myth busted:** verified against the official transformers
+  `modeling_rwkv7.py` that fla and BlinkDL share the SAME token-shift algebra
+  (`delta = prev - x`); the fla-form dual-path added earlier was based on a
+  misread and was REMOVED (`omniseed.fla_shift` gone).
+
+### Verification (Phase 8)
+- `omniseed_tests` **165/165**, `omniseed_real_weights` **13/13**, `omniseed_sides`
+  **14/14** (skip cleanly when sidecars absent): mel [80×98], encode [49×384]
+  finite, vision 768-dim projection finite + input-sensitive (gradient vs
+  inverted differ > 1e-4).
+- Speed/RSS: scalar 2.1 tok/s / 202.8 MB → AVX2 **19.2 tok/s / 155 MB** (model
+  loaded); gen observed 15.7–20.8 tok/s; ternary-QAT path 114.6 MB.
 
 ## 3. NEXT STEPS (in order)
 
-1. **Vision/audio/focal weights**: extend the converter for MobileNetV4,
-   Whisper-tiny-encoder, FocalCodec codebooks; retire the documented fallback
-   paths in `mobilenet_v4.cpp` / `whisper_tiny.cpp` / `focal_codec.cpp`.
-2. **QAT for real ternary**: distill the int8 model into BitNet b1.58 weights
-   (the runtime kernels already support ternary + per-row scales; only
-   training-time lossy compression remains).
-3. **Speed**: current 1.4 tok/s is scalar; add AVX2 dot paths in
-   `bitlinear_forward_i8`, i8 dot with `_mm256_maddubs_epi16`, and batch the
-   head matmul with f16 conversion. Target: 8-15 tok/s on desktop.
+1. **Full-scale QAT**: real corpus (multi-GB), 10k+ steps, lr schedule → make
+   true ternary the default at i8 quality (runtime already validated; the tool
+   has chunked resume for long runs).
+2. **Whisper decoder weights**: autoregressive decoder → real end-to-end ASR
+   (encoder is already real).
+3. **FocalCodec codebooks**: last algorithmic-fallback sense; extend
+   `convert_senses.py` when a suitable public checkpoint is identified.
 4. **Tie-window test note**: `test_real_weights` records a continuation with
    a ±2-token tie window; if the reference drifts, re-record from a fresh run.
 5. **CI on Linux** (GCC/MinGW paths untested on this machine).
@@ -175,8 +216,9 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 
 ## 4. UNRESOLVED ISSUES / BUGS
 
-- **Vision/audio backbones run documented fallback paths** (deterministic patch
-  statistics / spectral-hash codes) until converter tensors exist (NEXT STEPS #1).
+- **Sense fallbacks largely retired**: whisper-tiny encoder + vision projection
+  load real weights (sidecars); remaining fallbacks are the whisper *decoder*
+  and FocalCodec codebooks (NEXT STEPS #2/#3).
 - **Server is serialized** (one request at a time) — fine for edge use.
 - **MinGW/GCC builds untested** on this machine; MSVC `/W4` is clean.
 - **Windows console UTF-8**: consider `SetConsoleOutputCP(CP_UTF8)` in CLI main.
@@ -199,6 +241,11 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 - CLI demos verified by hand: all 13 commands run; peak RSS **< 5 MB** each
   (no model loaded); `selftest` OK; `tools` emits valid JSON schemas.
 - **Real-model verification:** `gen --model models/rwkv7-0.1B-ternary.gguf`
-  greedy + sampled output coherent (see 2b); peak RSS 202.8 MB; ctest 2/2
-  suites green (`omniseed_platform`, `omniseed_real_weights`).
+  greedy + sampled output coherent (see 2b/2c); peak RSS **155 MB** at
+  **19.2 tok/s**; three suites green (`omniseed_platform` 165,
+  `omniseed_real_weights` 13, `omniseed_sides` 14). Server `/gen` coherent;
+  `/health` reports model+RSS. `omniseed ppl --eval-file F` for perplexity
+  (PPL ≈ 32.9 on in-repo markdown).
 - Fresh-clone build verified with wiped `build/`; zero compiler warnings.
+- `docs/OMNISEED_MASTER_SPEC.md` updated to v2.0 (real-weights story, Phase 7+8
+  tools, benchmarks, verification status).

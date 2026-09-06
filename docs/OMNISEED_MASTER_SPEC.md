@@ -1,7 +1,8 @@
 # OmniSeed — Master Specification
 
-**Version:** 1.0 (post-audit) · **Date:** 2026-09-06 · **Language:** pure C++17
-**Target envelope:** < 300 MB peak RSS at inference (observed idle: **~4 MB**)
+**Version:** 2.0 (real weights) · **Date:** 2026-09-06 · **Language:** pure C++17
+**Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
+RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2)**
 
 OmniSeed is a self-improving, multi-modal **micro-LLM agent kernel** designed from the
 ground up for the 100–300 MB RAM frontier described in the seven project research
@@ -17,9 +18,9 @@ The three pillars mandated by the research blueprint are all implemented:
 
 | Pillar | Blueprint requirement | Implementation |
 |---|---|---|
-| Linear-complexity backbone | RWKV-style recurrent core, **no KV cache** | `include/omniseed/core/rwkv.h`, `src/core/rwkv.cpp` — time-mixed + channel-mixed blocks with an O(1) recurrent state; state is saved/restored per session. |
-| Extreme quantization | BitNet **1.58-bit ternary** weights {-1,0,+1} | `include/omniseed/core/bitlinear.h`, `src/core/bitlinear.cpp` — BitLinear layers with per-tensor absmean scales; matmuls decompose into add/sub accumulate. |
-| Lean C++ runtime | No interpreter, static binaries, GGUF I/O | `src/core/gguf_loader.cpp`, `include/omniseed/core/gguf_format.h` — streaming GGUF reader; `tools/make_tiny_gguf.py` builds test models. Runtime = one static `omniseed_core` lib + CLI/server executables. |
+| Linear-complexity backbone | RWKV-style recurrent core, **no KV cache** | `include/omniseed/core/rwkv.h`, `src/core/rwkv.cpp` — time-mixed + channel-mixed blocks with an O(1) recurrent state; state is saved/restored per session. **Loads real RWKV-7 World 0.1B weights and generates coherent English.** |
+| Extreme quantization | BitNet **1.58-bit ternary** weights {-1,0,+1} | `include/omniseed/core/bitlinear.h`, `src/core/bitlinear.cpp` — BitLinear layers with per-tensor/per-row scales; runtime default is per-row int8 (accurate + AVX2-fast), true-ternary path validated with the QAT export (114 MB peak). |
+| Lean C++ runtime | No interpreter, static binaries, GGUF I/O | `src/core/gguf_loader.cpp`, `include/omniseed/core/gguf_format.h` — mmap-backed GGUF reader. AVX2 i8 dot-product kernels with SSE4.1/scalar fallback (`src/core/bitlinear_avx2.cpp`); fp16 head is quantized at load, never scalar-converted. |
 
 **Memory strategy.** The 1M-token context (feature #10) uses the
 StreamingLLM-style design from the blueprint: a sliding window with attention-sink
@@ -37,7 +38,7 @@ MobileNetV4/UniCompress vision patches (`src/vision/mobilenet_v4.cpp`,
 
 ## 2. The Seven Novel Capabilities
 
-Each capability below is functional C++ with dedicated unit tests (163/163 passing).
+Each capability below is functional C++ with dedicated unit tests (165/165 passing, plus 13 real-weights and 14 senses checks).
 
 ### 2.1 Dream-State Learning — capability #1
 - **Files:** `include/omniseed/memory/memory.h`, `src/memory/memory_crystals.cpp`
@@ -222,14 +223,32 @@ interface it needs exists).
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # Windows: -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
-ctest --test-dir build -C Release                 # 163/163 pass
+ctest --test-dir build -C Release                 # 165/165 pass
 ```
 
 Artifacts: `build/bin/omniseed.exe` (CLI), `build/bin/omniseed_tests.exe`,
+`build/bin/omniseed_real_weights.exe`, `build/bin/omniseed_sides.exe`,
 `build/bin/omniseed_server.exe` (HTTP control plane), `lib/omniseed_core`.
 
 Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`
-(SSE chat service), `docs/DEPLOYMENT.md` (Render/Fly/local guides).
+(SSE chat service), `docs/DEPLOYMENT.md` (Render/Fly/local guides). The server
+honors `--model` or `OMNISEED_MODEL`, loads the world tokenizer straight from the
+GGUF, and `/health` reports `model:true` + `peak_rss_mb`.
+
+**Model & weights (offline Python tooling; never shipped at runtime):**
+
+| Tool | Purpose |
+|---|---|
+| `tools/convert_to_omniseed.py` | Hakureirm/BlinkDL RWKV-7 World checkpoints → OmniSeed GGUF (i8 or ternary linears, fp16 embedding/head, embedded world vocab) |
+| `tools/convert_goose28.py` | Official `RWKV/RWKV7-Goose-World2.8-0.1B-HF` (fla naming) → same GGUF; proven bit-identical weights to the Hakureirm 0.1B |
+| `tools/convert_senses.py` | OpenAI whisper-tiny encoder + mel filters → `models/whisper-tiny-encoder.gguf`; vision projection → `models/vision-proj.gguf` |
+| `tools/qat_ternary.py` | STE-based QAT toward true ternary (PoC: PTQ ppl 479,871 → 230,013 after 150 toy steps; bf16 baseline 41.9) |
+| `tools/check_gguf.py` | GGUF structural/dtype validator |
+
+**Benchmark (x64, MSVC Release, 0.1B model loaded):** 2.1 tok/s scalar →
+**19.2 tok/s** after AVX2 + i8 head (9.1×); peak RSS 202.8 → **155 MB**.
+`omniseed bench --model M` reproduces; `omniseed ppl --model M --eval-file F.txt`
+gives cross-entropy perplexity (PPL ≈ 33 on in-repo markdown, i8 head).
 
 ---
 
@@ -238,6 +257,11 @@ Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`
 | Command | Demonstrates | Sample output |
 |---|---|---|
 | `omniseed info` | platform, RSS budget | `peak rss: 4.01 MB · budget: 300 MB` |
+| `omniseed gen --model M --prompt "…"` | free generation from real weights | coherent English, `[ms, tok/s, peak MB]` footer |
+| `omniseed chat --model M` | **streaming** REPL (tokens print as generated) | — |
+| `omniseed bench --model M` | warm tok/s + peak RSS | `19.2 tok/s · 155 MB` |
+| `omniseed ppl --model M --eval-file F` | teacher-forced cross-entropy/perplexity | `PPL=32.91 · 5.04 bits/token` |
+| `omniseed logits --model M --prompt "…"` | next-token distribution probe | `top8: (36786, 5.963) …` |
 | `omniseed demo-sensory` | capability #3 | `verify alice → 1.000 MATCH · bob → 0.845 reject` |
 | `omniseed demo-emotional` | capability #4 | `"terrible…hate" → sad −1.00 · reply "I hear you —…"` |
 | `omniseed demo-skills` | capabilities #6 | `convert 5 km to miles → zs_conv_km_to_miles_3 → 3.10685` |
@@ -250,28 +274,36 @@ Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`
 | `omniseed chat --model M` | REPL with thinking mode + interrupts | — |
 | `omniseed selftest` | numeric sanity | `selftest OK` |
 
-Observed peak RSS across **all** demos: **< 5 MB** (no model loaded), leaving ~295 MB
-for weights — i.e. a 1.58-bit ternary model of ~150M+ parameters fits the envelope
-comfortably, with the context state adding a constant few MB regardless of the 1M-token
-logical window.
+Observed peak RSS: **< 5 MB** across all demos (no model loaded) and
+**155–158 MB** with the 0.1B model + whisper encoder + vision projection loaded —
+roughly half the 300 MB envelope, leaving headroom for a ~2× larger model or the
+full ternary (1.58-bit) variant of a bigger checkpoint.
 
 ---
 
 ## 8. Verification
 
-- **Unit/integration tests:** 163 assertions across core, memory, agent, runtime,
-  audio, vision, swarm (`tests/test_platform.cpp`) — **163 passed / 0 failed**.
-- **Warnings:** zero under MSVC `/W4` (Release).
-- **Fresh-clone build:** verified with a wiped `build/` directory.
+- **Unit/integration tests:** 165 assertions across core, memory, agent, runtime,
+  audio, vision, swarm (`tests/test_platform.cpp`) — **165 passed / 0 failed**.
+- **Real-weights suite** (`tests/test_real_weights.cpp`, skips if no GGUF):
+  **13/13** — loader integrity, finite logits, stable greedy continuation, RSS cap.
+- **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **14/14** —
+  whisper encoder end-to-end on synthetic mel, ternary vision projection,
+  all-finite outputs.
+- **Warnings:** zero under MSVC `/W4` (Release); AddressSanitizer clean on the
+  senses suite after the null-optional-bias + mmap-lifetime fixes.
+- **Checkpoint equivalence:** official Goose-2.8 0.1B and Hakureirm 0.1B proven
+  bit-identical (per-tensor max\|diff\| = 0.0; identical NLL over 2048 tokens).
 - **Debug tooling:** `tools/dbg_build.py` + `tools/dbg_sensory.cpp` compile the sensory
   stack standalone under `vcvars64` for isolated probe runs.
 
 ## 9. Known Limitations & Roadmap
 
-1. **Trained weights** — encoders/decoders ship with deterministic algorithmic
-   implementations; PARTIAL/DESIGN features graduate to FULL once QAT-trained BitNet
-   weights are produced (`tools/make_tiny_gguf.py` already emits the target format).
-2. **Whisper decoder** — encoder path is real; autoregressive decoder pending weights.
+1. **True ternary at quality** — the runtime's ternary path is fully functional and
+   QAT is proven (2.1× perplexity recovery in 150 toy steps), but matching the i8
+   model's quality needs a real corpus and thousands of steps of QAT on CPU.
+2. **Whisper decoder** — the encoder is real and loaded from sidecar weights; the
+   autoregressive text decoder is still algorithmic.
 3. **WebRTC (#19)** — replaced by the leaner UDP beacon in-budget; a libdatachannel
    integration is the natural upgrade when the 300 MB cap is relaxed.
 4. **Catalog III (#81–100)** — research-frontier items; interfaces reserved as noted.
