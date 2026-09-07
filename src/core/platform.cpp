@@ -6,8 +6,10 @@
 // =============================================================================
 #include "omniseed/core/platform.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <new>
 #include <string>
@@ -114,9 +116,38 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
     return *this;
 }
 
+namespace {
+// Fires the fallback WARN at most once per process: a model file is opened
+// by several components (weights + GGUF-resident tokenizer), and one notice
+// that the RSS profile differs is all the operator needs.
+std::atomic<bool> g_fallback_warned{false};
+} // namespace
+
 bool MappedFile::open(const std::string& path) {
     close();
     path_ = path;
+
+    // ---------------------------------------------------------------
+    // Test/portability escape hatch: OMNISEED_FORCE_FREAD=1 skips mmap
+    // entirely and serves tensor views from a full heap copy. Proves the
+    // fallback path is byte-identical to the mmap path (same weights,
+    // same outputs) on hosts where mmap is unavailable.
+    // ---------------------------------------------------------------
+    const char* force = std::getenv("OMNISEED_FORCE_FREAD");
+    if (force != nullptr &&
+        (force[0] == '1' || force[0] == 'y' || force[0] == 'Y')) {
+        if (open_fallback_impl(path)) {
+            if (!g_fallback_warned.exchange(true)) {
+                log_warn(
+                    "MappedFile: OMNISEED_FORCE_FREAD=1 — '%s' served from a "
+                    "full heap copy (RSS will reflect the whole file).",
+                    path.c_str());
+            }
+            return true;
+        }
+        // fread failed too (missing file etc.): fall through so the mmap
+        // attempt produces the more descriptive OS error.
+    }
 
     // ---------------------------------------------------------------
     // Common path: try a real OS mmap first (zero-copy, lazy paging
@@ -127,10 +158,12 @@ bool MappedFile::open(const std::string& path) {
     if (open_mapped_impl(path)) return true;
     const std::string mmap_error = last_error_;
     if (open_fallback_impl(path)) {
-        log_warn(
-            "MappedFile: mmap unavailable for '%s' (%s); serving from a "
-            "full heap copy (RSS will reflect the whole file).",
-            path.c_str(), mmap_error.c_str());
+        if (!g_fallback_warned.exchange(true)) {
+            log_warn(
+                "MappedFile: mmap unavailable for '%s' (%s); serving from a "
+                "full heap copy (RSS will reflect the whole file).",
+                path.c_str(), mmap_error.c_str());
+        }
         return true;
     }
     return false;

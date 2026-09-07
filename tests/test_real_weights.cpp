@@ -210,7 +210,22 @@ int main() {
     }
 
     // --------------------- 5. memory budget ----------------------------------
-    CHECK(platform::peak_rss_bytes() < 300ull * 1024 * 1024);
+    // The <300 MB budget is an mmap-mode property (lazy page-in). Under
+    // OMNISEED_FORCE_FREAD=1 the whole file is deliberately heap-resident
+    // (and the tokenizer re-opens it -> ~2 full copies), so only run the
+    // budget check in the real deployment mode.
+    {
+        const char* force = std::getenv("OMNISEED_FORCE_FREAD");
+        const bool forced_fread =
+            force != nullptr && (force[0] == '1' || force[0] == 'y' ||
+                                 force[0] == 'Y');
+        if (forced_fread) {
+            std::printf(
+                "  (memory budget check skipped: OMNISEED_FORCE_FREAD=1)\n");
+        } else {
+            CHECK(platform::peak_rss_bytes() < 300ull * 1024 * 1024);
+        }
+    }
 
     std::printf("RESULT: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

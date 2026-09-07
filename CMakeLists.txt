@@ -177,6 +177,7 @@ if(OMNISEED_BUILD_TESTS)
     endif()
     add_test(NAME omniseed_real_weights COMMAND omniseed_real_weights
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_real_weights PRIVATE _CRT_SECURE_NO_WARNINGS)
     add_executable(omniseed_sides tests/test_sides.cpp)
     target_include_directories(omniseed_sides PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -189,6 +190,7 @@ if(OMNISEED_BUILD_TESTS)
     endif()
     add_test(NAME omniseed_sides COMMAND omniseed_sides
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_sides PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

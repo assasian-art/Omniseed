@@ -120,7 +120,16 @@ int main() {
                 std::printf("  transcribe: \"%s\" (%.1fs)\n",
                             text.c_str(), secs);
                 std::fflush(stdout);
-                CHECK(secs < 30.0);                       // no pathological loop
+                // No-pathological-loop guard, not a perf SLA: sanitizer/Debug
+                // builds legitimately run several times slower, so the bound
+                // is scalable via OMNISEED_TRANSCRIBE_TIMEOUT_S (default 30).
+                double secs_bound = 30.0;
+                if (const char* env = std::getenv(
+                        "OMNISEED_TRANSCRIBE_TIMEOUT_S")) {
+                    const double v = std::atof(env);
+                    if (v > 0.0) secs_bound = v;
+                }
+                CHECK(secs < secs_bound);
                 CHECK(text.size() < 4096);                // bounded output
                 for (const char c : text)                 // printable/UTF-8 bytes
                     CHECK(static_cast<unsigned char>(c) >= 0x09);
