@@ -48,7 +48,7 @@ def T(base):
         _cache[key] = torch.from_numpy(C.read_tensor(st_path, header, data_start, k))
     return _cache[key]
 
-tok = RwkvTokenizer(vocab_file='models/rwkv_vocab_v20230424.txt')
+tok = RwkvTokenizer(vocab_file=C.resolve_vocab('models/rwkv_vocab_v20230424.txt'))
 
 V, E = T('emb.weight').shape
 n_layers = 12

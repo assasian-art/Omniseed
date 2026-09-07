@@ -11,6 +11,12 @@ from hf_rwkv_tokenizer import RwkvTokenizer
 MODEL_DIR = 'models'
 sys.path.insert(0, 'models')
 
+import os
+# Vocab: committed tools/data copy first, legacy models/ second.
+VOCAB = 'tools/data/rwkv_vocab_v20230424.txt'
+if not os.path.exists(VOCAB):
+    VOCAB = 'models/rwkv_vocab_v20230424.txt'
+
 torch.set_grad_enabled(False)
 cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
 # the HF-format safetensors sits in models/model.safetensors with rwkv7.* keys
@@ -18,12 +24,12 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_DIR, config=cfg, trust_remote_code=True, torch_dtype=torch.float32)
 model.eval()
 
-tok = RwkvTokenizer(vocab_file='models/rwkv_vocab_v20230424.txt')
+tok = RwkvTokenizer(vocab_file=VOCAB)
 print('tokenizer:', type(tok).__name__, 'vocab', len(tok), flush=True)
 
 vocab = {}
 import ast
-for line in open('models/rwkv_vocab_v20230424.txt', encoding='utf-8'):
+for line in open(VOCAB, encoding='utf-8'):
     line = line.rstrip('\r\n')
     p = line.split(' ')
     if len(p) < 3:

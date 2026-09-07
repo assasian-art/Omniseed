@@ -46,3 +46,11 @@ Thumbs.db
 
 # Freebuff client state
 .freebuff/
+
+# ---------------------------------------------------------------------------
+# Committed world vocab (1.0 MB): ships in-repo so fresh clones / Colab train
+# out of the box — resolve_vocab() reads tools/data/ first, models/ second.
+# These negations are deliberate exceptions to any future artifact globs.
+# ---------------------------------------------------------------------------
+!tools/data/rwkv_vocab_v20230424.txt
+!models/rwkv_vocab_v20230424.txt

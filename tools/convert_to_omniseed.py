@@ -126,6 +126,28 @@ def K(base):
 # World vocab parsing: lines are "id 'python-escaped-piece' declared_len"
 # (space-separated; pieces may contain escaped spaces; id 0 is absent).
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# World vocab resolution: the vocab is COMMITTED at tools/data/ so fresh
+# clones (and Colab) work out of the box; the legacy models/ layout is the
+# fallback. An explicit existing path always wins.
+# -----------------------------------------------------------------------------
+def resolve_vocab(explicit=None):
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    name = 'rwkv_vocab_v20230424.txt'
+    if explicit and os.path.exists(explicit):
+        return explicit
+    if explicit:
+        print(f'[vocab] note: {explicit} not found; using the committed copy')
+    for cand in (os.path.join(root, 'tools', 'data', name),
+                 os.path.join(root, 'models', name),
+                 os.path.join('models', name)):
+        if os.path.exists(cand):
+            return cand
+    raise FileNotFoundError(
+        f'{name} not found (looked in tools/data/, models/, and {explicit!r})')
+
+
 def load_world_vocab(path, vocab_size):
     pieces = [''] * vocab_size          # id 0 stays an empty piece
     types = [1] * vocab_size            # 1 = NORMAL
@@ -359,7 +381,7 @@ def main():
           f'ranks w={rw} a={ra} g={rg} v={rv}')
 
     # ---------------- vocab ----------------
-    pieces, types = load_world_vocab(args.vocab, V)
+    pieces, types = load_world_vocab(resolve_vocab(args.vocab), V)
 
     # ---------------- writer ----------------
     w = GgufWriter()

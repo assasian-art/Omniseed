@@ -472,3 +472,39 @@ file/console I/O. All work verified: Release build zero warnings (/W4),
 - Fresh-clone build verified with wiped `build/`; zero compiler warnings.
 - `docs/OMNISEED_MASTER_SPEC.md` updated to v2.0 (real-weights story, Phase 7+8
   tools, benchmarks, verification status).
+
+---
+
+## 6. PHASE-11 — GPU-READY QAT + GITHUB PUSH (2026-09-07)
+
+### TASK 1 — Colab/GPU readiness (complete)
+
+- **`--device {auto,cpu,cuda}`** (`tools/qat_ternary.py`, default `auto`):
+  frozen params + trainable masters move via `RWKV7Ternary.to_device()`
+  (masters rebuilt as fresh leaf tensors before the optimizer exists);
+  batch/eval/verify tensors are created on the device; RNN state zeros are
+  device-aware. On cpu every `.to()` is a no-op.
+  **Bit-identity proven:** `--verify-batch --device cpu` →
+  `max|dlogits|=0.00e+00 max|dstate|=0.00e+00 OK` — identical to the
+  pre-change baseline.
+- **Fresh-clone bootstrap:** `ensure_checkpoint()` auto-downloads the public
+  HF checkpoint (`Hakureirm/rwkv7-0.1b-hf` → `models/model.safetensors`,
+  config refreshed into `models/hf-orig/`) with plain urllib, no login — a
+  fresh clone trains end-to-end.
+- **World vocab committed:** `tools/data/rwkv_vocab_v20230424.txt` (1.04 MB,
+  `cmp`-identical to the models/ copy). New shared
+  `convert_to_omniseed.resolve_vocab()` resolves repo-relative first
+  (tools/data/), models/ second, explicit-path-wins; wired into
+  `qat_ternary.py`, both converters, and the oracle/diff/sim dev tools.
+  `.gitignore` negation exceptions added.
+- **`tools/COLAB_QAT.md`:** exact cells — clone, pip, Drive mount, ckpt
+  restore/save per chunk, `--device cuda --time-budget 3300` chunk loop
+  (exit 3 = continue), auto-export of best-masters GGUF, download home.
+- **`--smoke` flag:** 2 real steps, eval off, no ckpt write / no export —
+  verified green (`auto` → cpu here; no CUDA on this box; an explicit cuda
+  request without a runtime warns loudly and falls back to cpu).
+- Full suite green post-change: ctest **3/3** (200 + 13 + 17).
+
+Next in this pass: TASK 2 (gitignore audit + `git add -A` commit) and
+TASK 3 (force-push `main` to github.com/assasian-art/Omniseed, then
+sanitize the remote URL — the session token lives only in shell commands).

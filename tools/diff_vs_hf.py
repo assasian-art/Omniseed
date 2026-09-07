@@ -19,7 +19,7 @@ st_path = 'models/model.safetensors'
 header, data_start = C.load_safetensors(st_path)
 T = lambda k: torch.from_numpy(C.read_tensor(st_path, header, data_start, C.K(k)))
 
-tok = RwkvTokenizer(vocab_file='models/rwkv_vocab_v20230424.txt')
+tok = RwkvTokenizer(vocab_file=C.resolve_vocab('models/rwkv_vocab_v20230424.txt'))
 
 cfg = AutoConfig.from_pretrained('models', trust_remote_code=True)
 hf = AutoModelForCausalLM.from_pretrained(

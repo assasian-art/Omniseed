@@ -33,7 +33,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert_to_omniseed import (  # noqa: E402
     load_safetensors, read_tensor, quantize_i8, to_f16_bytes,
-    GgufWriter, load_world_vocab, I8, TERNARY, F16, F32,
+    GgufWriter, load_world_vocab, resolve_vocab, I8, TERNARY, F16, F32,
 )
 
 DEFAULT_ST = 'models/goose28.safetensors'
@@ -65,7 +65,7 @@ def main():
     print(f'[goose] V={V} E={E} L={n_layers} H={H} D={D} FFN={I} '
           f'ranks w={rw} a={ra} g={rg} v={rv}')
 
-    pieces, types = load_world_vocab(args.vocab, V)
+    pieces, types = load_world_vocab(resolve_vocab(args.vocab), V)
 
     w = GgufWriter()
     w.add_str('general.architecture', 'omniseed-rwkv7')

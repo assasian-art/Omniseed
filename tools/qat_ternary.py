@@ -34,6 +34,11 @@
 #  Usage (from repo root, venv with torch on PATH):
 #    ./.venv/Scripts/python.exe tools/qat_ternary.py                # one chunk
 #    tools/qat_watch.bat            (Windows)  /  tools/qat_watch.sh (Unix)
+#
+#  GPU (Colab): --device {auto,cpu,cuda}; full recipe in tools/COLAB_QAT.md.
+#  Fresh clone: model.safetensors auto-downloads (HF Hakureirm/rwkv7-0.1b-hf)
+#  and the world vocab resolves repo-relative (tools/data/ first).
+#  --smoke: 2-step end-to-end self-check (no ckpt write, no export).
 # =============================================================================
 import argparse
 import math
@@ -47,7 +52,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert_to_omniseed import (  # noqa: E402
-    K, load_safetensors, read_tensor,
+    K, load_safetensors, read_tensor, resolve_vocab,
     GgufWriter, load_world_vocab, I8, TERNARY, F16, F32,
 )
 
@@ -60,6 +65,7 @@ WIKITEXT_VAL = ('https://huggingface.co/datasets/Salesforce/wikitext/'
                 'resolve/main/wikitext-103-raw-v1/'
                 'validation-00000-of-00001.parquet')
 REPO_FILES = ['PROJECT_STATE.md', 'docs/OMNISEED_MASTER_SPEC.md', 'README.md']
+HF_MODEL_REPO = 'Hakureirm/rwkv7-0.1b-hf'   # public HF repo, no login needed
 
 INV_SQ_E = 1.0 / math.sqrt(math.e)
 EXIT_DONE, EXIT_MORE = 0, 3
@@ -78,6 +84,31 @@ def _download(url, dest):
     urllib.request.urlretrieve(url, tmp)
     os.replace(tmp, dest)
     return dest
+
+
+def ensure_checkpoint(path):
+    """Fresh-clone bootstrap (Colab): when the safetensors is missing, pull
+    the public HF checkpoint (safetensors + config.json) with plain urllib —
+    no interactive login. models/hf-orig/config.json is committed, so this
+    normally only fetches the ~380 MB weights once."""
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return
+    import urllib.request
+    base = f'https://huggingface.co/{HF_MODEL_REPO}/resolve/main'
+    cfg = os.path.join(os.path.dirname(path) or '.', 'hf-orig', 'config.json')
+    if not os.path.exists(cfg):
+        os.makedirs(os.path.dirname(cfg) or '.', exist_ok=True)
+        print(f'[qat] downloading {base}/config.json', flush=True)
+        urllib.request.urlretrieve(f'{base}/config.json', cfg + '.part')
+        os.replace(cfg + '.part', cfg)
+    print(f'[qat] downloading {base}/model.safetensors (~380 MB, one-time)',
+          flush=True)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + '.part'
+    urllib.request.urlretrieve(f'{base}/model.safetensors', tmp)
+    os.replace(tmp, path)
+    print(f'[qat] checkpoint ready: {path} '
+          f'({os.path.getsize(path) / 1048576:.1f} MB)', flush=True)
 
 
 def _parquet_lines(path):
@@ -173,6 +204,7 @@ class RWKV7Ternary:
         self.torch = torch
         self.header, self.ds, self.st = header, data_start, st_path
         self.cache = {}
+        self.device = torch.device('cpu')   # moved by to_device() in main
 
         V, E = self.T(K('emb.weight')).shape
         n_layers = max(int(k.split('.')[2]) for k in header if '.blocks.' in k) + 1
@@ -221,6 +253,17 @@ class RWKV7Ternary:
                 self.masters[full] = W0.clone().requires_grad_(True)
         self.master_list = list(self.masters.values())
 
+    def to_device(self, device):
+        """Move frozen params + trainable masters to device. Masters are
+        rebuilt as fresh leaf tensors (still valid AdamW params), so this
+        MUST run before the optimizer is created. On cpu every .to() is a
+        no-op — the CPU path stays bit-identical."""
+        self.device = device
+        self.p = {k: v.to(device) for k, v in self.p.items()}
+        self.masters = {n: t_.detach().to(device).requires_grad_(True)
+                        for n, t_ in self.masters.items()}
+        self.master_list = list(self.masters.values())
+
     def T(self, k):
         if k not in self.cache:
             self.cache[k] = self.torch.from_numpy(
@@ -262,7 +305,9 @@ class RWKV7Ternary:
             return (x - m) / t.sqrt(v + eps) * w + b
 
         if state is None:
-            state = [(t.zeros(H, D, D), t.zeros(E), t.zeros(E)) for _ in range(L)]
+            state = [(t.zeros(H, D, D, device=self.device),
+                      t.zeros(E, device=self.device),
+                      t.zeros(E, device=self.device)) for _ in range(L)]
         x = p['emb'][tok]
         x = ln(x, p['ln0w'], p['ln0b'])
         v_first = None
@@ -343,8 +388,9 @@ class RWKV7Ternary:
 
         B = toks.shape[0]
         if state is None:
-            state = [(t.zeros(B, H, D, D), t.zeros(B, E), t.zeros(B, E))
-                     for _ in range(L)]
+            state = [(t.zeros(B, H, D, D, device=self.device),
+                      t.zeros(B, E, device=self.device),
+                      t.zeros(B, E, device=self.device)) for _ in range(L)]
         x = p['emb'][toks]                                  # [B, E]
         x = ln(x, p['ln0w'], p['ln0b'])
         v_first = None
@@ -447,7 +493,28 @@ def main():
     ap.add_argument('--no-export', action='store_true')
     ap.add_argument('--verify-batch', action='store_true',
                     help='assert step_batch(B=1) == step() and exit')
+    ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
+                    help='compute device; auto = cuda when available, else cpu')
+    ap.add_argument('--smoke', action='store_true',
+                    help='2-step end-to-end smoke (no ckpt write, no export)')
     args = ap.parse_args()
+
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        print('[qat] WARNING: cuda requested but torch sees no CUDA runtime; '
+              'continuing on cpu')
+        device = torch.device('cpu')
+    print('[qat] device: ' + str(device)
+          + (f' ({torch.cuda.get_device_name(0)})' if device.type == 'cuda'
+             else ''))
+    if args.smoke:
+        args.steps = min(args.steps, 2)
+        args.eval_every = 0
+        args.no_export = True
+        print('[qat] SMOKE: 2 steps, eval off, no checkpoint write / export')
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -455,7 +522,7 @@ def main():
 
     sys.path.insert(0, 'models/hf-orig')
     from hf_rwkv_tokenizer import RwkvTokenizer
-    tok = RwkvTokenizer(vocab_file='models/rwkv_vocab_v20230424.txt')
+    tok = RwkvTokenizer(vocab_file=resolve_vocab())
 
     if args.corpus in ('auto', 'wikitext'):
         try:
@@ -470,8 +537,10 @@ def main():
     print(f'[qat] corpus: train {len(train_ids):,} tokens, '
           f'val {len(val_ids):,} tokens')
 
+    ensure_checkpoint(args.safetensors)
     header, data_start = load_safetensors(args.safetensors)
     model = RWKV7Ternary(args.safetensors, header, data_start)
+    model.to_device(device)
     optimizer = torch.optim.AdamW(model.master_list, lr=args.lr,
                                   weight_decay=0.0, betas=(0.9, 0.95))
 
@@ -484,7 +553,7 @@ def main():
 
     global_step = args.start_step
     best = {'ppl': float('inf'), 'step': -1}
-    if os.path.exists(args.ckpt) and args.start_step == 0:
+    if os.path.exists(args.ckpt) and args.start_step == 0 and not args.smoke:
         ck = torch.load(args.ckpt, map_location='cpu', weights_only=True)
         with torch.no_grad():
             for n, t_ in ck['masters'].items():
@@ -522,7 +591,7 @@ def main():
         for j in range(use):
             toks = torch.tensor(
                 [int(ids[b * seg_len + j]) for b in range(n_seg)],
-                dtype=torch.long)
+                dtype=torch.long, device=device)
             logits, state = model.step_batch(toks, state)
             if j >= W:
                 logp = torch.log_softmax(logits.float(), -1)   # [B, V]
@@ -551,7 +620,8 @@ def main():
             lg, st1 = model.step(i, st1)
         s2, st2 = None, None
         for i in ref_ids:
-            lg2, st2 = model.step_batch(torch.tensor([i], dtype=torch.long), st2)
+            lg2, st2 = model.step_batch(
+                torch.tensor([i], dtype=torch.long, device=device), st2)
         d = (lg - lg2).abs().max().item()
         smax = max((a - b).abs().max().item()
                    for (a, _, _), (b, _, _) in zip(st1, st2))
@@ -580,13 +650,13 @@ def main():
                   for b in range(B)]
         model.begin_window(True)
         state = None
-        total_loss = torch.zeros(())
+        total_loss = torch.zeros((), device=device)
         for j in range(W):
             toks = torch.tensor([int(train_ids[s + j]) for s in starts],
-                                dtype=torch.long)
+                                dtype=torch.long, device=device)
             logits, state = model.step_batch(toks, state)
             tgt = torch.tensor([int(train_ids[s + j + 1]) for s in starts],
-                               dtype=torch.long)
+                               dtype=torch.long, device=device)
             loss = torch.nn.functional.cross_entropy(logits.float(), tgt)
             total_loss = total_loss + loss
             state = [(S.detach(), a.detach(), f.detach()) for S, a, f in state]
@@ -602,7 +672,7 @@ def main():
             ppl_val = perplexity(val_ids)
             if ppl_val < best['ppl']:
                 best = {'ppl': ppl_val, 'step': global_step}
-                torch.save({n: t_.detach().clone() for n, t_ in model.masters.items()},
+                torch.save({n: t_.detach().cpu().clone() for n, t_ in model.masters.items()},
                            args.ckpt.replace('.pt', '-best.pt'))
             log_line(f'[qat] step {global_step}/{args.steps} '
                      f'loss {(total_loss / W).item():.3f} lr={lr_at(global_step):.2e} '
@@ -615,14 +685,15 @@ def main():
             break
 
     # ---- persist checkpoint (masters + optimizer + progress + best) ----------
-    torch.save({'masters': {n: t_.detach().clone()
-                            for n, t_ in model.masters.items()},
-                'optim': optimizer.state_dict(),
-                'global_step': global_step,
-                'best_ppl': best['ppl'], 'best_step': best['step']},
-               args.ckpt)
-    log_line(f'[qat] checkpoint saved: {args.ckpt} (step {global_step}, '
-             f'best {best["ppl"]:.2f}@{best["step"]})')
+    if not args.smoke:
+        torch.save({'masters': {n: t_.detach().cpu().clone()
+                                for n, t_ in model.masters.items()},
+                    'optim': optimizer.state_dict(),
+                    'global_step': global_step,
+                    'best_ppl': best['ppl'], 'best_step': best['step']},
+                   args.ckpt)
+        log_line(f'[qat] checkpoint saved: {args.ckpt} (step {global_step}, '
+                 f'best {best["ppl"]:.2f}@{best["step"]})')
 
     done = global_step >= args.steps
     if done or args.export_always:
@@ -654,7 +725,7 @@ def export_gguf(model, args):
     rg = header[K('blocks.0.att.g2')]['shape'][0]
     rv = header[K('blocks.0.att.v2')]['shape'][0]
 
-    pieces, types = load_world_vocab('models/rwkv_vocab_v20230424.txt', V)
+    pieces, types = load_world_vocab(resolve_vocab(), V)
     w = GgufWriter()
     w.add_str('general.architecture', 'omniseed-rwkv7')
     w.add_str('general.name', 'RWKV7-World-0.1B-ternary-QAT')
