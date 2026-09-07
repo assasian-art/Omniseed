@@ -294,7 +294,21 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
    if the budget allows; DESIGN-status features #29/#30/#81–100 graduate when a
    training pipeline lands.
 
-## 3b. PORTABILITY HARDENING PASS (this session, uncommitted)
+## 3b. PORTABILITY HARDENING PASS (committed: 683b2ad + 161625b + beea44a)
+
+Proof layer (2a/2b):
+- **UDP beacon round-trip test** (test_platform.cpp, inside omniseed_platform):
+  two UdpBeacons on loopback ports 47471/47472 exchange CRC32+keystream
+  messages BOTH directions via unicast `udp:IP:port`; asserts payload equality
+  and source ip/port in host order. Required `UdpBeacon::send` to actually
+  honor `udp:IP:port` endpoints (it previously broadcast unconditionally —
+  fixed; "" still broadcasts). Suite now **177/177**.
+- **OMNISEED_FORCE_FREAD=1** forces MappedFile down the heap-fread path
+  (fallback WARN gated to once per process). Verified: Release fallback
+  12/12+17/17, ASan (MSVC /fsanitize=address, scratch config in gitignored
+  build-asan/) 13/13+17/17 — greedy continuation byte-identical in all four
+  modes, no leaks/overflows. RSS budget check + transcribe wall-clock bound
+  scale via env under fallback/sanitizer (see test_real_weights/test_sides).
 
 Goal: byte-exact behavior on every host ISA + ifdef-free swarm + UTF-8-safe
 file/console I/O. All work verified: Release build zero warnings (/W4),
