@@ -7,13 +7,21 @@ build/
 build-*/
 out/
 
-# Model artifacts (large binaries are not checked in)
-models/*.gguf
-models/*.ovocab
+# Python venv (training tools; Colab/CI use the system python)
+.venv/
+
+# Model artifacts (large binaries are not checked in). models/ is an
+# artifact drop-zone: DIRECT children are ignored by default; the committed
+# exceptions (world vocab, hf-orig runtime code) are re-included at the end
+# of this file — negations after models/* are load-bearing, keep the order.
+models/*
+!models/hf-orig/
 *.ckpt
 *.pth
 *.pt
 *.safetensors
+*.gguf
+*.ovocab
 
 # Downloaded reference sources (URLs documented in the converters)
 models/*.py
