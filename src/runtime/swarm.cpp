@@ -226,7 +226,19 @@ void UdpBeacon::stop() {
 bool UdpBeacon::send(const std::string& endpoint, const SwarmMessage& msg) {
     if (fd_ < 0) return false;
     const std::string blob = encode_message(msg, kSwarmKey);
-    (void)endpoint;    // broadcast only in the beacon transport
+    // "udp:IP:port" -> unicast to that peer; "" -> LAN broadcast (discovery).
+    if (endpoint.rfind("udp:", 0) == 0) {
+        unsigned ip0 = 0, ip1 = 0, ip2 = 0, ip3 = 0, port = 0;
+        if (std::sscanf(endpoint.c_str(), "udp:%u.%u.%u.%u:%u",
+                        &ip0, &ip1, &ip2, &ip3, &port) == 5 &&
+            ip0 < 256 && ip1 < 256 && ip2 < 256 && ip3 < 256 && port < 65536) {
+            const uint32_t ip4_host = (ip0 << 24) | (ip1 << 16) | (ip2 << 8) | ip3;
+            return platform::socket_udp_send(fd_, blob.data(), blob.size(),
+                                             ip4_host,
+                                             static_cast<uint16_t>(port));
+        }
+        return false;   // malformed endpoint: fail loudly, never broadcast by accident
+    }
     return platform::socket_udp_broadcast(fd_, blob.data(), blob.size(),
                                           cfg_.port);
 }

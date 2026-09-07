@@ -76,7 +76,8 @@ struct SwarmMessage {
 class SwarmTransport {
 public:
     virtual ~SwarmTransport() = default;
-    // Sends a message to a node endpoint ("" = broadcast).
+    // Sends a message to a node endpoint ("" = broadcast; UdpBeacon also
+    // accepts "udp:IP:port" for unicast to a specific peer).
     virtual bool send(const std::string& endpoint, const SwarmMessage& msg) = 0;
     // Polls for one inbound message; returns false when none pending.
     virtual bool poll(SwarmMessage& out, std::string& from_endpoint) = 0;

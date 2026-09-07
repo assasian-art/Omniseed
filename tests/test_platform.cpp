@@ -578,6 +578,71 @@ static void test_swarm_protocol() {
     mesh.leave("node-B");
 }
 
+static void test_udp_beacon_roundtrip() {
+    TEST("swarm: UDP beacon localhost round-trip, both directions");
+    // Two beacons on distinct loopback ports; messages cross the real wire
+    // through the platform socket shim (CRC32 + keystream encryption),
+    // unicast-addressed so neither side hears its own datagrams.
+    UdpBeacon::Config ca, cb;
+    ca.port = 47471;
+    cb.port = 47472;
+    UdpBeacon a(ca), b(cb);
+    if (!a.start() || !b.start()) {
+        // No UDP stack / port blocked (hardened CI sandboxes): skip cleanly.
+        platform::log_info("SKIP  UDP beacon unavailable on this host");
+        return;
+    }
+
+    SwarmMessage out_a, out_b;
+    std::string ep_a, ep_b;
+
+    // a -> b (b's poll sees a's broadcast; a's own loopback is disabled by
+    // design: a beacon never receives its own datagrams).
+    SwarmMessage m1;
+    m1.type = SwarmMessage::Type::Hello;
+    m1.from = "beacon-A";
+    m1.payload = "ping-from-a";
+    CHECK(a.send("udp:127.0.0.1:47472", m1));   // unicast straight to b
+    bool got1 = false;
+    for (int i = 0; i < 100 && !got1; ++i) {
+        got1 = b.poll(out_b, ep_b);
+        if (!got1) platform::yield_now();
+    }
+    CHECK(got1);
+    if (got1) {
+        CHECK(out_b.payload == m1.payload);
+        CHECK(out_b.from == m1.from);
+        CHECK(ep_b.rfind("udp:127.0.0.1:", 0) == 0);
+    }
+
+    // b -> a: the reply direction proves the shim is symmetric.
+    SwarmMessage m2;
+    m2.type = SwarmMessage::Type::TaskOffer;
+    m2.from = "beacon-B";
+    m2.task_key = "echo";
+    m2.payload = "pong-from-b";
+    CHECK(b.send("udp:127.0.0.1:47471", m2));   // unicast back to a
+    bool got2 = false;
+    for (int i = 0; i < 100 && !got2; ++i) {
+        got2 = a.poll(out_a, ep_a);
+        if (!got2) platform::yield_now();
+    }
+    CHECK(got2);
+    if (got2) {
+        CHECK(out_a.payload == m2.payload);
+        CHECK(out_a.from == m2.from);
+        CHECK(ep_a.rfind("udp:127.0.0.1:", 0) == 0);
+    }
+
+    // Source port correctness: the endpoint must name the PEER's bind port
+    // (a sends from 47471, b from 47472 — host order through the shim).
+    if (got1) CHECK(ep_b == "udp:127.0.0.1:47471");
+    if (got2) CHECK(ep_a == "udp:127.0.0.1:47472");
+
+    a.stop();
+    b.stop();
+}
+
 static void test_agent_intel() {
     TEST("agent intel: intent, dialogue state, confidence, kg, interrupts");
     CHECK(IntentClassifier::classify("what is a carburetor") ==
@@ -832,6 +897,7 @@ int main() {
     test_emotional_resonance();
     test_flash_skills_and_synthesis();
     test_swarm_protocol();
+    test_udp_beacon_roundtrip();
     test_agent_intel();
     test_audio_events();
     test_vision_tasks();
