@@ -523,7 +523,7 @@ bool FlashSkillPool::save() const {
 #endif
         (void)std::system(mkdir_cmd.c_str());   // best effort
     }
-    FILE* f = std::fopen(cfg_.store_path.c_str(), "wb");
+    FILE* f = platform::open_file_c(cfg_.store_path.c_str(), "wb");
     if (!f) return false;
     const uint32_t magic = 0x4C504B53;  // SKPL
     const uint32_t version = 1;
@@ -557,7 +557,7 @@ bool FlashSkillPool::save() const {
 }
 
 bool FlashSkillPool::load() {
-    FILE* f = std::fopen(cfg_.store_path.c_str(), "rb");
+    FILE* f = platform::open_file_c(cfg_.store_path.c_str(), "rb");
     if (!f) return false;
     uint32_t magic = 0, version = 0, n = 0;
     if (std::fread(&magic, 4, 1, f) != 1 || magic != 0x4C504B53 ||

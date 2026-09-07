@@ -130,7 +130,7 @@ void SelfImprovement::dream() {
 // Persistence
 // ===========================================================================
 bool SelfImprovement::save(const std::string& path) const {
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = platform::open_file_c(path.c_str(), "wb");
     if (!f) return false;
 
     const uint32_t magic = 0x54524953;   // SRIT

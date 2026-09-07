@@ -8,23 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
-
-#if OMNISEED_PLATFORM_WINDOWS
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-#else
-    #include <arpa/inet.h>
-    #include <fcntl.h>
-    #include <netinet/in.h>
-    #include <sys/socket.h>
-    #include <unistd.h>
-#endif
+#include <cstdio>
 
 namespace omniseed {
 
@@ -229,44 +213,13 @@ UdpBeacon::~UdpBeacon() { stop(); }
 
 bool UdpBeacon::start() {
     if (fd_ >= 0) return true;
-#ifdef _WIN32
-    fd_ = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
-    if (fd_ == INVALID_SOCKET) { fd_ = -1; return false; }
-#else
-    fd_ = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
-    if (fd_ < 0) return false;
-#endif
-    int one = 1;
-    ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR,
-                 reinterpret_cast<const char*>(&one), sizeof(one));
-    ::setsockopt(fd_, SOL_SOCKET, SO_BROADCAST,
-                 reinterpret_cast<const char*>(&one), sizeof(one));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(cfg_.port);
-    if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        stop();
-        return false;
-    }
-    // Non-blocking poll.
-#ifdef _WIN32
-    u_long nb = 1;
-    ::ioctlsocket(fd_, FIONBIO, &nb);
-#else
-    const int flags = ::fcntl(fd_, F_GETFL, 0);
-    if (flags >= 0) ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-#endif
-    return true;
+    // All OS specifics live behind the platform socket shim.
+    fd_ = platform::socket_udp_open(cfg_.port);
+    return fd_ >= 0;
 }
 
 void UdpBeacon::stop() {
-#ifdef _WIN32
-    if (fd_ >= 0) ::closesocket(fd_);
-#else
-    if (fd_ >= 0) ::close(fd_);
-#endif
+    platform::socket_udp_close(fd_);
     fd_ = -1;
 }
 
@@ -274,38 +227,29 @@ bool UdpBeacon::send(const std::string& endpoint, const SwarmMessage& msg) {
     if (fd_ < 0) return false;
     const std::string blob = encode_message(msg, kSwarmKey);
     (void)endpoint;    // broadcast only in the beacon transport
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    dst.sin_addr.s_addr = INADDR_BROADCAST;
-    dst.sin_port = htons(cfg_.port);
-    const int n = static_cast<int>(::sendto(
-        fd_, blob.data(), static_cast<int>(blob.size()), 0,
-        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst)));
-    return n > 0;
+    return platform::socket_udp_broadcast(fd_, blob.data(), blob.size(),
+                                          cfg_.port);
 }
 
 bool UdpBeacon::poll(SwarmMessage& out, std::string& from_endpoint) {
     if (fd_ < 0) return false;
     char buf[4096];
-    sockaddr_in src{};
-#ifdef _WIN32
-    int slen = sizeof(src);
-    const int n = ::recvfrom(fd_, buf, sizeof(buf), 0,
-                             reinterpret_cast<sockaddr*>(&src), &slen);
-#else
-    socklen_t slen = sizeof(src);
-    const ssize_t n = ::recvfrom(fd_, buf, sizeof(buf), 0,
-                                 reinterpret_cast<sockaddr*>(&src), &slen);
-#endif
+    uint32_t src_ip4 = 0;
+    uint16_t src_port = 0;
+    const int n = platform::socket_udp_poll(fd_, buf, sizeof(buf),
+                                            &src_ip4, &src_port);
     if (n <= 0) return false;
     SwarmMessage m;
     if (!decode_message(std::string(buf, static_cast<size_t>(n)),
                         kSwarmKey, m)) return false;
     out = m;
-    char ip[64];
-    ::inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
-    from_endpoint = std::string("udp:") + ip + ":" +
-                    std::to_string(ntohs(src.sin_port));
+    // Shim returns source address in HOST order; format "udp:IP:port"
+    // (the endpoint format documented in swarm.h). No inet_ntop needed.
+    char ip[16];
+    std::snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                  (src_ip4 >> 24) & 0xFFu, (src_ip4 >> 16) & 0xFFu,
+                  (src_ip4 >> 8) & 0xFFu, src_ip4 & 0xFFu);
+    from_endpoint = std::string("udp:") + ip + ":" + std::to_string(src_port);
     return true;
 }
 

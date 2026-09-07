@@ -68,35 +68,39 @@ struct MetadataValue {
 };
 
 // ---------------------------------------------------------------------------
-// Little-endian readers (x86/ARM are LE; this also documents intent)
+// Little-endian readers — byte-exact on EVERY host, including big-endian
+// (the GGUF spec is LE; these assemble values explicitly instead of trusting
+// host endianness via memcpy). Called only during header parsing, so the
+// byte-assembly cost is irrelevant; correctness on all ISAs is the point.
 // ---------------------------------------------------------------------------
 inline uint16_t read_u16(const uint8_t* p, size_t off) {
-    uint16_t v;
-    std::memcpy(&v, p + off, 2);
-    return v;
+    return static_cast<uint16_t>(p[off]) |
+           static_cast<uint16_t>(static_cast<uint16_t>(p[off + 1]) << 8);
 }
 inline uint32_t read_u32(const uint8_t* p, size_t off) {
-    uint32_t v;
-    std::memcpy(&v, p + off, 4);
-    return v;
+    return static_cast<uint32_t>(p[off]) |
+           (static_cast<uint32_t>(p[off + 1]) << 8) |
+           (static_cast<uint32_t>(p[off + 2]) << 16) |
+           (static_cast<uint32_t>(p[off + 3]) << 24);
 }
 inline uint64_t read_u64(const uint8_t* p, size_t off) {
-    uint64_t v;
-    std::memcpy(&v, p + off, 8);
-    return v;
+    return static_cast<uint64_t>(read_u32(p, off)) |
+           (static_cast<uint64_t>(read_u32(p, off + 4)) << 32);
 }
 inline int32_t  read_i32(const uint8_t* p, size_t off) {
     return static_cast<int32_t>(read_u32(p, off));
 }
 inline float read_f32(const uint8_t* p, size_t off) {
-    float v;
-    std::memcpy(&v, p + off, 4);
-    return v;
+    uint32_t v = read_u32(p, off);
+    float f;
+    std::memcpy(&f, &v, 4);   // bit-preserving reinterpret, host-endian safe
+    return f;
 }
 inline double read_f64(const uint8_t* p, size_t off) {
-    double v;
-    std::memcpy(&v, p + off, 8);
-    return v;
+    uint64_t v = read_u64(p, off);
+    double d;
+    std::memcpy(&d, &v, 8);   // bit-preserving reinterpret, host-endian safe
+    return d;
 }
 
 // GGUF string: uint64 length + bytes (no NUL).

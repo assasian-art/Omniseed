@@ -20,7 +20,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 namespace omniseed {
 
@@ -94,11 +96,18 @@ public:
     uint8_t*    bytes()  const { return static_cast<uint8_t*>(const_cast<void*>(data_)); }
     uint64_t    size()   const { return size_;   }
     const std::string& path() const { return path_; }
+    // True when the bytes are served from the heap fread fallback (no real mmap).
+    bool        using_fallback() const { return !fallback_buf_.empty(); }
 
     // Last OS error string (useful for diagnostics on open failure).
     const std::string& last_error() const { return last_error_; }
 
 private:
+    // Real mmap path (Windows MapViewOfFile / POSIX mmap). On failure falls
+    // back to open_fallback_impl() — a full fread into heap memory.
+    bool open_mapped_impl(const std::string& path);
+    bool open_fallback_impl(const std::string& path);
+
     void*       data_       = nullptr;
     uint64_t    size_       = 0;
     std::string path_;
@@ -108,14 +117,60 @@ private:
     void* file_handle_     = nullptr;   // HANDLE
     void* mapping_handle_  = nullptr;   // HANDLE
 #else
-    int   fd_              = -1;
+    int   fd_              = -1;        // POSIX open fd (real mmap path)
 #endif
+    // fread fallback backing (used when real mmap is unavailable or fails).
+    std::vector<uint8_t> fallback_buf_;
 };
 
 // ---------------------------------------------------------------------------
 // Page size of the host system in bytes (4096 on x86_64 Windows/Linux).
 // ---------------------------------------------------------------------------
 uint32_t page_size();
+
+// ---------------------------------------------------------------------------
+// Did open() succeed via a real mmap (true) or the fread fallback (false)?
+// The fallback engages automatically on platforms/conditions where mmap is
+// unavailable or fails; tensor views are byte-identical either way — only the
+// backing changes (OS page cache vs a heap copy).
+// ---------------------------------------------------------------------------
+bool mapped_with_fallback(const MappedFile& mf);
+
+// ---------------------------------------------------------------------------
+// Cooperative thread yield (poll loops, beacon polling).
+// ---------------------------------------------------------------------------
+void yield_now();
+
+// ---------------------------------------------------------------------------
+// Best-effort UTF-8 console enablement (Windows codepage 65001).
+// No-op on POSIX (terminals are already UTF-8-clean); never fatal.
+// ---------------------------------------------------------------------------
+void enable_utf8_console();
+
+// ---------------------------------------------------------------------------
+// fopen wrapper that tolerates UTF-8 paths on Windows (fopen_s/_wfopen path)
+// and is plain fopen() elsewhere. Signature matches std::fopen for drop-in use.
+// ---------------------------------------------------------------------------
+std::FILE* open_file_c(const char* path_utf8, const char* mode);
+
+// ---------------------------------------------------------------------------
+// Minimal UDP socket shim — the ONLY place in the codebase that touches
+// WinSock/POSIX sockets. UdpBeacon (swarm.cpp) is ifdef-free on top of this.
+//   * socket_udp_open() binds INADDR_ANY:port (SO_REUSEADDR + SO_BROADCAST)
+//     and sets non-blocking mode; returns -1 on failure.
+//   * sendto/broadcast; ip4 args are HOST order (0x7F000001 = 127.0.0.1) —
+//     the shim owns all htons/htonl conversions internally.
+//   * poll returns >=0 bytes received (-1 = nothing / error), fills src ip4
+//     (host order) and src port (host order) when the out-params are set.
+// ---------------------------------------------------------------------------
+int   socket_udp_open(uint16_t port);
+void  socket_udp_close(int fd);
+bool  socket_udp_broadcast(int fd, const void* buf, size_t len, uint16_t port);
+bool  socket_udp_send(int fd, const void* buf, size_t len,
+                      uint32_t ip4_host_order, uint16_t port);
+int   socket_udp_poll(int fd, void* buf, size_t cap,
+                      uint32_t* src_ip4_host_order_out,
+                      uint16_t* src_port_host_order_out);
 
 // ---------------------------------------------------------------------------
 // Aligned allocation helper (needed for potential SIMD-friendly buffers).

@@ -26,6 +26,8 @@
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif
+    #include <winsock2.h>   // MUST precede windows.h (winsock1 conflict guard)
+    #include <ws2tcpip.h>
     #include <windows.h>
     #include <psapi.h>
 #else
@@ -36,8 +38,10 @@
     #include <cstring>
     #include <fcntl.h>
     #include <sys/mman.h>
+    #include <sys/socket.h>
     #include <sys/stat.h>
     #include <unistd.h>
+    #include <arpa/inet.h>   // htonl/ntohl/htons/ntohs
 
     #if OMNISEED_PLATFORM_MACOS
         #include <mach/mach.h>
@@ -69,7 +73,8 @@ MappedFile::~MappedFile() { close(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
     : data_(other.data_), size_(other.size_), path_(std::move(other.path_)),
-      last_error_(std::move(other.last_error_))
+      last_error_(std::move(other.last_error_)),
+      fallback_buf_(std::move(other.fallback_buf_))
 #if OMNISEED_PLATFORM_WINDOWS
       , file_handle_(other.file_handle_), mapping_handle_(other.mapping_handle_)
 #else
@@ -93,6 +98,7 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
         size_       = other.size_;
         path_       = std::move(other.path_);
         last_error_ = std::move(other.last_error_);
+        fallback_buf_ = std::move(other.fallback_buf_);
 #if OMNISEED_PLATFORM_WINDOWS
         file_handle_    = other.file_handle_;
         mapping_handle_ = other.mapping_handle_;
@@ -112,6 +118,25 @@ bool MappedFile::open(const std::string& path) {
     close();
     path_ = path;
 
+    // ---------------------------------------------------------------
+    // Common path: try a real OS mmap first (zero-copy, lazy paging
+    // keeps RSS at touched-weights-only). On any failure fall back to
+    // a full read into heap memory — slower to start, byte-identical
+    // views, and available on EVERY platform (no mmap syscall needed).
+    // ---------------------------------------------------------------
+    if (open_mapped_impl(path)) return true;
+    const std::string mmap_error = last_error_;
+    if (open_fallback_impl(path)) {
+        log_warn(
+            "MappedFile: mmap unavailable for '%s' (%s); serving from a "
+            "full heap copy (RSS will reflect the whole file).",
+            path.c_str(), mmap_error.c_str());
+        return true;
+    }
+    return false;
+}
+
+bool MappedFile::open_mapped_impl(const std::string& path) {
 #if OMNISEED_PLATFORM_WINDOWS
     // ---------------------------------------------------------------
     // Windows: CreateFileW -> CreateFileMappingW -> MapViewOfFile
@@ -210,12 +235,45 @@ bool MappedFile::open(const std::string& path) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// fread fallback: read the whole file into a heap buffer and serve tensor
+// views from it. Used when mmap is unavailable (exotic platforms, sandboxed
+// filesystems) or the mmap syscalls fail. data_ points at fallback_buf_.data().
+// ---------------------------------------------------------------------------
+bool MappedFile::open_fallback_impl(const std::string& path) {
+    std::FILE* f = open_file_c(path.c_str(), "rb");
+    if (f == nullptr) {
+        last_error_ = "open failed (mmap and fread fallback)";
+        return false;
+    }
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); last_error_ = "seek failed"; return false; }
+    const long fsize = std::ftell(f);
+    if (fsize <= 0)      { std::fclose(f); last_error_ = "file is empty (fallback)"; return false; }
+    std::rewind(f);
+
+    fallback_buf_.resize(static_cast<size_t>(fsize));
+    const size_t got = fallback_buf_.empty()
+        ? 0u
+        : std::fread(fallback_buf_.data(), 1, fallback_buf_.size(), f);
+    std::fclose(f);
+    if (got != fallback_buf_.size()) {
+        fallback_buf_.clear();
+        fallback_buf_.shrink_to_fit();
+        last_error_ = "short read (fallback)";
+        return false;
+    }
+    data_ = fallback_buf_.data();
+    size_ = fallback_buf_.size();
+    last_error_.clear();
+    return true;
+}
+
 void MappedFile::close() {
 #if OMNISEED_PLATFORM_WINDOWS
-    if (data_ != nullptr) {
+    if (data_ != nullptr && fallback_buf_.empty()) {
         ::UnmapViewOfFile(data_);
-        data_ = nullptr;
     }
+    data_ = nullptr;
     if (mapping_handle_ != nullptr) {
         ::CloseHandle(static_cast<HANDLE>(mapping_handle_));
         mapping_handle_ = nullptr;
@@ -225,15 +283,17 @@ void MappedFile::close() {
         file_handle_ = nullptr;
     }
 #else
-    if (data_ != nullptr) {
+    if (data_ != nullptr && fallback_buf_.empty()) {
         ::munmap(data_, static_cast<size_t>(size_));
-        data_ = nullptr;
     }
+    data_ = nullptr;
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
 #endif
+    fallback_buf_.clear();
+    fallback_buf_.shrink_to_fit();
     size_ = 0;
 }
 
@@ -332,6 +392,155 @@ uint64_t current_rss_bytes() {
     std::fclose(f);
     return vm_rss * 1024ull;
 #endif
+}
+
+// ===========================================================================
+// mmap-mode probe + thread yield + UTF-8 console + portable fopen
+// ===========================================================================
+bool mapped_with_fallback(const MappedFile& mf) {
+    // A fallback-backed mapping owns its bytes in fallback_buf_; real mmaps
+    // do not. Probe via the accessor on the real object (no const hack).
+    return mf.using_fallback();
+}
+
+void yield_now() {
+#if OMNISEED_PLATFORM_WINDOWS
+    ::SwitchToThread();
+#else
+    ::sched_yield();
+#endif
+}
+
+void enable_utf8_console() {
+#if OMNISEED_PLATFORM_WINDOWS
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
+    // POSIX terminals: nothing to do — already UTF-8-clean.
+}
+
+std::FILE* open_file_c(const char* path_utf8, const char* mode) {
+#if OMNISEED_PLATFORM_WINDOWS
+    // Convert UTF-8 -> wide and use _wfopen so non-ASCII model paths work.
+    if (path_utf8 == nullptr) return nullptr;
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, path_utf8, -1, nullptr, 0);
+    if (n <= 0) return nullptr;
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, path_utf8, -1, &w[0], n);
+    const int mn = ::MultiByteToWideChar(CP_UTF8, 0, mode, -1, nullptr, 0);
+    if (mn <= 0) return nullptr;
+    std::wstring wm(static_cast<size_t>(mn), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, mode, -1, &wm[0], mn);
+    return ::_wfopen(w.c_str(), wm.c_str());
+#else
+    return std::fopen(path_utf8, mode);
+#endif
+}
+
+// ===========================================================================
+// Minimal UDP socket shim (the ONLY socket code in the repo)
+// ===========================================================================
+#if OMNISEED_PLATFORM_WINDOWS
+namespace {
+struct WinsockOnce {
+    bool ok = false;
+    WinsockOnce() {
+        WSADATA d;
+        ok = ::WSAStartup(MAKEWORD(2, 2), &d) == 0;
+    }
+    ~WinsockOnce() { if (ok) ::WSACleanup(); }
+};
+WinsockOnce g_winsock;
+} // namespace
+#endif
+
+int socket_udp_open(uint16_t port) {
+#if OMNISEED_PLATFORM_WINDOWS
+    if (!g_winsock.ok) return -1;
+    const SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return -1;
+    const int fd = static_cast<int>(s);
+#else
+    const int fd = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    if (fd < 0) return -1;
+#endif
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                 reinterpret_cast<const char*>(&one), sizeof(one));
+    ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST,
+                 reinterpret_cast<const char*>(&one), sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        socket_udp_close(fd);
+        return -1;
+    }
+#if OMNISEED_PLATFORM_WINDOWS
+    u_long nb = 1;
+    ::ioctlsocket(fd, FIONBIO, &nb);
+#else
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+    return fd;
+}
+
+void socket_udp_close(int fd) {
+    if (fd < 0) return;
+#if OMNISEED_PLATFORM_WINDOWS
+    ::closesocket(static_cast<SOCKET>(fd));
+#else
+    ::close(fd);
+#endif
+}
+
+bool socket_udp_broadcast(int fd, const void* buf, size_t len, uint16_t port) {
+    if (fd < 0 || buf == nullptr || len == 0) return false;
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);   // host 255.255.255.255
+    dst.sin_port = htons(port);
+    const int n = static_cast<int>(::sendto(
+        fd, static_cast<const char*>(buf), static_cast<int>(len), 0,
+        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst)));
+    return n > 0;
+}
+
+bool socket_udp_send(int fd, const void* buf, size_t len,
+                     uint32_t ip4_host_order, uint16_t port) {
+    if (fd < 0 || buf == nullptr || len == 0) return false;
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(ip4_host_order);
+    dst.sin_port = htons(port);
+    const int n = static_cast<int>(::sendto(
+        fd, static_cast<const char*>(buf), static_cast<int>(len), 0,
+        reinterpret_cast<const sockaddr*>(&dst), sizeof(dst)));
+    return n > 0;
+}
+
+int socket_udp_poll(int fd, void* buf, size_t cap,
+                    uint32_t* src_ip4_host_order_out,
+                    uint16_t* src_port_host_order_out) {
+    if (fd < 0 || buf == nullptr || cap == 0) return -1;
+    sockaddr_in src{};
+#if OMNISEED_PLATFORM_WINDOWS
+    int slen = sizeof(src);
+    const int n = static_cast<int>(::recvfrom(
+        fd, static_cast<char*>(buf), static_cast<int>(cap), 0,
+        reinterpret_cast<sockaddr*>(&src), &slen));
+#else
+    socklen_t slen = sizeof(src);
+    const ssize_t n = ::recvfrom(
+        fd, buf, cap, 0, reinterpret_cast<sockaddr*>(&src), &slen);
+#endif
+    if (n <= 0) return -1;
+    if (src_ip4_host_order_out != nullptr)
+        *src_ip4_host_order_out = ntohl(src.sin_addr.s_addr);
+    if (src_port_host_order_out != nullptr)
+        *src_port_host_order_out = ntohs(src.sin_port);
+    return n;
 }
 
 // ===========================================================================

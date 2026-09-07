@@ -214,6 +214,8 @@ if(OMNISEED_BUILD_SERVER)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     target_compile_definitions(omniseed_server PRIVATE OMNISEED_HTTP)
+    # Same portable-stdio stance as omniseed_core (getenv/localhost helpers).
+    target_compile_definitions(omniseed_server PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(omniseed_server PRIVATE omniseed_core)
     if(MSVC)
         target_compile_options(omniseed_server PRIVATE /W4 /utf-8 /Zc:__cplusplus)

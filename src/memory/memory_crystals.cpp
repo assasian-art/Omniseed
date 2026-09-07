@@ -163,7 +163,7 @@ std::vector<MemoryCrystal> MemoryCrystals::retrieve(
 // Persistence: compact binary sidecar
 // ===========================================================================
 bool MemoryCrystals::save(const std::string& path) const {
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = platform::open_file_c(path.c_str(), "wb");
     if (!f) return false;
 
     const uint32_t magic = 0x5254434D;   // MCTR

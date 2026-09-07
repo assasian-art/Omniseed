@@ -17,9 +17,9 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **165/165 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE 7 COMPLETE — real RWKV-7 0.1B world weights converted,
-  loaded, and generating coherent English inside the <300 MB budget. GGUF loader
-  data-offset bug found & fixed. Sampling + FFT landed.
+- **Last updated:** PORTABILITY HARDENING PASS — byte-exact GGUF readers (any
+  endianness), MappedFile fread fallback, UDP socket shim (swarm ifdef-free),
+  UTF-8 fopen/console. 165/165 + 13/13 + 17/17, zero warnings /W4.
 
 ---
 
@@ -277,19 +277,58 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 
 ## 3. NEXT STEPS (in order)
 
-1. **Full-scale QAT**: real corpus (multi-GB), 10k+ steps, lr schedule → make
-   true ternary the default at i8 quality (runtime already validated; the tool
-   has chunked resume for long runs).
-2. **Whisper decoder weights**: autoregressive decoder → real end-to-end ASR
+1. **Commit this hardening pass**, then **full-scale QAT**: real corpus
+   (multi-GB), 10k+ steps, lr schedule → make true ternary the default at i8
+   quality (runtime already validated; the tool has chunked resume for long
+   runs).
+2. **CI on Linux** is the natural next proof for this pass: the byte-exact
+   readers, POSIX fd_/mmap path, and socket shim are now CI-relevant — watch
+   the ubuntu-latest job in `.github/workflows/ci.yml`.
+3. **Whisper decoder weights**: autoregressive decoder → real end-to-end ASR
    (encoder is already real).
-3. **FocalCodec codebooks**: last algorithmic-fallback sense; extend
+4. **FocalCodec codebooks**: last algorithmic-fallback sense; extend
    `convert_senses.py` when a suitable public checkpoint is identified.
-4. **Tie-window test note**: `test_real_weights` records a continuation with
+5. **Tie-window test note**: `test_real_weights` records a continuation with
    a ±2-token tie window; if the reference drifts, re-record from a fresh run.
-5. **CI on Linux** (GCC/MinGW paths untested on this machine).
 6. **WebRTC (#19)** upgrade path: replace/augment `UdpBeacon` with libdatachannel
    if the budget allows; DESIGN-status features #29/#30/#81–100 graduate when a
    training pipeline lands.
+
+## 3b. PORTABILITY HARDENING PASS (this session, uncommitted)
+
+Goal: byte-exact behavior on every host ISA + ifdef-free swarm + UTF-8-safe
+file/console I/O. All work verified: Release build zero warnings (/W4),
+**165/165 + 13/13 + 17/17**, greedy continuation byte-identical to pre-change,
+`demo-swarm` OK.
+
+- **GGUF readers byte-exact on any endianness** (`gguf_format.h`): u16/u32/u64
+  and f32/f64 are now assembled byte-by-byte (LE spec) instead of `memcpy`-ing
+  host-order words. read_f64 is bit-preserving via u64 + memcpy reinterpret.
+  (An interrupted earlier edit had DELETED read_f64 while gguf_loader.cpp still
+  called it — restored.)
+- **MappedFile fread fallback** (`platform.h/.cpp`): open() tries a real mmap
+  first; on failure falls back to a full heap fread (byte-identical views,
+  every platform). `using_fallback()` / `mapped_with_fallback()` probe the
+  mode; a WARN log fires when the fallback engages. POSIX `fd_` member kept
+  (an interrupted edit had removed it while close()/move-assign still used it).
+  close() only unmaps when NOT fallback-backed.
+- **UDP socket shim** (`platform.h/.cpp`): the ONLY socket code in the repo.
+  WinsockOne-time WSAStartup, open/bind/SO_BROADCAST/non-blocking, close,
+  broadcast/send, poll. IP/port args are HOST order on the API surface (shim
+  owns htonl/htons) — no consumer needs ntohs/ntohl, endian-safe by design.
+  poll() returns source ip4 + port (host order). swarm.cpp is now ifdef-free
+  on top of the shim; endpoint format "udp:IP:port" restored (host-order
+  dotted quad + port — the half-finished edit had dropped the port and used
+  network-order bytes). ws2_32 already linked to omniseed_core; winsock2.h
+  included BEFORE windows.h in platform.cpp.
+- **UTF-8-safe fopen** `platform::open_file_c()` (Windows _wfopen path) adopted
+  by all six persistence sites (sensory, memory_crystals, agent_intel KG,
+  flash_skills save/load, self_improvement) — non-ASCII state paths work.
+- **UTF-8 console** `platform::enable_utf8_console()` (CP 65001) called at the
+  top of CLI + server mains (resolves the old "consider SetConsoleOutputCP"
+  issue).
+- **Server build hygiene**: omniseed_server now defines _CRT_SECURE_NO_WARNINGS
+  (same portable-stdio stance as omniseed_core) — zero-warning /W4 restored.
 
 ## 4. UNRESOLVED ISSUES / BUGS
 
@@ -298,7 +337,6 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
   and FocalCodec codebooks (NEXT STEPS #2/#3).
 - **Server is serialized** (one request at a time) — fine for edge use.
 - **MinGW/GCC builds untested** on this machine; MSVC `/W4` is clean.
-- **Windows console UTF-8**: consider `SetConsoleOutputCP(CP_UTF8)` in CLI main.
 - Persistence paths route under `./state/` (created on demand, verified).
 - `models/` (281 MB safetensors + 294 MB GGUF) is gitignored; the converter
   re-creates the GGUF from the safetensors + vocab (download URLs in the tool).

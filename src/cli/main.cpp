@@ -782,6 +782,7 @@ int cmd_chat(Session& s) {
 } // namespace
 
 int main(int argc, char** argv) {
+    platform::enable_utf8_console();   // Windows codepage 65001; no-op elsewhere
     if (argc < 2) {
         print_usage();
         return 0;

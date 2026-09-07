@@ -300,7 +300,7 @@ std::string SensoryFingerprint::identity_token() const {
 // Persistence: 'SNFP' binary
 // ===========================================================================
 bool SensoryFingerprint::save(const std::string& path) const {
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = platform::open_file_c(path.c_str(), "wb");
     if (!f) return false;
     const uint32_t magic = 0x50464E53;  // SNFP
     const uint32_t version = 1;

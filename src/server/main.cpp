@@ -199,6 +199,7 @@ document.getElementById('f').addEventListener('submit', async e => {
 } // namespace
 
 int main(int argc, char** argv) {
+    platform::enable_utf8_console();   // Windows codepage 65001; no-op elsewhere
     int port = kPort;
     std::string model_path = "./models/omniseed.gguf";
     // Documented deployment env (see Dockerfile): OMNISEED_MODEL is the
