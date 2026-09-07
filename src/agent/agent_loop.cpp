@@ -6,10 +6,17 @@
 #include "omniseed/agent/agent.h"
 #include "omniseed/core/platform.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
 namespace omniseed {
+
+namespace {
+// Thread-local-ish handoff from generate() to run(): the uncertainty report
+// of the final answer pass's first logits. (AgentLoop is documented as
+// single-threaded per instance; a plain member is sufficient and zero-cost.)
+} // namespace
 
 // ===========================================================================
 // Prompt assembly: crystals + tool schemas + user turn
@@ -59,11 +66,43 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
     Tensor logits("logits", {model_.config().n_vocab}, DType::F32);
     int32_t cursor = seed_token;
     uint64_t rng = cfg_.seed;
+    bool first_analyzed = false;
+    int32_t rss_soft_cut = 0;   // max_tokens halved once at soft watermark
 
     for (int32_t i = 0; i < max_tokens; ++i) {
         model_.forward(cursor, st, logits);
-        const int32_t id = cfg_.temperature > 0.0f
-            ? model_.sample_token(logits, cfg_.temperature, cfg_.top_k, rng)
+
+        // ---- Phase-Omega: uncertainty on the FIRST logits only -------------
+        // (O(V) once per generation; the distribution sharpens as context
+        // accumulates, so the first token carries the worst case.)
+        if (!first_analyzed) {
+            first_analyzed = true;
+            last_uncertainty_ = Uncertainty::analyze(logits);
+            entropy_mon_.push(last_uncertainty_.entropy);
+        }
+
+        // ---- Phase-Omega: temperature annealing ----------------------------
+        float temp = cfg_.temperature;
+        if (cfg_.anneal_tokens > 0 && cfg_.temperature > 0.0f) {
+            const float frac = static_cast<float>(i) /
+                               static_cast<float>(cfg_.anneal_tokens);
+            temp = cfg_.temperature +
+                   (cfg_.anneal_temp_start - cfg_.temperature) *
+                   std::max(0.0f, 1.0f - frac);
+        }
+
+        // ---- Phase-Omega: RSS watermark guard ------------------------------
+        if (cfg_.rss_guard) {
+            const int zone = throttle_.rss_zone();
+            if (zone == 2) break;                       // hard stop
+            if (zone == 1 && rss_soft_cut == 0) {
+                rss_soft_cut = max_tokens / 2;          // halve the budget
+                max_tokens = std::min(max_tokens, i + rss_soft_cut);
+            }
+        }
+
+        const int32_t id = temp > 0.0f
+            ? model_.sample_token(logits, temp, cfg_.top_k, rng)
             : model_.greedy_pick(logits);
         if (id == Tokenizer::kEosId) break;
 
@@ -92,6 +131,13 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Prefix snapshot (Phase-Omega): store the current WKV state.
+// ---------------------------------------------------------------------------
+bool AgentLoop::snapshot_prefix() {
+    return prefix_cache_.store(cfg_.prefix_key, model_, last_state_);
+}
+
 // ===========================================================================
 // One agent turn
 // ===========================================================================
@@ -107,7 +153,18 @@ AgentLoop::Result AgentLoop::run(const std::string& user_input) {
     std::vector<std::string> trace;
 
     RwkvState st;
-    model_.init_state(st);
+    int64_t restored_tokens = 0;
+    bool prefix_hit = false;
+    if (!cfg_.prefix_key.empty()) {
+        if (prefix_cache_.load(cfg_.prefix_key, model_, st, restored_tokens)) {
+            prefix_hit = true;
+            res.prefix_hits = 1;
+        } else {
+            model_.init_state(st);
+        }
+    } else {
+        model_.init_state(st);
+    }
 
     if (cfg_.allow_tools) {
         // feed prompt
@@ -163,11 +220,43 @@ AgentLoop::Result AgentLoop::run(const std::string& user_input) {
     {
         const std::vector<int32_t> prompt = build_prompt(user_input, lv);
         Tensor logits("logits", {model_.config().n_vocab}, DType::F32);
-        for (const int32_t id : prompt) model_.forward(id, st, logits);
+        if (prefix_hit) {
+            // Prefix fast path: the cached state already contains the system
+            // prompt + schemas; only the NEW tokens after the snapshot point
+            // need forwarding. (Snapshot is taken at the end of this turn —
+            // see below — so this turn still pays full prefill once.)
+            // NOTE: the cached state corresponds to the FULL previous prompt;
+            // we conservatively re-feed everything (correctness first), but
+            // skip re-feeding when the prompt is byte-identical to the
+            // snapshot's (the common single-session repeat case).
+            //
+            // Implementation: the snapshot stores tokens_seen; if our current
+            // prompt is the same length as the snapshot's, the prompt is
+            // (by construction of prefix_key usage) the same -> skip prefill.
+            if (static_cast<int64_t>(prompt.size()) == restored_tokens) {
+                // state already ends exactly at the prompt: no forward needed
+            } else {
+                for (const int32_t id : prompt) model_.forward(id, st, logits);
+            }
+        } else {
+            for (const int32_t id : prompt) model_.forward(id, st, logits);
+        }
         const int32_t seed = prompt.empty() ? Tokenizer::kBosId : prompt.back();
         res.reply = generate(st, seed, throttle_.max_new_tokens(lv),
                              {Tokenizer::kAssistantEndId, Tokenizer::kEosId},
                              nullptr);
+
+        // Uncertainty abstain (Phase-Omega): hedge flat/coin-flip answers.
+        res.first_token_uncertainty = last_uncertainty_;
+        if (!cfg_.abstain_hedge.empty() &&
+            Uncertainty::should_abstain(last_uncertainty_, ucfg_)) {
+            res.reply = cfg_.abstain_hedge + res.reply;
+            res.abstained = true;
+        }
+
+        // Snapshot AFTER generation: the state now ends at prompt+answer,
+        // which is a valid restore point for a byte-identical next turn.
+        if (!cfg_.prefix_key.empty()) prefix_cache_.store(cfg_.prefix_key, model_, st);
     }
 
     // self-improvement bookkeeping

@@ -41,8 +41,8 @@ void MemoryCrystals::embed_tokens(const std::vector<int32_t>& ids,
 // Crystallize: retired tokens -> compressed crystal record
 // ===========================================================================
 bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
-                                 const Tokenizer& tok,
-                                 uint64_t stream_pos) {
+                                 const Tokenizer& tok, uint64_t stream_pos,
+                                 float entropy) {
     if (retired_tokens.size() < 8) return false;   // too small to be useful
 
     // ---- sentence segmentation on '.'/'!'/'?'/'\n' pieces -------------------
@@ -107,6 +107,15 @@ bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
     c.importance = static_cast<float>(std::min(
         1.0, score(0, c.tokens) + 0.25));
 
+    // Entropy salience gate (grok M02): high-entropy retired turns carry
+    // more information; boost importance (bounded) when the signal exists.
+    if (entropy >= 0.0f && cfg_.entropy_boost > 0.0f) {
+        // Map entropy in [0, ~8 nats] to a 0..1 boost factor.
+        const float e01 = std::min(1.0f, entropy / 8.0f);
+        c.importance = std::min(1.0f, c.importance + cfg_.entropy_boost * e01);
+        c.salience = e01;
+    }
+
     embed_tokens(c.tokens, c.embedding);
 
     // ---- capacity: evict lowest importance when full ------------------------
@@ -129,10 +138,10 @@ bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
 }
 
 // ===========================================================================
-// Retrieval: cosine similarity over crystal embeddings
+// Retrieval: cosine similarity over crystal embeddings (+ recency bookkeeping)
 // ===========================================================================
 std::vector<MemoryCrystal> MemoryCrystals::retrieve(
-        const std::vector<int32_t>& query_tokens, int32_t k) const {
+        const std::vector<int32_t>& query_tokens, int32_t k) {
     if (crystals_.empty() || k <= 0) return {};
 
     float q[64];
@@ -154,9 +163,38 @@ std::vector<MemoryCrystal> MemoryCrystals::retrieve(
 
     std::vector<MemoryCrystal> out;
     const int32_t take = std::min<int32_t>(k, static_cast<int32_t>(scored.size()));
-    for (int32_t i = 0; i < take; ++i)
-        out.push_back(crystals_[scored[static_cast<size_t>(i)].second]);
+    for (int32_t i = 0; i < take; ++i) {
+        const size_t idx = scored[static_cast<size_t>(i)].second;
+        crystals_[idx].hits += 1;                    // Ebbinghaus bookkeeping
+        crystals_[idx].last_access_token =           // "recency" in stream time
+            crystals_[idx].created_at_token + static_cast<uint64_t>(query_tokens.size());
+        out.push_back(crystals_[idx]);
+    }
     return out;
+}
+
+// ===========================================================================
+// Ebbinghaus decay: effective = importance * exp(-age_days / tau)
+// ===========================================================================
+size_t MemoryCrystals::decay(double now_unix_seconds) {
+    if (cfg_.decay_tau_days <= 0.0) return 0;
+    size_t dropped = 0;
+    for (auto it = crystals_.begin(); it != crystals_.end();) {
+        // Age in days since creation (stream position stands in for wall
+        // time when the caller does not track wall clock per crystal).
+        const double age_days = static_cast<double>(it->last_access_token) /
+                                100000.0;   // 100k tokens ≈ 1 day of use
+        const double eff = static_cast<double>(it->importance) *
+                           std::exp(-age_days / cfg_.decay_tau_days) *
+                           (1.0 + 0.1 * std::min<uint32_t>(it->hits, 10));
+        if (eff < static_cast<double>(cfg_.min_importance)) {
+            it = crystals_.erase(it);
+            ++dropped;
+        } else {
+            ++it;
+        }
+    }
+    return dropped;
 }
 
 // ===========================================================================
@@ -167,7 +205,7 @@ bool MemoryCrystals::save(const std::string& path) const {
     if (!f) return false;
 
     const uint32_t magic = 0x5254434D;   // MCTR
-    const uint32_t version = 1;
+    const uint32_t version = 2;
     const uint32_t n = static_cast<uint32_t>(crystals_.size());
     std::fwrite(&magic, 4, 1, f);
     std::fwrite(&version, 4, 1, f);
@@ -177,7 +215,10 @@ bool MemoryCrystals::save(const std::string& path) const {
     for (const MemoryCrystal& c : crystals_) {
         std::fwrite(&c.id, 8, 1, f);
         std::fwrite(&c.created_at_token, 8, 1, f);
+        std::fwrite(&c.last_access_token, 8, 1, f);
         std::fwrite(&c.importance, 4, 1, f);
+        std::fwrite(&c.salience, 4, 1, f);
+        std::fwrite(&c.hits, 4, 1, f);
         std::fwrite(c.embedding, 4, static_cast<size_t>(cfg_.embed_dim), f);
         const uint32_t nt = static_cast<uint32_t>(c.tokens.size());
         std::fwrite(&nt, 4, 1, f);
@@ -199,7 +240,7 @@ bool MemoryCrystals::load(const std::string& path) {
     if (mf.size() < 16 || std::memcmp(p, "MCTR", 4) != 0) return false;
     cur += 4;
     const uint32_t version = *reinterpret_cast<const uint32_t*>(p + cur); cur += 4;
-    if (version != 1) return false;
+    if (version != 1 && version != 2) return false;
     const uint32_t dim = *reinterpret_cast<const uint32_t*>(p + cur); cur += 4;
     if (static_cast<int32_t>(dim) != cfg_.embed_dim) return false;
     const uint32_t n = *reinterpret_cast<const uint32_t*>(p + cur); cur += 4;
@@ -209,6 +250,11 @@ bool MemoryCrystals::load(const std::string& path) {
         MemoryCrystal c;
         std::memcpy(&c.id, p + cur, 8); cur += 8;
         std::memcpy(&c.created_at_token, p + cur, 8); cur += 8;
+        if (version >= 2) {
+            std::memcpy(&c.last_access_token, p + cur, 8); cur += 8;
+            std::memcpy(&c.salience, p + cur, 4); cur += 4;
+            std::memcpy(&c.hits, p + cur, 4); cur += 4;
+        }
         std::memcpy(&c.importance, p + cur, 4); cur += 4;
         std::memcpy(c.embedding, p + cur, 4 * dim); cur += 4 * dim;
         uint32_t nt; std::memcpy(&nt, p + cur, 4); cur += 4;

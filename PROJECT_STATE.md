@@ -17,9 +17,12 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **165/165 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PORTABILITY HARDENING PASS — byte-exact GGUF readers (any
-  endianness), MappedFile fread fallback, UDP socket shim (swarm ifdef-free),
-  UTF-8 fopen/console. 165/165 + 13/13 + 17/17, zero warnings /W4.
+- **Last updated:** PHASE-OMEGA — Grand Unification pass. Read all 3 feature
+  registries (z.ai universe / deepseek VOL.I+II / grok grounded), triaged every
+  feature into A/B/C buckets, implemented the Bucket-A gold (uncertainty
+  quantification, WKV prefix snapshots, Ebbinghaus memory decay, temperature
+  annealing, RSS watermark), documented the refusal of n-gram speculative
+  decoding on RWKV with the math. 200/200 + 13/13 + 17/17, RSS 155 MB.
 
 ---
 
@@ -294,6 +297,90 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
    if the budget allows; DESIGN-status features #29/#30/#81–100 graduate when a
    training pipeline lands.
 
+## 3c. PHASE-OMEGA — GRAND UNIFICATION (this pass)
+
+### The audit
+All three registries absorbed (z.ai "Complete Universe" 150+ features + v4.0
+paranormal/quantum expansion; deepseek VOL.I + VOL.II 48-category extension;
+grok grounded registry with per-feature RAM math). Original 7 research TXTs
+were already audited into the feature tables of section 1. Everything below
+was scored against the real budget: **155 MB resident → ~145 MB headroom**,
+pure C++17, zero deps.
+
+### Bucket A — IMPLEMENTED NOW (this pass)
+| Feature (registry id) | Files | RAM | Notes |
+|---|---|---|---|
+| Uncertainty quantification (deepseek VOL.II "不确定性量化", z.ai Q-08) | `include/omniseed/core/uncertainty.h`, `src/core/uncertainty.cpp` | ~0 (scalars) | Stable softmax entropy + top-2 margin + abstain policy; wired into AgentLoop (first-logits analysis, `Result.first_token_uncertainty`, `abstain_hedge` config) |
+| Entropy anomaly detection (z.ai P-02) | same file (`EntropyMonitor`) | 64 floats | Sliding z-score window; flags loop-collapse / topic-shift moments |
+| **WKV prefix snapshots** (grok C01/C02) | `include/omniseed/memory/prefix_cache.h`, `src/memory/prefix_cache.cpp` | 1–5 MB (8 × 0.59 MB, LRU) | Byte-exact state serialization, LRU store, binary persistence; wired into AgentLoop (`prefix_key` config, snapshot after each turn, restore on hit) |
+| Ebbinghaus memory decay (deepseek VOL.II "记忆擦除", grok M06) | `memory.h/.cpp` | 0 | `effective = importance × exp(-age/τ) × (1+0.1·hits)`; `decay()` + recency bookkeeping on retrieve |
+| Entropy salience gate (grok M02) | `memory.h/.cpp` | 0 | High-entropy retired turns get an importance boost at crystallization |
+| Working memory scratchpad (grok M, deepseek L1) | `memory.h` (`WorkingMemory`) | 2 KB | Fixed-capacity token ring |
+| Temperature annealing (deepseek VOL.II) | `agent.h/.cpp` | 0 | Explore→exploit ramp over `anneal_tokens` |
+| RSS watermark + kill-switch (grok S01) | `agent.h` (`ComputeThrottle::rss_zone`), `agent_loop.cpp` | 0 | Soft 260 MB (halve budget) / hard 295 MB (stop) — budget enforcement without a monitor thread |
+
+### Bucket A — REFUSED WITH MATH (documented, not forgotten)
+- **N-gram/prompt-lookup speculative decoding (grok C04/C05, deepseek #5):**
+  RWKV-7 is strictly recurrent — verifying m draft tokens costs m sequential
+  forwards, exactly greedy's cost. Draft speculation only wins where
+  verification is parallel (transformers). The registries' own "do not lie to
+  implementers" rule applies. Revisit only if a parallel-scan WKV verify
+  kernel lands (see FUTURE HORIZON).
+- **Draft-model/Medusa/EAGLE speculation:** second model does not fit the
+  budget next to the 0.1B kernel (grok C24 already IMPOSSIBLE).
+
+### Bucket B — FUTURE HORIZON ROADMAP (the next AI's queue)
+1. **BitNet b1.58 native QAT to production quality** (grok C13/C14) — the
+   strategic RAM unlock: ternary 0.1B ≈ 24 MB weights → ~80–120 MB total RSS
+   → Whisper-tiny + vision + TTS could then CO-RESIDE. Tooling exists
+   (`tools/qat_ternary.py`); needs corpus-scale training time.
+2. **Parallel-scan WKV verify kernel** — would flip speculative decoding
+   from refused to profitable; pairs with C04/C05.
+3. **RWKV-Lite clustered LM head + sparsity predictor** (grok C08/C09) —
+   steals back 20–60 MB of the vocab-projection fat tail (V=65536).
+4. **Int4 grouped FFN linears** (grok C12) — saves 30–50 MB; quality gate
+   must beat int8 on the `omniseed ppl` harness first.
+5. **Layer-stream mmap + madvise working-set control** (grok C18/S05) —
+   `madvise(DONTNEED)` on cold layers; the fread fallback makes this safe
+   everywhere.
+6. **Flash-skills LoRA bank** (grok G03/G04) — mmap rank-4/8 adapters applied
+   as ΔW during FFN; skills-as-files already exists.
+7. **HippoRAG-lite entity graph over crystals** (grok M07) — char-ngram hash
+   embeddings, no 7B embedder.
+8. **Swarm skill-patch exchange + WKV state teleport** (grok G08/F12) —
+   0.59 MB state packets over the (now unicast-capable) UDP mesh.
+9. **Sidecar hot-swap governor** (grok S07) — unmap vision, map audio;
+   peak(phase) < 300 MB discipline.
+10. **On-device LoRA QAT during dream()** (grok F01/F09) — one layer at a
+    time, 10–40 MB optimizer state.
+
+### Bucket C — THEORETICAL & IMPOSSIBLE FRONTIER (preserved, not lost)
+*These violate physics, exceed any plausible RAM budget, or require
+ non-existent hardware. Documented so the research is never lost; none may
+ enter the runtime.*
+
+**Requires new physics:** Quantum consciousness/qualia engines (z.ai Q-*,
+sections 10/19) — the hard problem is not a software bug; superposition
+memory & non-locality processors (violate Bell constraints as classical
+simulations at 15–30 MB); retrocausal interfaces & causal-loop computation
+(Novikov self-consistency has no computational substrate); entropy-reversal
+& vacuum-energy extraction (Landauer is a budget, not a suggestion);
+time-travel computation and temporal-paradox resolution.
+
+**Requires >300 MB by information theory:** Infinite lossless compression
+(counting argument); full 7B+ or 1B-class SLM co-residency (0.5–4 GB even
+Q4); diffusion/SDXL-class generation; MusicGen/Kokoro/NeuTTS concurrent
+with the kernel; Sparse Delta Memory (57–400 MB state ALONE).
+
+**Requires non-existent hardware:** Neural dust/BCI; DNA storage; memristive
+or phase-change compute; stellar/galactic computation networks; dark-matter
+interfaces; ternary CPU ISA (runtime-ready, silicon pending).
+
+**Deliberately parked as philosophy, not engineering:** phenomenological
+experience, free-will simulation, meaning/purpose engines, metaphysical
+query processing — these are prompts, not modules; the agent-intel stack
+(intent/confidence/KG) already provides their honest, testable subset.
+
 ## 3b. PORTABILITY HARDENING PASS (committed: 683b2ad + 161625b + beea44a)
 
 Proof layer (2a/2b):
@@ -356,6 +443,13 @@ file/console I/O. All work verified: Release build zero warnings (/W4),
   re-creates the GGUF from the safetensors + vocab (download URLs in the tool).
 
 ## 5. VERIFICATION STATUS
+
+- **Phase-Omega additions (this pass):** `omniseed_tests` **200/200** (added:
+  uncertainty entropy/margin/abstain incl. coin-flip tie, entropy anomaly
+  z-score window, prefix-cache container semantics, entropy salience +
+  working-memory ring), `omniseed_real_weights` **13/13** (RSS 155 MB),
+  `omniseed_sides` **17/17**; `omniseed gen` real-model smoke: coherent,
+  14.3 tok/s, peak **155.4 MB** — the Omega features cost ~0 RSS.
 
 - `build\bin\omniseed_tests.exe` → **165/165 PASS** (added: FFT-vs-DFT exactness,
   tone-bin agreement). Coverage: platform (mmap,

@@ -10,6 +10,8 @@
 
 namespace omniseed {
 
+using platform::current_rss_bytes;
+
 ComputeThrottle::Level ComputeThrottle::classify(const std::string& in) const {
     // normalize
     std::string low;
@@ -75,6 +77,17 @@ const char* ComputeThrottle::name(Level lv) const {
         case Level::Deep:     return "deep";
     }
     return "?";
+}
+
+// ---------------------------------------------------------------------------
+// RSS watermark (grok S01): zero-RAM budget enforcement. Called from the
+// generation loop every token; the platform RSS read is ~microseconds.
+// ---------------------------------------------------------------------------
+int ComputeThrottle::rss_zone() const {
+    const uint64_t mb = platform::current_rss_bytes() / (1024ull * 1024ull);
+    if (mb >= hard_rss_mb_) return 2;
+    if (mb >= soft_rss_mb_) return 1;
+    return 0;
 }
 
 } // namespace omniseed

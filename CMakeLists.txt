@@ -64,6 +64,8 @@ set(OMNISEED_CORE_SOURCES
     src/runtime/swarm.cpp
     src/memory/streaming_llm.cpp
     src/memory/memory_crystals.cpp
+    src/memory/prefix_cache.cpp
+    src/core/uncertainty.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp

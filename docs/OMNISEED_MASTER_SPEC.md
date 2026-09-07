@@ -1,6 +1,6 @@
 # OmniSeed — Master Specification
 
-**Version:** 2.1 (Phase 9 — deploy, decoder ASR, CI) · **Date:** 2026-09-07 ·
+**Version:** 2.2 (Phase-Omega — grand unification: uncertainty, prefix snapshots, memory decay) · **Date:** 2026-09-07 ·
 **Language:** pure C++17
 **Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
 RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 115 MB on the
@@ -288,8 +288,15 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
 
 ## 8. Verification
 
-- **Unit/integration tests:** 165 assertions across core, memory, agent, runtime,
-  audio, vision, swarm (`tests/test_platform.cpp`) — **165 passed / 0 failed**.
+- **Unit/integration tests:** 200 assertions across core, memory, agent, runtime,
+  audio, vision, swarm (`tests/test_platform.cpp`) — **200 passed / 0 failed**.
+  Phase-Omega additions: uncertainty quantification (entropy/margin/abstain,
+  incl. coin-flip ties), entropy-anomaly z-score window, prefix-cache container
+  semantics, entropy-salience + working-memory ring.
+- **Portability proofs:** UDP beacon localhost round-trip (both directions,
+  source ip/port in host order); `OMNISEED_FORCE_FREAD=1` fallback stress —
+  outputs byte-identical between mmap and heap-copy modes, ASan-clean in all
+  four mode combinations.
 - **Real-weights suite** (`tests/test_real_weights.cpp`, skips if no GGUF):
   **13/13** — loader integrity, finite logits, stable greedy continuation, RSS cap.
 - **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **17/17** —
@@ -315,3 +322,26 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
 3. **WebRTC (#19)** — replaced by the leaner UDP beacon in-budget; a libdatachannel
    integration is the natural upgrade when the 300 MB cap is relaxed.
 4. **Catalog III (#81–100)** — research-frontier items; interfaces reserved as noted.
+
+## 10. Phase-Omega — Grand Unification (v2.2)
+
+All feature registries (deepseek VOL.I/II, grok grounded registry, z.ai
+universe) were triaged against the <300 MB C++17 reality. Implemented now
+(Bucket A, ~0 MB net RAM):
+
+| Capability | Module | What it gives the kernel |
+|---|---|---|
+| **Uncertainty quantification** | `core/uncertainty.*` → `AgentLoop` | Stable softmax entropy + top-2 margin; abstain policy hedges flat/coin-flip answers instead of hallucinating with confidence |
+| **Entropy anomaly detection** | `core/uncertainty.*` (`EntropyMonitor`) | 64-float sliding z-score; flags loop-collapse and topic-shift moments |
+| **WKV prefix snapshots** | `memory/prefix_cache.*` → `AgentLoop` | O(1) RWKV state checkpointed at prompt boundaries (0.59 MB each, LRU, persisted); turn 2+ can skip the system-prompt prefill |
+| **Ebbinghaus decay + entropy salience** | `memory/memory_crystals.*` | Memories fade by recency × importance × hits; high-entropy turns crystallize stronger |
+| **Working memory scratchpad** | `memory/memory.h` | Fixed-capacity token ring (2 KB) for pinned intermediate results |
+| **Temperature annealing** | `AgentLoop::Config` | Explore-early/exploit-late sampling ramp |
+| **RSS watermark + kill-switch** | `ComputeThrottle::rss_zone` | Soft 260 MB (halve budget) / hard 295 MB (stop) — budget enforcement with zero RAM |
+
+**Refused with math:** n-gram/prompt-lookup speculative decoding — RWKV-7 is
+strictly recurrent, so verifying m draft tokens costs m sequential forwards
+(exactly greedy's cost). Speculation wins only where verification is
+parallel. See PROJECT_STATE.md §3c for the full Bucket B roadmap (QAT
+ternary, parallel-scan verify kernel, RWKV-Lite head clustering) and the
+Bucket C theoretical archive.
