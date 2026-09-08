@@ -193,6 +193,22 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_sides COMMAND omniseed_sides
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_sides PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # QAT-model ternary-kernel A/B: byte-identical greedy continuation across
+    # scalar/SSE4.1/AVX2. Skips cleanly when the QAT GGUF is not present.
+    add_executable(omniseed_qat_ternary tests/test_qat_ab.cpp)
+    target_include_directories(omniseed_qat_ternary PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_qat_ternary PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_qat_ternary PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_qat_ternary PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_qat_ternary COMMAND omniseed_qat_ternary
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_qat_ternary PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

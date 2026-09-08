@@ -35,11 +35,12 @@ namespace {
 using I8ForwardFn = void (*)(const int8_t*, const float*, const float*,
                              float*, int64_t, int64_t);
 using TernaryRowsFn = void (*)(const uint8_t*, const float*, const float*,
-                               float*, int64_t, int64_t);
-
-I8ForwardFn   g_i8_fn         = nullptr;
-TernaryRowsFn g_tern_rows_fn  = nullptr;
+                               float*, int64_t, int64_t);I8ForwardFn   g_i8_fn        = nullptr;
+TernaryRowsFn g_tern_rows_fn = nullptr;
 bool g_simd_init = false;
+// Test/bench override for the ternary per-row kernel (see
+// force_ternary_kernel). Auto = cpuid dispatch + env forces at first init.
+TernaryKernel g_tern_force = TernaryKernel::Auto;
 
 } // namespace
 
@@ -78,9 +79,18 @@ void init_simd_dispatch() {
         g_tern_rows_fn = fwd_ternary_rows_sse41;
     }
 #endif
-    // A/B escape hatch: force the scalar ternary kernel for benchmarking.
-    const char* no_simd = std::getenv("OMNISEED_NO_SIMD_TERNARY");
-    if (no_simd != nullptr && no_simd[0] == '1') g_tern_rows_fn = fwd_ternary_rows_scalar;
+    // Env-based ternary-kernel forces (first init only; an explicit
+    // force_ternary_kernel() call takes precedence over both):
+    //   OMNISEED_FORCE_SSE4_TERNARY=1  -> SSE4.1 kernel even on AVX2 hosts
+    //   OMNISEED_NO_SIMD_TERNARY=1     -> scalar kernel (A/B benchmark)
+    if (g_tern_force == TernaryKernel::Auto) {
+        const char* force_sse = std::getenv("OMNISEED_FORCE_SSE4_TERNARY");
+        if (force_sse != nullptr && force_sse[0] == '1')
+            g_tern_force = TernaryKernel::Sse41;
+        const char* no_simd = std::getenv("OMNISEED_NO_SIMD_TERNARY");
+        if (no_simd != nullptr && no_simd[0] == '1')
+            g_tern_force = TernaryKernel::Scalar;
+    }
     // otherwise: scalar (already the default)
 }
 
@@ -94,7 +104,17 @@ I8ForwardFn simd_selected_fn() {
 
 TernaryRowsFn ternary_rows_selected_fn() {
     init_simd_dispatch();
+    if (g_tern_force == TernaryKernel::Scalar) return fwd_ternary_rows_scalar;
+#if defined(OMNISEED_X86)
+    if (g_tern_force == TernaryKernel::Sse41) return fwd_ternary_rows_sse41;
+    if (g_tern_force == TernaryKernel::Avx2) return fwd_ternary_rows_avx2;
+#endif
     return g_tern_rows_fn;
+}
+
+void force_ternary_kernel(TernaryKernel k) {
+    if (k != TernaryKernel::Auto) init_simd_dispatch();  // env already read
+    g_tern_force = k;
 }
 
 // ===========================================================================
@@ -212,8 +232,7 @@ void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
 void bitlinear_forward_rows_simd(const uint8_t* W_packed, const float* scales,
                                  const float* x, float* y,
                                  int64_t out_dim, int64_t in_dim) {
-    init_simd_dispatch();
-    g_tern_rows_fn(W_packed, scales, x, y, out_dim, in_dim);
+    ternary_rows_selected_fn()(W_packed, scales, x, y, out_dim, in_dim);
 }
 
 // Scalar reference for the PACKED TERNARY per-row dot — the bit-exactness

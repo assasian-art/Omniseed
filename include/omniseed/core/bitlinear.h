@@ -89,6 +89,13 @@ void fwd_ternary_rows_scalar(const uint8_t* W_packed, const float* scales,
                              const float* x, float* y,
                              int64_t out_dim, int64_t in_dim);
 
+// Kernel-selection override for the packed-ternary per-row dot (tests/bench).
+// Auto = cpuid dispatch, honoring OMNISEED_FORCE_SSE4_TERNARY=1 and
+// OMNISEED_NO_SIMD_TERNARY=1 at first init; an explicit pick forces that
+// kernel regardless of the host (Sse41/Avx2 picks are no-ops on non-x86).
+enum class TernaryKernel { Auto, Scalar, Sse41, Avx2 };
+void force_ternary_kernel(TernaryKernel k);
+
 // ---------------------------------------------------------------------------
 // Training path (BitLinear QAT / LoRA fine-tuning support)
 // ---------------------------------------------------------------------------
