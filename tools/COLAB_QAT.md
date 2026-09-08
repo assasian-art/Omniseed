@@ -130,6 +130,80 @@ the C++ runtime needs no changes; ternary-QAT tensors use the existing
 
 ---
 
+# ROUND 2 — resume + distillation + TinyStories mix (Phase 13)
+
+Round-1 result (T4, 4000 steps, B=16/W=16): val PPL 257,402 → 538 →
+**136.70 (best @3800)**. The GGUF runs in C++ (114 MB RSS) but generation
+loops on wikitext-style text — the corpus is too narrow and the schedule
+ended at lr≈0. Round 2 fixes both, plus teacher distillation:
+
+| New flag | Round-2 value | What it does |
+|---|---|---|
+| `--lr` + `--cosine-start` | `2e-4` + `4000` | restart the cosine at step 4000 with a fresh (smaller) peak while resuming `models/qat_ckpt.pt` |
+| `--kd-weight` / `--kd-temp` | `1.0` / `2.0` | add `kd_weight · T² · KL(teacher ‖ student)` where the teacher is the FROZEN bf16-master forward on the same window — transfers the bf16 model's full distribution, not just argmax |
+| `--corpus wikitext+tinystories` | (round-2 default) | 50/50 batch interleave with auto-downloaded TinyStories — narrative diversity breaks the wikitext loops |
+| `--window` | `32` | 2× the round-1 context per step |
+
+With `--kd-weight 0` (default) every existing path — including
+`--verify-batch` — is bit-identical to round 1.
+
+## Cell R1 — restore the round-1 checkpoint from Drive
+
+```python
+%%bash
+CKPT=/content/drive/MyDrive/omniseed-qat/qat_ckpt.pt
+mkdir -p models
+if [ -f "$CKPT" ]; then
+  cp "$CKPT" models/qat_ckpt.pt
+  cp "${CKPT%.pt}-best.pt" models/qat_ckpt-best.pt 2>/dev/null || true
+  echo "round-1 checkpoint restored"
+fi
+```
+
+## Cell R2 — the round-2 chunk loop
+
+```python
+%%bash
+STEPS=12000            # round-2 target: 4000 -> 12000
+for i in $(seq 1 48); do
+  python -u tools/qat_ternary.py --device cuda \
+      --corpus wikitext+tinystories \
+      --lr 2e-4 --cosine-start 4000 \
+      --kd-weight 1.0 --kd-temp 2.0 \
+      --window 32 --batch 16 \
+      --steps $STEPS --eval-every 100 --time-budget 3300 \
+      --ckpt models/qat_ckpt.pt
+  rc=$?
+  if [ $rc -eq 0 ]; then echo "ROUND-2 DONE"; break; fi
+  if [ $rc -ne 3 ]; then echo "FAILED rc=$rc"; exit $rc; fi
+  cp models/qat_ckpt.pt /content/drive/MyDrive/omniseed-qat/qat_ckpt.pt
+  cp models/qat_ckpt-best.pt \
+     /content/drive/MyDrive/omniseed-qat/qat_ckpt-best.pt 2>/dev/null || true
+  echo "chunk $i done: $(tail -1 qat_log.txt)"
+done
+tail -5 qat_log.txt
+```
+
+Notes: the TinyStories stream + token cache builds once (~2-3 min) in the
+first chunk and is cached under `models/corpus/`; KD roughly doubles step
+cost (two forwards per token) — a T4 chunk still fits the 55-min budget;
+the `best` checkpoint only updates when val PPL improves, so the exported
+GGUF always comes from the best masters seen.
+
+## Cell R3 — export + take home (same as Cells 8/9, best masters auto-export)
+
+```python
+!python -u tools/qat_ternary.py --device cuda --steps 12000 \
+    --corpus wikitext+tinystories --lr 2e-4 --cosine-start 4000 \
+    --kd-weight 1.0 --ckpt models/qat_ckpt.pt --export-always
+```
+
+Gate to flip the default model: **ternary val PPL ≤ 60** on wikitext val.
+Until then `models/rwkv7-0.1B-ternary.gguf` (i8, 19.2 tok/s, coherent)
+stays the daily default.
+
+---
+
 ### Notes and knobs
 
 - `--batch 8 --window 32` defaults fit any Colab GPU (T4 and up) with huge

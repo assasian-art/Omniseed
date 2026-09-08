@@ -39,6 +39,13 @@
 #  Fresh clone: model.safetensors auto-downloads (HF Hakureirm/rwkv7-0.1b-hf)
 #  and the world vocab resolves repo-relative (tools/data/ first).
 #  --smoke: 2-step end-to-end self-check (no ckpt write, no export).
+#
+#  Round 2 (Phase 13): --kd-weight distills the FROZEN bf16-master teacher
+#  into the ternary student (soft-target KL, Hinton T^2 scaling) to break the
+#  wikitext repetition loops round-1 left behind; --corpus
+#  wikitext+tinystories interleaves TinyStories 50/50 for narrative diversity;
+#  --lr + --cosine-start restart the cosine schedule (e.g. 2e-4 @ step 4000)
+#  while resuming models/qat_ckpt.pt.
 # =============================================================================
 import argparse
 import math
@@ -64,6 +71,12 @@ WIKITEXT_TRAIN = ('https://huggingface.co/datasets/Salesforce/wikitext/'
 WIKITEXT_VAL = ('https://huggingface.co/datasets/Salesforce/wikitext/'
                 'resolve/main/wikitext-103-raw-v1/'
                 'validation-00000-of-00001.parquet')
+# TinyStories (round-2 mix): plain-text files, so we STREAM them and stop at
+# the token cap — a 3M-token cap pulls ~15 MB of the 1.9 GB train file.
+TINY_TRAIN = ('https://huggingface.co/datasets/roneneldan/TinyStories/'
+              'resolve/main/TinyStories-train.txt')
+TINY_VAL = ('https://huggingface.co/datasets/roneneldan/TinyStories/'
+            'resolve/main/TinyStories-valid.txt')
 REPO_FILES = ['PROJECT_STATE.md', 'docs/OMNISEED_MASTER_SPEC.md', 'README.md']
 HF_MODEL_REPO = 'Hakureirm/rwkv7-0.1b-hf'   # public HF repo, no login needed
 
@@ -156,6 +169,50 @@ def load_corpus_wikitext(tok, max_train_tokens, cache=True):
     if cache:
         np.save(train_np, tr)
         np.save(val_np, va)
+    return tr, va
+
+
+def load_corpus_tinystories(tok, max_train_tokens, cache=True):
+    """TinyStories train/val as plain text, streamed and tokenized up to the
+    cap (no pyarrow needed). Cache files carry the cap in the name so a small
+    --max-train-tokens smoke can never poison a real run's cache."""
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+    tr_np = os.path.join(CORPUS_DIR, f'tinystories_train_{max_train_tokens}.npy')
+    va_np = os.path.join(CORPUS_DIR, 'tinystories_val.npy')
+    if cache and os.path.exists(tr_np) and os.path.exists(va_np):
+        print(f'[qat] tinystories cache hit: {tr_np} / {va_np}', flush=True)
+        return np.load(tr_np), np.load(va_np)
+
+    def stream(url, cap):
+        import io
+        import urllib.request
+        ids, buf, count = [], [], 0
+        print(f'[qat] streaming {url} (cap {cap:,} tokens)', flush=True)
+        with urllib.request.urlopen(url) as resp:
+            text = io.TextIOWrapper(resp, encoding='utf-8', errors='replace')
+            for raw in text:
+                line = raw.strip()
+                if not line:
+                    continue
+                buf.append(line)
+                if sum(len(b) for b in buf) >= 4096:
+                    got = tok.encode('\n'.join(buf))
+                    ids.extend(got)
+                    count += len(got)
+                    buf = []
+                    if count >= cap:
+                        break          # closes the HTTP stream early
+        for b in buf:
+            ids.extend(tok.encode(b))
+        return np.asarray(ids, dtype=np.int32)
+
+    tr = stream(TINY_TRAIN, max_train_tokens)
+    va = stream(TINY_VAL, 400_000)
+    print(f'[qat] TinyStories: train {len(tr):,} tokens, '
+          f'val {len(va):,} tokens', flush=True)
+    if cache:
+        np.save(tr_np, tr)
+        np.save(va_np, va)
     return tr, va
 
 
@@ -464,14 +521,29 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument('--safetensors', default=ST_DEFAULT)
-    ap.add_argument('--corpus', default='auto', choices=['auto', 'wikitext', 'repo'])
+    ap.add_argument('--corpus', default='auto',
+                    choices=['auto', 'wikitext', 'repo',
+                             'wikitext+tinystories'],
+                    help='wikitext+tinystories interleaves both corpora '
+                         '50/50 per batch (round-2 anti-repetition mix)')
     ap.add_argument('--max-train-tokens', type=int, default=3_000_000)
     ap.add_argument('--steps', type=int, default=10_000,
                     help='total training steps (across chunks)')
     ap.add_argument('--start-step', type=int, default=0,
                     help='override the checkpoint global step (usually left 0; '
                          'resume supplies it)')
-    ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--lr', type=float, default=1e-3,
+                    help='peak LR; override to restart (round-2: 2e-4)')
+    ap.add_argument('--cosine-start', type=int, default=0,
+                    help='restart the cosine schedule at this global step '
+                         '(round-2: --lr 2e-4 --cosine-start 4000 while '
+                         'resuming; 0 = the original schedule exactly)')
+    ap.add_argument('--kd-weight', type=float, default=0.0,
+                    help='knowledge-distillation weight toward the FROZEN '
+                         'bf16-master teacher, soft-target KL with T^2 '
+                         'scaling (0 = off; round-2 uses 1.0)')
+    ap.add_argument('--kd-temp', type=float, default=2.0,
+                    help='KD softening temperature T')
     ap.add_argument('--lr-min', type=float, default=1e-5)
     ap.add_argument('--warmup', type=int, default=100)
     ap.add_argument('--window', type=int, default=32)
@@ -524,6 +596,7 @@ def main():
     from hf_rwkv_tokenizer import RwkvTokenizer
     tok = RwkvTokenizer(vocab_file=resolve_vocab())
 
+    ts_train = ts_val = None
     if args.corpus in ('auto', 'wikitext'):
         try:
             train_ids, val_ids = load_corpus_wikitext(tok, args.max_train_tokens)
@@ -534,8 +607,11 @@ def main():
             train_ids, val_ids = load_corpus_repo(tok)
     else:
         train_ids, val_ids = load_corpus_repo(tok)
+    if args.corpus == 'wikitext+tinystories':
+        ts_train, ts_val = load_corpus_tinystories(tok, args.max_train_tokens)
     print(f'[qat] corpus: train {len(train_ids):,} tokens, '
-          f'val {len(val_ids):,} tokens')
+          f'val {len(val_ids):,} tokens'
+          + (f', tinystories {len(ts_train):,}' if ts_train is not None else ''))
 
     ensure_checkpoint(args.safetensors)
     header, data_start = load_safetensors(args.safetensors)
@@ -547,8 +623,11 @@ def main():
     def cosine_lr(step):
         if step < args.warmup:
             return args.lr * (step + 1) / max(1, args.warmup)
-        t_ = (step - args.warmup) / max(1, args.steps - args.warmup)
-        t_ = min(1.0, t_)
+        if args.cosine_start > 0:            # round-2 restart anchor
+            t_ = (step - args.cosine_start) / max(1, args.steps - args.cosine_start)
+        else:                                # original schedule, unchanged
+            t_ = (step - args.warmup) / max(1, args.steps - args.warmup)
+        t_ = min(1.0, max(0.0, t_))
         return args.lr_min + 0.5 * (args.lr - args.lr_min) * (1 + math.cos(math.pi * t_))
 
     global_step = args.start_step
@@ -605,10 +684,13 @@ def main():
     def evaluate_and_log(tag):
         ppl_bf16 = perplexity(train_ids, float_masters=True)
         ppl_val = perplexity(val_ids)
+        extra = ''
+        if ts_val is not None:               # story-domain fit, informational
+            extra = f' tinystories_val={perplexity(ts_val):.2f}'
         log_line(f'[qat] {tag}: bf16(train) ppl={ppl_bf16:.2f} '
                  f'ternary val ppl={ppl_val:.2f} '
                  f'ratio={ppl_val / max(ppl_bf16, 1e-9):.2f}x '
-                 f'best={min(best["ppl"], ppl_val):.2f}')
+                 f'best={min(best["ppl"], ppl_val):.2f}{extra}')
         return ppl_bf16, ppl_val
 
     if args.verify_batch:
@@ -634,7 +716,31 @@ def main():
 
     started = time.time()
     W, B = args.window, args.batch
-    n_starts = max(1, len(train_ids) - W - 2)
+    mixed = ts_train is not None
+    if mixed:
+        half = B // 2
+        n_starts_w = max(1, len(train_ids) - W - 2)
+        n_starts_t = max(1, len(ts_train) - W - 2)
+    else:
+        n_starts = max(1, len(train_ids) - W - 2)
+
+    def window_picks(step):
+        """B (corpus, start) pairs for this step: B independent CONTIGUOUS
+        windows; element b runs tokens start..start+W-1 through its own RNN
+        state. Mixed mode: first half of the batch from wikitext, second half
+        from TinyStories (50/50 interleave)."""
+        if not mixed:
+            return [(train_ids, (step * 7919 + b * 104729) % n_starts)
+                    for b in range(B)]
+        out = []
+        for b in range(B):
+            if b < half:
+                out.append((train_ids,
+                            (step * 7919 + b * 104729) % n_starts_w))
+            else:
+                out.append((ts_train,
+                            (step * 7919 + (b - half) * 104729) % n_starts_t))
+        return out
 
     def lr_at(step):
         lr = cosine_lr(step)
@@ -644,20 +750,33 @@ def main():
 
     while global_step < args.steps:
         lr_at(global_step)
-        # B independent CONTIGUOUS windows; element b runs tokens
-        # starts[b] .. starts[b]+W-1 through its own RNN state.
-        starts = [(global_step * 7919 + b * 104729) % n_starts
-                  for b in range(B)]
+        picks = window_picks(global_step)
         model.begin_window(True)
         state = None
+        t_state = None                    # teacher (frozen bf16) RNN state
         total_loss = torch.zeros((), device=device)
         for j in range(W):
-            toks = torch.tensor([int(train_ids[s + j]) for s in starts],
+            toks = torch.tensor([int(src[s + j]) for src, s in picks],
                                 dtype=torch.long, device=device)
             logits, state = model.step_batch(toks, state)
-            tgt = torch.tensor([int(train_ids[s + j + 1]) for s in starts],
+            tgt = torch.tensor([int(src[s + j + 1]) for src, s in picks],
                                dtype=torch.long, device=device)
             loss = torch.nn.functional.cross_entropy(logits.float(), tgt)
+            if args.kd_weight > 0.0:
+                # Teacher: the FROZEN bf16-master reference forward (detached,
+                # no_grad) on the SAME window. Soft-target distillation:
+                #   L_kd = kd_weight * T^2 * KL(teacher_soft || student_soft)
+                # (teacher targets under student logits — the stable Hinton
+                # direction; the reverse KL is mode-seeking and unstable.)
+                with torch.no_grad():
+                    model.float_mode = True
+                    t_logits, t_state = model.step_batch(toks, t_state)
+                    model.float_mode = False
+                T = args.kd_temp
+                log_p = torch.log_softmax(t_logits.float() / T, -1)
+                log_q = torch.log_softmax(logits.float() / T, -1)
+                kd = (log_p.exp() * (log_p - log_q)).sum(-1).mean()
+                loss = loss + args.kd_weight * (T * T) * kd
             total_loss = total_loss + loss
             state = [(S.detach(), a.detach(), f.detach()) for S, a, f in state]
         (total_loss / W).backward()
