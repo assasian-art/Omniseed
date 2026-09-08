@@ -237,8 +237,12 @@ Deployment: `Dockerfile` (multi-stage, ~15 MB runtime image), `render.yaml`,
 model attach → verify). The server honors `--model` or `OMNISEED_MODEL`, loads
 the world tokenizer straight from the GGUF, serves a **browser demo console at
 `GET /`** (inline HTML, calls `/gen`, polls `/health`), and `/health` reports
-`model:true` + `peak_rss_mb`. CI: `.github/workflows/ci.yml` builds + ctests on
-ubuntu (gcc) and windows (MSVC) with model-less server smokes.
+`model:true` + `peak_rss_mb`. `POST /gen` and `POST /ask` accept optional
+`"repeat_penalty"` (default 1.0 = off) and `"repeat_window"` (default 64)
+fields — CTRL-style repetition suppression tuned for the QAT ternary model;
+each request is self-contained (absent fields revert to the defaults). CI:
+`.github/workflows/ci.yml` builds + ctests on ubuntu (gcc) and windows (MSVC)
+with model-less server smokes.
 
 **Model & weights (offline Python tooling; never shipped at runtime):**
 
@@ -277,6 +281,7 @@ gives cross-entropy perplexity (PPL ≈ 33 on in-repo markdown, i8 head).
 | `omniseed dream` | capability #1 | `dream complete: 1 traces retained, 0 skills retired` |
 | `omniseed ask --model M "task"` | one full agent turn (tools+memory) | JSON tool-call transcript |
 | `omniseed chat --model M` | REPL with thinking mode + interrupts | — |
+| `omniseed gen/chat … --repeat-penalty P` | CTRL-style repetition suppression (1.0 = off; 1.15–1.25 breaks text loops on the QAT ternary model; `--repeat-window` sets the recency ring, default 64) | loop-free continuation at full tok/s with no overhead |
 | `omniseed selftest` | numeric sanity | `selftest OK` |
 
 Observed peak RSS: **< 5 MB** across all demos (no model loaded) and
@@ -292,7 +297,11 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
   audio, vision, swarm (`tests/test_platform.cpp`) — **200 passed / 0 failed**.
   Phase-Omega additions: uncertainty quantification (entropy/margin/abstain,
   incl. coin-flip ties), entropy-anomaly z-score window, prefix-cache container
-  semantics, entropy-salience + working-memory ring.
+  semantics, entropy-salience + working-memory ring. Phase-13 additions:
+  packed-ternary SIMD kernels (scalar/SSE4.1/AVX2, bit-exact A/B across six
+  dim shapes) and the `omniseed_qat_ternary` suite proving byte-identical
+  greedy continuation across all three kernels on the real QAT model
+  (8/8; skips cleanly when the QAT GGUF is absent).
 - **Portability proofs:** UDP beacon localhost round-trip (both directions,
   source ip/port in host order); `OMNISEED_FORCE_FREAD=1` fallback stress —
   outputs byte-identical between mmap and heap-copy modes, ASan-clean in all

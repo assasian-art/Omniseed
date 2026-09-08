@@ -261,6 +261,12 @@ public:
                          const std::vector<int32_t>& stop_pieces,
                          GrammarDecoder* grammar);
 
+    // Runtime sampling override (server): set repeat_penalty/repeat_window
+    // between turns. The server is serialized (one request at a time), so a
+    // per-request set is race-free; each request passing its own values (or
+    // the defaults) keeps requests self-contained.
+    void set_sampling(float repeat_penalty, int32_t repeat_window);
+
     // --- Prefix cache access (Phase-Omega) --------------------------------
     // Snapshot the CURRENT WKV state under cfg_.prefix_key. Call after a
     // turn whose prompt is representative (or from the runtime's idle loop).

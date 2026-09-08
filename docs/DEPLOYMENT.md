@@ -83,8 +83,8 @@ Options: `--model PATH`, `--prompt TEXT`, `--max-tokens N`, `--quiet`.
 | Endpoint | Method | Body | Result |
 |---|---|---|---|
 | `/health` | GET | — | `{"ok":true,"model":true,"peak_rss":42}` |
-| `/ask` | POST | `{"task":"what is 2+2"}` | `{"reply":"..."}` |
-| `/gen` | POST | `{"prompt":"hello"}` | `{"text":"..."}` |
+| `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64}` | `{"reply":"..."}` |
+| `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64}` | `{"text":"..."}` |
 
 ---
 

@@ -4,8 +4,10 @@
 //  no external dependencies. Endpoints:
 //    GET  /               -> one-page HTML demo console (talks to /gen)
 //    GET  /health         -> {"ok":true,"model":bool,"peak_rss":MB}
-//    POST /ask            -> one agent turn (json body: {"task": "..."})
-//    POST /gen            -> raw generation (json body: {"prompt": "..."})
+//    POST /ask            -> one agent turn (json body: {"task": "...",
+//                           "repeat_penalty": 1.2, "repeat_window": 64})
+//    POST /gen            -> raw generation (json body: {"prompt": "...",
+//                           "repeat_penalty": 1.2, "repeat_window": 64})
 //
 //  Deployment target: Render/Docker (see docs/DEPLOYMENT.md).
 // =============================================================================
@@ -94,6 +96,20 @@ std::string json_field(const std::string& body, const std::string& key) {
     const auto q2 = body.find('"', q1 + 1);
     if (q1 == std::string::npos || q2 == std::string::npos) return "";
     return body.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Numeric JSON field (unquoted value, e.g. "repeat_penalty":1.2). Returns
+// `dflt` when absent or unparseable — requests stay valid without the field.
+float json_num_field(const std::string& body, const std::string& key,
+                     float dflt) {
+    const auto kpos = body.find("\"" + key + "\"");
+    if (kpos == std::string::npos) return dflt;
+    const auto cpos = body.find(':', kpos);
+    if (cpos == std::string::npos) return dflt;
+    const char* begin = body.c_str() + cpos + 1;
+    char* end = nullptr;
+    const float v = std::strtof(begin, &end);
+    return (end == begin) ? dflt : v;
 }
 
 // One-page demo console: a browser chat box against POST /gen. No assets,
@@ -311,10 +327,19 @@ int main(int argc, char** argv) {
             respond(client, b);
         } else if (path == "/ask" && method == "POST" && have_model) {
             const std::string task = json_field(body, "task");
+            // Optional per-request sampling overrides (Phase 13):
+            //   "repeat_penalty": 1.2   (1.0 = off, >1 breaks text loops)
+            //   "repeat_window":  64    (recent-token ring size)
+            loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),
+                              static_cast<int32_t>(
+                                  json_num_field(body, "repeat_window", 64.0f)));
             const AgentLoop::Result r = loop.run(task);
             respond(client, "{\"reply\":\"" + r.reply + "\"}");
         } else if (path == "/gen" && method == "POST" && have_model) {
             const std::string prompt = json_field(body, "prompt");
+            loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),
+                              static_cast<int32_t>(
+                                  json_num_field(body, "repeat_window", 64.0f)));
             auto ids = tok.encode_chat(prompt);
             RwkvState st;
             model.init_state(st);

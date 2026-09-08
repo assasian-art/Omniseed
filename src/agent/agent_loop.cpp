@@ -58,6 +58,11 @@ std::vector<int32_t> AgentLoop::build_prompt(
 // Generation with optional grammar constraint.
 // Proper autoregressive loop: forward(seed) -> logits -> pick -> feed back.
 // ===========================================================================
+void AgentLoop::set_sampling(float repeat_penalty, int32_t repeat_window) {
+    cfg_.repeat_penalty = repeat_penalty;
+    cfg_.repeat_window = repeat_window;
+}
+
 std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
                                 int32_t max_tokens,
                                 const std::vector<int32_t>& stop_pieces,
