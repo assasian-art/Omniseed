@@ -15,14 +15,13 @@ GLM-5.3-FLASH
   untested here.
 - **Build:** `build.bat` (auto-detects VS via vswhere) or
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
-- **Test:** `build\bin\omniseed_tests.exe` — **165/165 passing** +
+- **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-OMEGA — Grand Unification pass. Read all 3 feature
-  registries (z.ai universe / deepseek VOL.I+II / grok grounded), triaged every
-  feature into A/B/C buckets, implemented the Bucket-A gold (uncertainty
-  quantification, WKV prefix snapshots, Ebbinghaus memory decay, temperature
-  annealing, RSS watermark), documented the refusal of n-gram speculative
-  decoding on RWKV with the math. 200/200 + 13/13 + 17/17, RSS 155 MB.
+- **Last updated:** PHASE-13 — QAT round-2 runtime pass (uncommitted): packed-
+  ternary SIMD kernels (SSE4.1/AVX2, bit-exact vs scalar, 29× on the QAT
+  model: 0.6 → 17.4 tok/s) + CTRL-style repetition penalty
+  (`--repeat-penalty`, breaks the QAT model's wikitext loops). 206/206 +
+  13/13 + 17/17, QAT-model RSS 115 MB.
 
 ---
 
@@ -534,3 +533,87 @@ sanitize the remote URL — the session token lives only in shell commands).
   or log. Post-push verification: `.git/config` token-free, `git log -p`
   history token-free, anonymous `ls-remote` proves the repo is publicly
   cloneable.
+
+---
+
+## 7. PHASE-12/13 — QAT ROUNDS + TERNARY RUNTIME (2026-09-08)
+
+### Phase 12 — Round-1 QAT (Colab T4, 4000 steps, B=16/W=16)
+
+- Trajectory: val PPL **257,402 → 538 → 136.70 (best @ step 3800)** — a
+  ~1900× recovery from PTQ; the schedule ended at lr≈0 so the run stopped
+  improving. `models/rwkv7-0.1B-ternary-qat.gguf` (201 MB) loads in C++
+  (114.6 MB RSS) but generation loops on wikitext-style text — the corpus
+  was too narrow and the model never saw narrative diversity.
+- Lesson encoded into round 2: narrow corpus + lr→0 = repetition loops, not
+  quality.
+
+### Phase 13 TASK 1 — QAT round-2 tooling (committed: bc47799)
+
+- `tools/qat_ternary.py` gains **teacher distillation** (`--kd-weight`/
+  `--kd-temp`): KL(teacher‖student) with Hinton T² scaling against the
+  FROZEN bf16-master forward on the same window — transfers the full
+  distribution, not the argmax. `--kd-weight 0` (default) keeps every
+  existing path — including `--verify-batch` — bit-identical to round 1.
+- **TinyStories 50/50 corpus mix** (`--corpus wikitext+tinystories`,
+  round-2 default): streamed plain-text files (3M-token cap ≈ 15 MB of the
+  1.9 GB train file) interleaved per batch — narrative diversity breaks the
+  wikitext loops.
+- **`--lr` + `--cosine-start`** restart the cosine schedule at a fresh
+  (smaller) peak while resuming `models/qat_ckpt.pt`; `--window 32`
+  (2× round-1 context). Colab round-2 recipe in `tools/COLAB_QAT.md`
+  (target 12000 steps, chunk loop, Drive restore/save).
+
+### Phase 13 TASK 2 — Ternary runtime: SIMD kernels + repetition penalty (UNCOMMITTED)
+
+Two runtime gaps stood between the round-2 GGUF and a usable model:
+the ternary per-row dot ran scalar-only (0.6 tok/s), and even a good
+ternary model loops without repetition suppression.
+
+**Packed-ternary SIMD kernels** (`bitlinear.h/.cpp`, `bitlinear_avx2.cpp`,
+`rwkv.cpp`, `tests/test_platform.cpp`):
+- SSE4.1 + AVX2 kernels for `bitlinear_forward_rows` (2 weights/byte,
+  pshufb LUT unpack to {-1,0,+1}, then the i8 dot path). Same cpuid
+  dispatch + `OMNISEED_NO_SIMD_TERNARY=1` scalar escape hatch as the i8
+  path.
+- **Bit-exactness contract:** all three kernels (scalar/SSE4.1/AVX2)
+  implement ONE canonical accumulation order — 8 fp32 lanes, weight index
+  c ≡ lane (mod 8) in increasing c, horizontal sum `((l0+l4)+(l2+l6)) +
+  ((l1+l5)+(l3+l7))`, tail folded into lanes in increasing c. w·x is exact
+  in IEEE (w ∈ {-1,0,+1}), so only the lane additions round, identically
+  on every host. `rwkv.cpp` hot paths (per-row linears + ternary head)
+  now call `bitlinear_forward_rows_simd`.
+- New test `test_ternary_simd_bitexact`: memcmp A/B vs scalar across
+  {2×2, 5×7, 17×24, 64×96, 33×77 (odd in_dim), 256×768} — **all
+  byte-identical**.
+- **Verified today:** QAT-model greedy gen byte-identical with/without
+  SIMD (only the timing line differs); **0.6 → 17.4 tok/s (29×)**,
+  peak RSS unchanged 114.9 MB. i8 default model path untouched
+  (real-weights continuation re-recorded and matched).
+
+**Repetition penalty** (`agent.h`, `agent_loop.cpp`, `cli/main.cpp`):
+- CTRL-style: after each forward, tokens in the last `repeat_window`
+  generated tokens get logit/penalty when positive (×penalty when
+  negative); `AgentLoop::Config{repeat_penalty=1.0, repeat_window=64}`,
+  CLI `--repeat-penalty P` on `gen`/`chat` (1.0 = off).
+- **Verified today:** QAT model, same prompt: no penalty →
+  "the first time , the first time , the first time …" infinite loop;
+  `--repeat-penalty 1.2` → loop broken, coherent continuation at
+  19.5 tok/s (no measurable overhead).
+
+### Verification (Phase 12/13)
+- ctest **3/3**: `omniseed_platform` **206/206** (was 200; +6 from the
+  ternary bit-exactness A/B), `omniseed_real_weights` **13/13** (greedy
+  continuation unchanged), `omniseed_sides` **17/17**.
+- QAT model: 114.9–115.1 MB RSS at 17.4–19.5 tok/s.
+
+### NEXT STEPS (updated)
+1. **Commit this Phase 13 TASK 2 pass** (ternary SIMD + repetition penalty
+   + tests + this state file).
+2. **Round-2 QAT run to completion** (Colab, 12000 steps, ~13 h) — the
+   repetition penalty is a stopgap; KD + TinyStories is the real fix.
+   Resume: `tools/qat_watch.bat` locally or the R2 chunk loop in
+   `tools/COLAB_QAT.md`.
+3. Parallel-scan WKV verify kernel (would flip speculative decoding from
+   refused to profitable) — unchanged from PHASE-OMEGA.
+4. Whisper decoder + FocalCodec codebooks — unchanged (see §3).

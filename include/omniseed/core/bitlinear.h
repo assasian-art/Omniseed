@@ -75,6 +75,20 @@ void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
                           const float* x, float* y,
                           int64_t out_dim, int64_t in_dim);
 
+// Per-row PACKED ternary (2 weights/byte, low nibble = even index, layout
+// identical to bitlinear_forward_rows): y[r] = scales[r] * (W . x).
+// Same SIMD/dispatch contract as bitlinear_forward_i8 (see bitlinear.cpp):
+// results are byte-identical to the scalar path on every host.
+void bitlinear_forward_rows_simd(const uint8_t* W_packed, const float* scales,
+                                 const float* x, float* y,
+                                 int64_t out_dim, int64_t in_dim);
+
+// Scalar reference for the packed-ternary per-row dot — the bit-exactness
+// baseline (defined in bitlinear.cpp; tests A/B against it).
+void fwd_ternary_rows_scalar(const uint8_t* W_packed, const float* scales,
+                             const float* x, float* y,
+                             int64_t out_dim, int64_t in_dim);
+
 // ---------------------------------------------------------------------------
 // Training path (BitLinear QAT / LoRA fine-tuning support)
 // ---------------------------------------------------------------------------

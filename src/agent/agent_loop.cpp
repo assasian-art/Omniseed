@@ -68,6 +68,9 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
     uint64_t rng = cfg_.seed;
     bool first_analyzed = false;
     int32_t rss_soft_cut = 0;   // max_tokens halved once at soft watermark
+    // Phase 13: repetition-penalty ring of recently generated tokens.
+    std::vector<int32_t> recent;
+    recent.reserve(static_cast<size_t>(std::max<int32_t>(cfg_.repeat_window, 1)));
 
     for (int32_t i = 0; i < max_tokens; ++i) {
         model_.forward(cursor, st, logits);
@@ -101,9 +104,31 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
             }
         }
 
+        // ---- Phase 13: repetition penalty ------------------------------
+        // CTRL-style: tokens present in the recent ring get their logit
+        // divided by the penalty when positive (multiplied when negative),
+        // suppressing the "/ repeat / repeat" loops of the QAT model.
+        if (cfg_.repeat_penalty > 1.0f && !recent.empty()) {
+            const float p = cfg_.repeat_penalty;
+            const int32_t win = std::max<int32_t>(cfg_.repeat_window, 1);
+            const size_t start = recent.size() > static_cast<size_t>(win)
+                ? recent.size() - static_cast<size_t>(win)
+                : 0;
+            float* lp = logits.f32();
+            const int32_t vocab = static_cast<int32_t>(logits.numel());
+            for (size_t ri = start; ri < recent.size(); ++ri) {
+                const int32_t t = recent[ri];
+                if (t < 0 || t >= vocab) continue;
+                if (lp[t] > 0.0f)      lp[t] /= p;
+                else if (lp[t] < 0.0f) lp[t] *= p;
+                // logit == 0: unchanged
+            }
+        }
+
         const int32_t id = temp > 0.0f
             ? model_.sample_token(logits, temp, cfg_.top_k, rng)
             : model_.greedy_pick(logits);
+        recent.push_back(id);
         if (id == Tokenizer::kEosId) break;
 
         const std::string piece = tok_.piece(id);

@@ -8,11 +8,19 @@
 //  FMA) -> SSE4.1 (16-wide) -> scalar. bitlinear_avx2.cpp is compiled with
 //  /arch:AVX2 (-mavx2) for exactly one translation unit; everything else
 //  stays baseline-compatible.
+//
+//  Phase 13: the PACKED TERNARY per-row kernel joins the same dispatch
+//  (pshufb LUT unpack to -1/0/+1, then the i8 dot path). The ternary dot is
+//  EXACTLY the scalar ternary dot in fp32 (integer weights, one fp32 scale
+//  per row), so the SIMD result is bit-identical on every host — tests A/B
+//  the two and gen must not drift. OMNISEED_NO_SIMD_TERNARY=1 forces the
+//  scalar ternary kernel for A/B benchmarking.
 // =============================================================================
 #include "omniseed/core/bitlinear.h"
 #include "omniseed/core/platform.h"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace omniseed {
 namespace bitnet {
@@ -26,19 +34,31 @@ namespace {
 
 using I8ForwardFn = void (*)(const int8_t*, const float*, const float*,
                              float*, int64_t, int64_t);
+using TernaryRowsFn = void (*)(const uint8_t*, const float*, const float*,
+                               float*, int64_t, int64_t);
 
-I8ForwardFn g_i8_fn = nullptr;
+I8ForwardFn   g_i8_fn         = nullptr;
+TernaryRowsFn g_tern_rows_fn  = nullptr;
 bool g_simd_init = false;
 
 } // namespace
 
 void fwd_i8_scalar(const int8_t* W, const float* scales, const float* x,
                    float* y, int64_t out_dim, int64_t in_dim);
+void fwd_ternary_rows_scalar(const uint8_t* W, const float* scales,
+                             const float* x, float* y,
+                             int64_t out_dim, int64_t in_dim);
 #if defined(OMNISEED_X86)
 void fwd_i8_avx2(const int8_t* W, const float* scales, const float* x,
                  float* y, int64_t out_dim, int64_t in_dim);
 void fwd_i8_sse41(const int8_t* W, const float* scales, const float* x,
                   float* y, int64_t out_dim, int64_t in_dim);
+void fwd_ternary_rows_avx2(const uint8_t* W, const float* scales,
+                           const float* x, float* y,
+                           int64_t out_dim, int64_t in_dim);
+void fwd_ternary_rows_sse41(const uint8_t* W, const float* scales,
+                            const float* x, float* y,
+                            int64_t out_dim, int64_t in_dim);
 #endif
 
 namespace {
@@ -47,11 +67,20 @@ void init_simd_dispatch() {
     if (g_simd_init) return;
     g_simd_init = true;
     g_i8_fn = fwd_i8_scalar;
+    g_tern_rows_fn = fwd_ternary_rows_scalar;
 #if defined(OMNISEED_X86)
     platform::CpuFeatures f = platform::cpu_features();
-    if (f.avx2)      g_i8_fn = fwd_i8_avx2;
-    else if (f.sse41) g_i8_fn = fwd_i8_sse41;
+    if (f.avx2) {
+        g_i8_fn = fwd_i8_avx2;
+        g_tern_rows_fn = fwd_ternary_rows_avx2;
+    } else if (f.sse41) {
+        g_i8_fn = fwd_i8_sse41;
+        g_tern_rows_fn = fwd_ternary_rows_sse41;
+    }
 #endif
+    // A/B escape hatch: force the scalar ternary kernel for benchmarking.
+    const char* no_simd = std::getenv("OMNISEED_NO_SIMD_TERNARY");
+    if (no_simd != nullptr && no_simd[0] == '1') g_tern_rows_fn = fwd_ternary_rows_scalar;
     // otherwise: scalar (already the default)
 }
 
@@ -61,6 +90,11 @@ void init_simd_dispatch() {
 I8ForwardFn simd_selected_fn() {
     init_simd_dispatch();
     return g_i8_fn;
+}
+
+TernaryRowsFn ternary_rows_selected_fn() {
+    init_simd_dispatch();
+    return g_tern_rows_fn;
 }
 
 // ===========================================================================
@@ -173,6 +207,48 @@ void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
                           int64_t out_dim, int64_t in_dim) {
     init_simd_dispatch();
     g_i8_fn(W_i8, scales, x, y, out_dim, in_dim);
+}
+
+void bitlinear_forward_rows_simd(const uint8_t* W_packed, const float* scales,
+                                 const float* x, float* y,
+                                 int64_t out_dim, int64_t in_dim) {
+    init_simd_dispatch();
+    g_tern_rows_fn(W_packed, scales, x, y, out_dim, in_dim);
+}
+
+// Scalar reference for the PACKED TERNARY per-row dot — the bit-exactness
+// baseline (tests A/B against it; OMNISEED_NO_SIMD_TERNARY=1 forces it).
+//
+// Canonical accumulation order shared with the SSE4.1/AVX2 kernels in
+// bitlinear_avx2.cpp so all three are byte-identical on every host:
+//   * lane j (0..7) accumulates w*x for weight indices c ≡ j (mod 8), in
+//     increasing c — 8 independent fp32 accumulators.
+//   * the horizontal sum is the exact AVX2 tree:
+//         ((l0+l4)+(l2+l6)) + ((l1+l5)+(l3+l7))
+//   * w*x is exact in IEEE (w ∈ {-1,0,+1}); only the lane additions round,
+//     in the same order in every kernel.
+// Weight-index addressing (wi>>1, wi&1) makes this fully general, including
+// odd in_dim where rows start mid-byte.
+void fwd_ternary_rows_scalar(const uint8_t* W_packed, const float* scales,
+                             const float* x, float* y,
+                             int64_t out_dim, int64_t in_dim) {
+    for (int64_t r = 0; r < out_dim; ++r) {
+        const int64_t wbase = r * in_dim;
+        float l[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int64_t c = 0; c < in_dim; ++c) {
+            const int64_t wi = wbase + c;
+            const uint8_t b = W_packed[static_cast<size_t>(wi >> 1)];
+            const int8_t nib = (wi & 1) ? static_cast<int8_t>(b >> 4)
+                                        : static_cast<int8_t>(b & 0x0F);
+            const float wf = (nib == 1) ? 1.0f : (nib == 15) ? -1.0f : 0.0f;
+            l[c & 7] += wf * x[c];
+        }
+        const float a04 = l[0] + l[4];
+        const float a26 = l[2] + l[6];
+        const float a15 = l[1] + l[5];
+        const float a37 = l[3] + l[7];
+        y[r] = ((a04 + a26) + (a15 + a37)) * scales[r];
+    }
 }
 
 // scalar reference used as the baseline impl (and by tests)

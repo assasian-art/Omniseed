@@ -962,6 +962,55 @@ static void test_memory_crystals_and_streaming() {
 }
 
 // ===========================================================================
+// Phase 13: packed-ternary SIMD kernels must be byte-identical to the
+// canonical scalar (same 8-lane accumulation order in every kernel).
+// ===========================================================================
+static void test_ternary_simd_bitexact() {
+    TEST("bitnet: packed-ternary SIMD == scalar, byte-identical (all dims)");
+    static uint64_t s = 0x5eed13f7u;
+    auto next = []() {   // SplitMix64 — same deterministic stream everywhere
+        s += 0x9e3779b97f4a7c15ull;
+        uint64_t z = s;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    };
+    auto pick = [&next]() {   // ~40% sparse like real converted rows
+        const uint64_t r = next() % 10;
+        return r < 4 ? static_cast<int8_t>(0)
+             : r < 7 ? static_cast<int8_t>(1)
+                     : static_cast<int8_t>(-1);
+    };
+
+    // dims: tiny, non-multiple-of-8, multiple-of-8, large-ish, odd in_dim
+    const int64_t dims[][2] = {{2, 2}, {5, 7}, {17, 24}, {64, 96},
+                               {33, 77}, {256, 768}};
+    for (const auto& d : dims) {
+        const int64_t out_dim = d[0], in_dim = d[1];
+        std::vector<int8_t> ternary(static_cast<size_t>(out_dim * in_dim));
+        for (auto& w : ternary) w = pick();
+        std::vector<uint8_t> packed(bitnet::pack_ternary_packed_bytes(
+            out_dim * in_dim));
+        bitnet::pack_ternary(ternary.data(), out_dim * in_dim, packed.data());
+
+        std::vector<float> x(static_cast<size_t>(in_dim));
+        for (auto& v : x) v = static_cast<float>(next() % 2000 - 1000) / 64.0f;
+        std::vector<float> scales(static_cast<size_t>(out_dim));
+        for (auto& v : scales) v = static_cast<float>(next() % 1000) / 997.0f;
+
+        std::vector<float> y_scalar(static_cast<size_t>(out_dim), 0.0f);
+        std::vector<float> y_simd(static_cast<size_t>(out_dim), 0.0f);
+        bitnet::fwd_ternary_rows_scalar(packed.data(), scales.data(), x.data(),
+                                        y_scalar.data(), out_dim, in_dim);
+        bitnet::bitlinear_forward_rows_simd(packed.data(), scales.data(),
+                                            x.data(), y_simd.data(),
+                                            out_dim, in_dim);
+        CHECK(std::memcmp(y_scalar.data(), y_simd.data(),
+                          static_cast<size_t>(out_dim) * sizeof(float)) == 0);
+    }
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 int main() {
@@ -978,6 +1027,7 @@ int main() {
     test_tensor_softmax_and_inplace_exp();
     test_ternary_pack_roundtrip();
     test_ternary_matmul();
+    test_ternary_simd_bitexact();
     test_bitlinear_train_step();
     test_gguf_magic();
     test_fft_matches_dft();

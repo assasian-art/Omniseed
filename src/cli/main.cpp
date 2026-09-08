@@ -81,6 +81,8 @@ void print_usage() {
         "  --max-tokens N   generation budget (default 160)\n"
         "  --temperature T  sampling temperature, 0 = greedy (default 0)\n"
         "  --top-k K        keep K highest-probability tokens (0 = all)\n"
+        "  --repeat-penalty P  penalize recently generated tokens (1.15-1.25\n"
+        "                      breaks loops; 1.0 = off, default 1.0)\n"
         "  --seed S         sampling seed, deterministic per seed\n"
         "  --quiet          suppress info logs\n");
 }
@@ -510,6 +512,7 @@ struct Session {
     int32_t max_tokens = 160;
     float temperature = 0.0f;   // 0 => greedy
     int32_t top_k = 0;
+    float repeat_penalty = 1.0f; // 1.0 = off
     uint64_t seed = 42;
     std::string prompt;
     std::string eval_file;      // ppl: corpus file (else --prompt text)
@@ -605,6 +608,7 @@ int cmd_gen(Session& s) {
     cfg.allow_tools = false;
     cfg.temperature = s.temperature;
     cfg.top_k = s.top_k;
+    cfg.repeat_penalty = s.repeat_penalty;
     cfg.seed = s.seed;
     static ToolRegistry dummy;
     static MemoryCrystals mem;
@@ -752,6 +756,7 @@ int cmd_chat(Session& s) {
     cfg.max_new_tokens = s.max_tokens;
     cfg.temperature = s.temperature;
     cfg.top_k = s.top_k;
+    cfg.repeat_penalty = s.repeat_penalty;
     // Streaming: print each piece as it is decoded, then finish the line
     // after generation completes (Result.reply holds the same text).
     cfg.on_token = [](const std::string& piece) {
@@ -801,6 +806,8 @@ int main(int argc, char** argv) {
             s.temperature = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--top-k" && i + 1 < argc)
             s.top_k = std::atoi(argv[++i]);
+        else if (a == "--repeat-penalty" && i + 1 < argc)
+            s.repeat_penalty = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--seed" && i + 1 < argc)
             s.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];

@@ -446,8 +446,8 @@ void RwkvModel::project(const Tensor& W, const Tensor& scales,
                                          out_dim, in_dim);
             return;
         }
-        bitnet::bitlinear_forward_rows(W.packed(), scales.f32(), x, y,
-                                       out_dim, in_dim);
+        bitnet::bitlinear_forward_rows_simd(W.packed(), scales.f32(), x, y,
+                                            out_dim, in_dim);
         return;
     }
     bitnet::bitlinear_forward(W.packed(), nullptr, scalar_scale, x, y,
@@ -723,8 +723,10 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
     const double p_head = dbg_prof() ? platform::now_ms() : 0.0;
     if (head_ternary_) {
         if (head_scales_.numel() == V_out) {
-            bitnet::bitlinear_forward_rows(head_.packed(), head_scales_.f32(),
-                                           xl3.f32(), logits.f32(), V_out, E);
+            bitnet::bitlinear_forward_rows_simd(head_.packed(),
+                                                head_scales_.f32(),
+                                                xl3.f32(), logits.f32(),
+                                                V_out, E);
         } else {
             bitnet::bitlinear_forward(head_.packed(), nullptr, head_scale_,
                                       xl3.f32(), logits.f32(), V_out, E);

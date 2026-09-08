@@ -192,6 +192,13 @@ public:
         float    temperature    = 0.0f;
         int32_t  top_k          = 0;
         uint64_t seed           = 42;
+        // Repetition penalty (Phase 13): after each forward, tokens present
+        // in the last `repeat_window` generated tokens get their logit
+        // divided by repeat_penalty when positive (multiplied when negative)
+        // — the CTRL-style suppression that breaks text loops on the QAT
+        // ternary model. 1.0 = disabled (default).
+        float    repeat_penalty = 1.0f;
+        int32_t  repeat_window  = 64;
         // Streaming: invoked per decoded piece during generate() (chat UI).
         // nullptr = buffered (default). Must not throw.
         std::function<void(const std::string&)> on_token;
