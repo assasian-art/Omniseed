@@ -17,11 +17,13 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-13 — QAT round-2 runtime pass (uncommitted): packed-
-  ternary SIMD kernels (SSE4.1/AVX2, bit-exact vs scalar, 29× on the QAT
-  model: 0.6 → 17.4 tok/s) + CTRL-style repetition penalty
-  (`--repeat-penalty`, breaks the QAT model's wikitext loops). 206/206 +
-  13/13 + 17/17, QAT-model RSS 115 MB.
+- **Last updated:** PHASE-13 close-out (all committed): packed-ternary SIMD
+  kernels (SSE4.1/AVX2, bit-exact vs scalar, 29× on the QAT model: 0.6 →
+  17.4 tok/s) + CTRL-style repetition penalty (`--repeat-penalty`, breaks
+  the QAT model's wikitext loops), dispatch hardening
+  (`OMNISEED_FORCE_SSE4_TERNARY`, `omniseed_qat_ternary` A/B ctest) and
+  per-request penalty on the server (`/gen` + `/ask`). ctest **4/4**
+  (206 + 13 + 17 + 8), QAT-model RSS 115 MB.
 
 ---
 
@@ -564,7 +566,8 @@ sanitize the remote URL — the session token lives only in shell commands).
   (2× round-1 context). Colab round-2 recipe in `tools/COLAB_QAT.md`
   (target 12000 steps, chunk loop, Drive restore/save).
 
-### Phase 13 TASK 2 — Ternary runtime: SIMD kernels + repetition penalty (UNCOMMITTED)
+### Phase 13 TASK 2 — Ternary runtime: SIMD kernels + repetition penalty
+### (committed: 73e4356)
 
 Two runtime gaps stood between the round-2 GGUF and a usable model:
 the ternary per-row dot ran scalar-only (0.6 tok/s), and even a good
@@ -601,19 +604,49 @@ ternary model loops without repetition suppression.
   `--repeat-penalty 1.2` → loop broken, coherent continuation at
   19.5 tok/s (no measurable overhead).
 
-### Verification (Phase 12/13)
-- ctest **3/3**: `omniseed_platform` **206/206** (was 200; +6 from the
-  ternary bit-exactness A/B), `omniseed_real_weights` **13/13** (greedy
-  continuation unchanged), `omniseed_sides` **17/17**.
-- QAT model: 114.9–115.1 MB RSS at 17.4–19.5 tok/s.
+### Phase 13 TASK 2b — dispatch hardening (committed: c1eb2f0)
+
+- **`bitnet::force_ternary_kernel(TernaryKernel{Auto,Scalar,Sse41,Avx2})`**
+  — explicit per-call kernel pick for tests/bench (an explicit pick wins
+  over both env vars; non-x86 hosts no-op the SIMD picks). New env
+  **`OMNISEED_FORCE_SSE4_TERNARY=1`** forces the SSE4.1 ternary kernel even
+  on AVX2 hosts (first-init; joins `OMNISEED_NO_SIMD_TERNARY=1`).
+- **New ctest `omniseed_qat_ternary`** (`tests/test_qat_ab.cpp`, 8 checks):
+  loads the real QAT model, greedy-generates 24 tokens from "Hello" under
+  each forced kernel, asserts **byte-identical continuations across
+  scalar/SSE4.1/AVX2 in one process** (verified on this AVX2 box; trivially
+  identical on non-x86 CI), + RSS budget check. Skips cleanly when the QAT
+  GGUF is absent. Also verified end-to-end through the CLI: gen output
+  identical under both env forces.
+
+### Phase 13 TASK 2c — server exposure (committed: 43b3135)
+
+- `AgentLoop::set_sampling(repeat_penalty, repeat_window)`; `POST /gen` and
+  `POST /ask` accept optional `"repeat_penalty"` (default 1.0 = off) and
+  `"repeat_window"` (default 64). The serialized server makes per-request
+  sets race-free; **absent fields revert to the defaults, so each request
+  is self-contained** (verified live: penalty 1.2 breaks the loop, the next
+  request without the field loops again).
+- Docs: MASTER_SPEC CLI table row + server contract note + Verification
+  section; DEPLOYMENT.md endpoint table.
+
+### Verification (Phase 12/13 close-out)
+- ctest **4/4**: `omniseed_platform` **206/206**, `omniseed_real_weights`
+  **13/13**, `omniseed_sides` **17/17**, `omniseed_qat_ternary` **8/8**
+  (three full QAT-model generations, 35 s).
+- Gen smoke `--repeat-penalty 1.2` (QAT model): loop broken, coherent,
+  **16.4 tok/s, peak 115.1 MB**.
+- Server live check: `/health` `{model:true,peak_rss:115}`; `/gen` with
+  `"repeat_penalty":1.2` coherent vs looping default; `/ask` with penalty OK.
 
 ### NEXT STEPS (updated)
-1. **Commit this Phase 13 TASK 2 pass** (ternary SIMD + repetition penalty
-   + tests + this state file).
-2. **Round-2 QAT run to completion** (Colab, 12000 steps, ~13 h) — the
-   repetition penalty is a stopgap; KD + TinyStories is the real fix.
-   Resume: `tools/qat_watch.bat` locally or the R2 chunk loop in
-   `tools/COLAB_QAT.md`.
-3. Parallel-scan WKV verify kernel (would flip speculative decoding from
+1. **Round-2 QAT run to completion** (Colab, 12000 steps, ~13 h) — **USER-
+   TRIGGERED manually on Colab; do not start locally.** The repetition
+   penalty is a stopgap; KD + TinyStories is the real fix. Recipe: the R2
+   chunk loop in `tools/COLAB_QAT.md`; restore `models/qat_ckpt.pt` from
+   Drive (Cell R1).
+2. Parallel-scan WKV verify kernel (would flip speculative decoding from
    refused to profitable) — unchanged from PHASE-OMEGA.
-4. Whisper decoder + FocalCodec codebooks — unchanged (see §3).
+3. Whisper decoder + FocalCodec codebooks — unchanged (see §3).
+4. Optional: browser console (`GET /`) could expose a penalty slider once
+   round-2 lands and the default model becomes ternary.
