@@ -46,8 +46,15 @@
 #  wikitext+tinystories interleaves TinyStories 50/50 for narrative diversity;
 #  --lr + --cosine-start restart the cosine schedule (e.g. 2e-4 @ step 4000)
 #  while resuming models/qat_ckpt.pt.
+#
+#  Round 2b (calm recipe): --resume-best restarts from the TRACKED BEST
+#  masters (<ckpt>-best.pt) instead of the checkpoint's current masters —
+#  AdamW moments are reset (no hot-optimizer momentum carries over) while the
+#  global step and best record are kept. Use after a too-hot LR run; recipe
+#  in tools/COLAB_QAT.md.
 # =============================================================================
 import argparse
+import collections
 import math
 import os
 import random
@@ -538,6 +545,11 @@ def main():
                     help='restart the cosine schedule at this global step '
                          '(round-2: --lr 2e-4 --cosine-start 4000 while '
                          'resuming; 0 = the original schedule exactly)')
+    ap.add_argument('--resume-best', action='store_true',
+                    help='on resume, start from the TRACKED BEST masters '
+                         '(<ckpt>-best.pt) instead of the current masters; '
+                         'AdamW moments are RESET, global step + best record '
+                         'are kept (calm-recipe restart after a hot LR)')
     ap.add_argument('--kd-weight', type=float, default=0.0,
                     help='knowledge-distillation weight toward the FROZEN '
                          'bf16-master teacher, soft-target KL with T^2 '
@@ -644,6 +656,23 @@ def main():
                 'step': ck.get('best_step', -1)}
         print(f'[qat] resumed from {args.ckpt} (global step {global_step}, '
               f'best val ppl {best["ppl"]:.2f})')
+        if args.resume_best:
+            best_path = args.ckpt.replace('.pt', '-best.pt')
+            if os.path.exists(best_path):
+                bb = torch.load(best_path, map_location='cpu',
+                                weights_only=True)
+                with torch.no_grad():
+                    for n, t_ in bb.items():
+                        model.masters[n].copy_(t_)
+                print(f'[qat] resumed from best @ step {best["step"]}, '
+                      f'PPL {best["ppl"]:.2f} (AdamW moments reset)')
+            else:
+                print(f'[qat] WARNING: --resume-best requested but '
+                      f'{best_path} not found; continuing from current '
+                      f'masters (AdamW moments still reset)')
+            # Fresh AdamW moments either way: momentum/variance from the hot
+            # run must not drive the calm-LR restart.
+            optimizer.state = collections.defaultdict(dict)
 
     def log_line(text):
         print(text, flush=True)
@@ -780,11 +809,14 @@ def main():
             total_loss = total_loss + loss
             state = [(S.detach(), a.detach(), f.detach()) for S, a, f in state]
         (total_loss / W).backward()
-        torch.nn.utils.clip_grad_norm_(model.master_list, args.clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.master_list,
+                                                   args.clip).item()
         optimizer.step()
         optimizer.zero_grad()
         model.end_window()
         global_step += 1
+        if global_step % 10 == 0:       # LR-health signal (calm-recipe tuning)
+            log_line(f'[qat] step {global_step} grad_norm={grad_norm:.3e}')
 
         if args.eval_every > 0 and (global_step % args.eval_every == 0
                                     or global_step >= args.steps):

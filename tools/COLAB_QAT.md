@@ -204,6 +204,67 @@ stays the daily default.
 
 ---
 
+# ROUND 2b — the calm recipe (resume from BEST, cool LR)
+
+Round-2 reality (T4, chunk loop hit the GPU quota at step 4326): val PPL
+oscillated 176–624 after an early best of **159.15 @ step 600** (lr 2e-4) —
+diagnosis: **the LR was too hot** for a resumed cosine restart, so the run
+kept bouncing out of the good basin it found in the first few hundred steps.
+The good news: `qat_ckpt-best.pt` still holds those step-600 masters.
+
+`--resume-best` restarts from that tracked-best snapshot instead of the hot
+step-4326 masters. On resume it: loads `<ckpt>-best.pt` over the current
+masters, **RESETS the AdamW moments** (no leftover momentum/variance from the
+hot run drives the restart), and keeps the global step + best record so the
+cosine anchor and best tracking stay consistent. It prints
+`resumed from best @ step N, PPL X.XX` when it engages.
+
+## Cell C1 — the calm chunk loop (from the Drive-restored checkpoint)
+
+```python
+%%bash
+STEPS=12000            # same target; the checkpoint keeps global step 4326
+for i in $(seq 1 48); do
+  python -u tools/qat_ternary.py --device cuda \
+      --corpus wikitext+tinystories \
+      --resume-best --lr 5e-5 --kd-weight 0.5 --kd-temp 2.0 \
+      --window 32 --batch 16 \
+      --steps $STEPS --eval-every 100 --time-budget 3300 \
+      --ckpt models/qat_ckpt.pt
+  rc=$?
+  if [ $rc -eq 0 ]; then echo "ROUND-2B DONE"; break; fi
+  if [ $rc -ne 3 ]; then echo "FAILED rc=$rc"; exit $rc; fi
+  cp models/qat_ckpt.pt /content/drive/MyDrive/omniseed-qat/qat_ckpt.pt
+  cp models/qat_ckpt-best.pt \
+     /content/drive/MyDrive/omniseed-qat/qat_ckpt-best.pt 2>/dev/null || true
+  echo "chunk $i done: $(tail -1 qat_log.txt)"
+done
+tail -5 qat_log.txt
+```
+
+Why each knob is what it is:
+
+| Knob | Value | Why |
+|---|---|---|
+| `--resume-best` | (flag) | start from the 159.15@600 masters, not the hot 4326 ones; AdamW moments reset |
+| `--lr 5e-5` | ¼ of round-2's 2e-4 | stay inside the good basin instead of bouncing out of it; watch `grad_norm` in `qat_log.txt` (logged every 10 steps) — healthy ≈ 0.2–2, exploding = raise LR too high again |
+| `--kd-weight 0.5` | ½ of round-2's 1.0 | keep the bf16 teacher's soft targets stabilizing the student, but let the CE loss on real tokens dominate |
+| `--kd-temp 2.0` | unchanged | T=2 remains the sensible softening for a 65k vocab |
+| `--window 32 --batch 16` | same as round 2 | bigger context + batch was working; the LR was the problem, not the geometry |
+
+The cosine restart anchor moves with the checkpoint: `--cosine-start` is only
+needed when resuming with a *fresh* schedule; with `--resume-best` at lr 5e-5
+over the remaining 7,674 steps the default schedule (anchored at the stored
+global step, warmup 100) is already gentle. Expect a warmup dip for the first
+~100 steps while the fresh Adam moments re-calibrate — that's normal.
+
+Progress bar for success: **beat 159.15** first (proves the calm recipe), then
+**beat round-1's 136.70** (proves KD + TinyStories actually add on top).
+Every improvement is auto-saved to `qat_ckpt-best.pt` and the export (Cell R3)
+always ships the best masters.
+
+---
+
 ### Notes and knobs
 
 - `--batch 8 --window 32` defaults fit any Colab GPU (T4 and up) with huge
