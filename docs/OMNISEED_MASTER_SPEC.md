@@ -1,10 +1,11 @@
 # OmniSeed — Master Specification
 
-**Version:** 2.2 (Phase-Omega — grand unification: uncertainty, prefix snapshots, memory decay) · **Date:** 2026-09-07 ·
+**Version:** 2.3 (Phase-13B — round-2b QAT status: ternary path faster than i8; round-3 clean-QAT gate) · **Date:** 2026-09-09 ·
 **Language:** pure C++17
 **Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
-RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 115 MB on the
-ternary-QAT path**
+RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 114.7–115.4 MB on the
+ternary-QAT path at 26.3–28.6 tok/s — the packed-ternary SIMD path is now FASTER than the
+i8 default (19.2 tok/s)**
 
 OmniSeed is a self-improving, multi-modal **micro-LLM agent kernel** designed from the
 ground up for the 100–300 MB RAM frontier described in the seven project research
@@ -256,6 +257,11 @@ with model-less server smokes.
 
 **Benchmark (x64, MSVC Release, 0.1B model loaded):** 2.1 tok/s scalar →
 **19.2 tok/s** after AVX2 + i8 head (9.1×); peak RSS 202.8 → **155 MB**.
+**Ternary-QAT GGUF (round-2b):** **28.6 tok/s** bench / **26.3 tok/s** gen @
+`--repeat-penalty 1.2`, peak RSS **114.7 / 115.4 MB** — 2 weights/byte wins
+once the row dots are vectorized (packed-ternary SSE4.1/AVX2, bit-exact vs
+scalar). Quality is still QAT-bound (see §9.1): the i8 model remains the
+daily default until round-3 QAT clears the PPL gate.
 `omniseed bench --model M` reproduces; `omniseed ppl --model M --eval-file F.txt`
 gives cross-entropy perplexity (PPL ≈ 33 on in-repo markdown, i8 head).
 
@@ -321,10 +327,19 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
 
 ## 9. Known Limitations & Roadmap
 
-1. **True ternary at quality** — the runtime's ternary path is fully functional and
-   full-scale QAT runs (wikitext-103, resumable chunks; trajectory in `qat_log.txt`:
-   bf16 31.16 → PTQ 257,402 → 538.85 @ step 200, falling); reaching the ≤1.25×
-   target needs the remaining ~3,800 steps (~13 h CPU) via `tools/qat_watch.bat`.
+1. **True ternary at quality** — the runtime's ternary path is fully functional,
+   SIMD-vectorized and now FASTER than i8 (**28.6 tok/s bench / 26.3 tok/s gen
+   @ penalty 1.2, 114.7/115.4 MB RSS**), but the round-2/2b QAT masters still
+   regurgitate in-repo markdown + wikitext fragments: the master chain inherited
+   PoC-markdown memorization from its Phase-8 fine-tune, and the tracked best
+   froze early (**best@600, PPL 159.15**; round-1 best 136.70) while the hot lr
+   2e-4 oscillated 176–624 — PPL ~136–160 ≫ the ~39 target. **The runtime is
+   NOT at fault** (bit-exact kernels, deterministic greedy, penalty controls the
+   loop symptom). Fix = **round-3 clean QAT**: fresh PTQ init, no resume,
+   wikitext+tinystories, lr 1e-4, kd 1.0, W32 B32, 12k steps, export only at
+   val PPL ≤ 60 (recipe + `--resume-best`/grad-norm tooling in
+   `tools/qat_ternary.py` / `tools/COLAB_QAT.md`). Until then the i8 model
+   stays the daily default.
 2. **Whisper decoder language coverage** — end-to-end greedy ASR works in pure C++
    (silence → EOT verified; real MHA encoder feeds real cross-attention); true
    speech transcripts need audio test fixtures and optional timestamp handling.

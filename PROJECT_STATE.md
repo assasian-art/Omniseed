@@ -17,13 +17,17 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-13 close-out (all committed): packed-ternary SIMD
-  kernels (SSE4.1/AVX2, bit-exact vs scalar, 29× on the QAT model: 0.6 →
-  17.4 tok/s) + CTRL-style repetition penalty (`--repeat-penalty`, breaks
-  the QAT model's wikitext loops), dispatch hardening
-  (`OMNISEED_FORCE_SSE4_TERNARY`, `omniseed_qat_ternary` A/B ctest) and
-  per-request penalty on the server (`/gen` + `/ask`). ctest **4/4**
-  (206 + 13 + 17 + 8), QAT-model RSS 115 MB.
+- **Last updated:** PHASE-13B (all committed): round-2b QAT status — ternary
+  GGUF bench **28.6 tok/s**, gen **26.3 tok/s** @ penalty 1.2, peak RSS
+  **114.7/115.4 MB** (the SIMD ternary path is now FASTER than the i8
+  default's 19.2 tok/s); calm-recipe tooling shipped (`--resume-best`,
+  grad-norm logging every 10 steps, COLAB_QAT round-2b section, commit
+  4b7ea2b). Diagnosis: the exported masters regurgitate in-repo markdown +
+  wikitext fragments — inherited PoC-markdown memorization + an early
+  best@600; PPL 136–160 ≫ the ~39 target — **the runtime is NOT at fault**.
+  Next: **round-3 clean QAT** (fresh PTQ init, no resume, lr 1e-4, kd 1.0,
+  W32 B32, 12k steps, export gate val PPL ≤ 60); i8 stays daily default
+  until then. See §8.
 
 ---
 
@@ -650,3 +654,54 @@ ternary model loops without repetition suppression.
 3. Whisper decoder + FocalCodec codebooks — unchanged (see §3).
 4. Optional: browser console (`GET /`) could expose a penalty slider once
    round-2 lands and the default model becomes ternary.
+
+---
+
+## 8. PHASE-13B — ROUND-2b QAT STATUS (2026-09-09)
+
+### Round-2b results (this box, ternary QAT GGUF)
+
+- Context: the round-2 Colab run hit the GPU quota at step 4326; best
+  **159.15 @ step 600** (lr 2e-4), PPL oscillated 176–624 afterwards. That
+  diagnosis (lr too hot) produced the calm-recipe tooling (commit 4b7ea2b):
+  `--resume-best` (tracked-best masters + AdamW-moment reset, global step +
+  best kept), grad-norm logging every 10 steps in `qat_log.txt`, and the
+  ROUND 2b section in `tools/COLAB_QAT.md`.
+- **Bench: 28.6 tok/s** on the ternary QAT GGUF; **gen 26.3 tok/s @
+  repeat-penalty 1.2**; peak RSS **114.7 / 115.4 MB** (bench/gen). The
+  packed-ternary SIMD path is now **FASTER than the i8 default's 19.2
+  tok/s** — 2 weights/byte wins once the row dots are vectorized.
+- `--verify-batch` remains exact after the round-2b tool changes
+  (`max|dlogits|=0.00e+00 max|dstate|=0.00e+00`); zero C++ changes.
+
+### Diagnosis — why the exported masters still regurgitate
+
+The QAT GGUF regurgitates in-repo markdown + wikitext fragments:
+
+1. **Inherited memorization:** the master chain was first fine-tuned on the
+   PoC in-repo markdown corpus (Phase 8 TASK 3); every later resume
+   (round 1 → round 2 → round 2b) inherits those weights, so the memorized
+   fragments keep resurfacing in generation.
+2. **Early best @600:** the tracked best froze at step 600 (PPL 159.15) —
+   the hot 2e-4 LR kept bouncing out of that good basin, so the remaining
+   ~3,700 steps added nothing durable (grad-norm ≈ 4.8e+02 from the hot
+   masters vs ≈ 1.9e+01 from the best masters).
+3. **PPL ~136–160 ≫ the ~39 target** (≤1.25× bf16): quality simply is not
+   there yet.
+4. **The runtime is NOT at fault:** greedy output is deterministic, the
+   SIMD kernels are bit-exact across scalar/SSE4.1/AVX2 (proven on this
+   exact model, `omniseed_qat_ternary` 8/8), and the repetition penalty
+   controls the looping symptom at full speed. What remains is
+   training-domain, not inference-domain.
+
+### NEXT STEPS (current — supersedes the §3 and §7 lists)
+
+1. **Round-3 clean QAT** — USER-triggered on Colab; do NOT start locally:
+   fresh PTQ init, **no resume** (breaks the inherited-memorization chain),
+   `--corpus wikitext+tinystories`, **lr 1e-4**, **kd-weight 1.0**,
+   **window 32, batch 32**, 12k steps, and **export only at val PPL ≤ 60**.
+2. **Until round-3 lands: the i8 default model stays the daily default**;
+   the QAT ternary GGUF remains the speed/footprint demonstrator (28.6
+   tok/s @ ~115 MB) with `--repeat-penalty 1.2` for loop-free demos.
+3. Pending (unchanged): **FocalCodec codebooks**, **LoRA
+   assistant-behavior pass**, **Render live deploy**.
