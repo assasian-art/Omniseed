@@ -42,6 +42,9 @@ qat_log.txt
 *.obj
 *.pdb
 
+# Regenerated docs (tools/md2html.py docs/OMNISEED_MASTER_SPEC.md)
+docs/OMNISEED_MASTER_SPEC.html
+
 # Local runtime state (memory crystals, skills, fingerprints)
 state/
 
