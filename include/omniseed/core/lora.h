@@ -23,6 +23,8 @@
 #include "omniseed/core/gguf_loader.h"
 #include "omniseed/core/tensor.h"
 
+#include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +61,18 @@ public:
     // callers check numel() before applying.
     Factors factors(int32_t layer, LoraTarget target) const;
 
+    // Hot-path entry: batch-converted fp32 copies of A [rank, in] and
+    // B [out, rank] (half→float is exact, so the live math is bit-identical
+    // to apply_lora while skipping ~660k half_to_float calls per token).
+    // hot_entry() returns nullptr for an untargeted pair; callers must check.
+    struct HotEntry {
+        std::unique_ptr<float[]> a32;   // fp32 copy of A [rank, in_dim]
+        std::unique_ptr<float[]> b32;   // fp32 copy of B [out_dim, rank]
+        int64_t rank = 0;
+        int64_t out  = 0;
+    };
+    const HotEntry* hot_entry(int32_t layer, LoraTarget target) const;
+
     // y[i] += scaling * sum_j B[i,j] * (A[j]·x)
     //   B [out, rank] f16, A [rank, in_dim] f16 — plain fp32 math, no SIMD
     //   needed (rank*2 reads per output vs the ternary base's in_dim).
@@ -74,6 +88,12 @@ private:
     float   scaling_     = 1.0f;
     bool    valid_       = false;
     std::string error_;
+
+    // Hot-path cache: [layer][target] → converted fp32 factors; built once
+    // after a successful load (untargeted pairs store rank == 0).
+    std::vector<std::array<HotEntry, 6>> hot_;
+
+    void build_hot_cache();
 };
 
 } // namespace omniseed

@@ -43,6 +43,7 @@ bool LoraAdapter::load(const std::string& path) {
         return false;
     }
     valid_ = true;
+    build_hot_cache();
     return true;
 }
 
@@ -71,6 +72,44 @@ LoraAdapter::Factors LoraAdapter::factors(int32_t layer,
         f.b = store_.tensor(prefix + ".b");
     }
     return f;
+}
+
+// ---------------------------------------------------------------------------
+// Hot-path cache: per (layer, target), keep batch-converted fp32 copies of A
+// and B. Built once at load; forward() then costs zero string work and zero
+// half_to_float calls per token (half→float is exact, so the live math is
+// bit-identical to the f16-view version).
+// ---------------------------------------------------------------------------
+void LoraAdapter::build_hot_cache() {
+    hot_.clear();
+    for (int32_t l = 0; l < layer_count_; ++l) hot_.emplace_back();
+    for (int32_t l = 0; l < layer_count_; ++l) {
+        for (int t = 0; t < 6; ++t) {
+            const auto target = static_cast<LoraTarget>(t);
+            const Factors f = factors(l, target);
+            HotEntry& e = hot_[static_cast<size_t>(l)][static_cast<size_t>(t)];
+            if (f.a.numel() == 0 || f.b.numel() == 0) continue;   // untargeted
+            const int64_t r    = f.a.dim(0);
+            const int64_t nin  = f.a.dim(1);
+            const int64_t nout = f.b.dim(0);
+            e.rank = r;
+            e.out  = nout;
+            e.a32 = std::make_unique<float[]>(static_cast<size_t>(r * nin));
+            e.b32 = std::make_unique<float[]>(static_cast<size_t>(nout * r));
+            for (int64_t i = 0; i < r * nin; ++i)
+                e.a32[static_cast<size_t>(i)] = half_to_float(f.a.f16()[i]);
+            for (int64_t i = 0; i < nout * r; ++i)
+                e.b32[static_cast<size_t>(i)] = half_to_float(f.b.f16()[i]);
+        }
+    }
+}
+
+const LoraAdapter::HotEntry* LoraAdapter::hot_entry(int32_t layer,
+                                                    LoraTarget target) const {
+    if (layer < 0 || layer >= layer_count_) return nullptr;
+    const HotEntry& e =
+        hot_[static_cast<size_t>(layer)][static_cast<size_t>(target)];
+    return (e.rank > 0 && e.a32 && e.b32) ? &e : nullptr;
 }
 
 void LoraAdapter::apply_lora(const Tensor& B, const Tensor& A, float scaling,

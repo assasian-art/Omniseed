@@ -5,9 +5,17 @@
 //    GET  /               -> one-page HTML demo console (talks to /gen)
 //    GET  /health         -> {"ok":true,"model":bool,"peak_rss":MB}
 //    POST /ask            -> one agent turn (json body: {"task": "...",
-//                           "repeat_penalty": 1.2, "repeat_window": 64})
+//                           "repeat_penalty": 1.2, "repeat_window": 64,
+//                           "assistant_lora": "path/to/sidecar.gguf"})
 //    POST /gen            -> raw generation (json body: {"prompt": "...",
-//                           "repeat_penalty": 1.2, "repeat_window": 64})
+//                           "repeat_penalty": 1.2, "repeat_window": 64,
+//                           "assistant_lora": "path/to/sidecar.gguf"})
+//
+//  Assistant-behavior LoRA: attach a sidecar at startup with
+//  --assistant-lora P (or OMNISEED_ASSISTANT_LORA), or swap it per request
+//  with the "assistant_lora" JSON field. The serialized request loop makes
+//  per-request swaps race-free; a load/geometry failure logs an error and
+//  detaches (requests keep serving the base model).
 //
 //  Deployment target: Render/Docker (see docs/DEPLOYMENT.md).
 // =============================================================================
@@ -212,20 +220,62 @@ document.getElementById('f').addEventListener('submit', async e => {
 </html>)HTML";
 }
 
+// Current LoRA attachment (server is serialized, so one global is race-free).
+LoraAdapter* server_lora = nullptr;
+std::string  server_lora_path;
+
+// Attach a LoRA sidecar to the model, or detach it. Returns true when a
+// sidecar is now attached; logs (never throws) on failure.
+bool set_server_lora(RwkvModel& model, LoraAdapter*& lora,
+                     const std::string& path) {
+    if (path.empty()) {              // explicit empty = detach
+        if (lora) platform::log_info("assistant LoRA detached");
+        model.set_lora(nullptr);
+        delete lora;
+        lora = nullptr;
+        return false;
+    }
+    if (lora && server_lora_path == path) return true;   // already attached
+    if (lora) { model.set_lora(nullptr); delete lora; lora = nullptr; }
+    lora = new LoraAdapter();
+    const int32_t nl = static_cast<int32_t>(model.config().n_layers);
+    const int32_t ne = static_cast<int32_t>(model.config().n_embd);
+    if (!lora->load(path) || lora->layer_count() != nl
+        || lora->n_embd() != ne) {
+        platform::log_error(
+            "assistant LoRA load failed (%s) — serving WITHOUT it",
+            lora->valid() ? "geometry mismatch vs base model"
+                          : lora->error().c_str());
+        delete lora;
+        lora = nullptr;
+        return false;
+    }
+    model.set_lora(lora);
+    server_lora_path = path;
+    platform::log_info("assistant LoRA attached: %s (rank %d, scaling %.2f)",
+                       path.c_str(), lora->rank(), lora->scaling());
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     platform::enable_utf8_console();   // Windows codepage 65001; no-op elsewhere
     int port = kPort;
     std::string model_path = "./models/omniseed.gguf";
+    std::string lora_path;
     // Documented deployment env (see Dockerfile): OMNISEED_MODEL is the
     // fallback default; an explicit --model flag wins.
     if (const char* env = std::getenv("OMNISEED_MODEL")) model_path = env;
+    if (const char* env = std::getenv("OMNISEED_ASSISTANT_LORA"))
+        lora_path = env;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc)
             model_path = argv[++i];
+        else if (std::strcmp(argv[i], "--assistant-lora") == 0 && i + 1 < argc)
+            lora_path = argv[++i];
     }
 
 #ifdef _WIN32
@@ -278,6 +328,10 @@ int main(int argc, char** argv) {
     if (!have_model) {
         platform::log_warn("model not loaded: %s — /health only",
                            model.error().c_str());
+    } else if (!lora_path.empty()) {
+        // Startup attachment (--assistant-lora P or OMNISEED_ASSISTANT_LORA):
+        // attach before the request loop so every generation honors it.
+        set_server_lora(model, server_lora, lora_path);
     }
 
     ToolRegistry tools;
@@ -321,6 +375,8 @@ int main(int argc, char** argv) {
         } else if (path == "/health") {
             std::string b = std::string("{\"ok\":true,\"model\":") +
                             (have_model ? "true" : "false") +
+                            ",\"assistant_lora\":" +
+                            (server_lora ? "true" : "false") +
                             ",\"peak_rss\":" +
                             std::to_string(platform::peak_rss_bytes() / 1048576) +
                             "}";
@@ -333,6 +389,13 @@ int main(int argc, char** argv) {
             loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),
                               static_cast<int32_t>(
                                   json_num_field(body, "repeat_window", 64.0f)));
+            // Optional per-request assistant LoRA (Phase 14): absent field
+            // leaves the current attachment untouched (startup flag/env still
+            // applies); "" detaches for this request's identity.
+            const std::string want = json_field(body, "assistant_lora");
+            if (!want.empty() || body.find("\"assistant_lora\"")
+                                 != std::string::npos)
+                set_server_lora(model, server_lora, want);
             const AgentLoop::Result r = loop.run(task);
             respond(client, "{\"reply\":\"" + r.reply + "\"}");
         } else if (path == "/gen" && method == "POST" && have_model) {
@@ -340,6 +403,10 @@ int main(int argc, char** argv) {
             loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),
                               static_cast<int32_t>(
                                   json_num_field(body, "repeat_window", 64.0f)));
+            const std::string want = json_field(body, "assistant_lora");
+            if (!want.empty() || body.find("\"assistant_lora\"")
+                                 != std::string::npos)
+                set_server_lora(model, server_lora, want);
             auto ids = tok.encode_chat(prompt);
             RwkvState st;
             model.init_state(st);

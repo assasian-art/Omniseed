@@ -468,10 +468,31 @@ void RwkvModel::apply_targeted(int32_t l, LoraTarget target,
                                const float* x, float* y,
                                int64_t out_dim, int64_t in_dim) const {
     if (lora_ == nullptr) return;
-    const LoraAdapter::Factors f = lora_->factors(l, target);
-    if (f.a.numel() == 0 || f.b.numel() == 0) return;   // untargeted pair
-    LoraAdapter::apply_lora(f.b, f.a, lora_->scaling(), x, y,
-                            out_dim, in_dim);
+    // Hot path: cached fp32 A/B (converted once at load — half→float is
+    // exact, so identical math) — no string-built lookups, no half_to_float
+    // per token. Detached (nullptr) stays the zero-cost path. A·x is
+    // hoisted: O(in·rank + out·rank) per linear.
+    const LoraAdapter::HotEntry* e = lora_->hot_entry(l, target);
+    if (e == nullptr) return;                           // untargeted pair
+    const int64_t r = e->rank;
+
+    float z[256];                                       // rank ≤ 256 on the stack
+    std::vector<float> zheap;
+    if (r > 256) zheap.assign(static_cast<size_t>(r), 0.0f);
+    float* zp = r > 256 ? zheap.data() : z;
+    for (int64_t j = 0; j < r; ++j) {
+        const float* arow = e->a32.get() + j * in_dim;
+        float dot = 0.0f;
+        for (int64_t c = 0; c < in_dim; ++c) dot += arow[c] * x[c];
+        zp[j] = dot;
+    }
+    const float* b32 = e->b32.get();
+    for (int64_t i = 0; i < out_dim; ++i) {
+        const float* brow = b32 + i * r;
+        float acc = 0.0f;
+        for (int64_t j = 0; j < r; ++j) acc += brow[j] * zp[j];
+        y[i] += lora_->scaling() * acc;
+    }
 }
 
 void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {

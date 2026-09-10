@@ -82,9 +82,14 @@ Options: `--model PATH`, `--prompt TEXT`, `--max-tokens N`, `--quiet`.
 
 | Endpoint | Method | Body | Result |
 |---|---|---|---|
-| `/health` | GET | — | `{"ok":true,"model":true,"peak_rss":42}` |
+| `/health` | GET | — | `{"ok":true,"model":true,"assistant_lora":false,"peak_rss":42}` |
 | `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64}` | `{"reply":"..."}` |
 | `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64}` | `{"text":"..."}` |
+
+Assistant-behavior LoRA: start the server with `--assistant-lora
+models/assistant-lora.gguf` (or `OMNISEED_ASSISTANT_LORA`), or pass
+`"assistant_lora": "path.gguf"` per request on `/gen`/`/ask` — absent keeps
+the current attachment, `""` detaches. See the MASTER_SPEC server contract.
 
 ---
 

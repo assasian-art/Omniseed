@@ -760,6 +760,29 @@ pure C++17, zero deps). Precise findings:
 
 ---
 
+## 9b. PHASE-14 — HTTP LoRA EXPOSURE + SIDECAR OVERHEAD (2026-09-10)
+
+- **Server exposure:** `omniseed_server --assistant-lora P` (or
+  `OMNISEED_ASSISTANT_LORA`) attaches a sidecar at startup; `POST /gen` and
+  `POST /ask` accept an optional `"assistant_lora"` field — absent keeps the
+  current attachment, `"path.gguf"` attaches (geometry-validated, logged
+  fallback to base on failure), `""` detaches. The serialized loop makes
+  swaps race-free; re-sending the attached path is a no-op. `/health`
+  reports `"assistant_lora":true|false`. Verified live: attach → `/gen`
+  (attached text), `""` → `/gen` (different text), `/ask` with field →
+  re-attach (`/health` true). Contract documented in MASTER_SPEC §6 +
+  DEPLOYMENT.md endpoint table.
+- **Sidecar overhead (bench, ternary QAT GGUF, rank-8 sidecar attached):**
+  base **25.8–27.4 tok/s** (median ≈26.6) vs attached **25.7–26.0 tok/s**
+  (median ≈25.9) → **≈2–3% per-token overhead** (~0.6 tok/s), +2.6 MB RSS
+  (158.2 vs 155.5 MB). First measurement showed ≈14%: the hot path was
+  per-element `half_to_float` on B and per-call string-built tensor lookups.
+  Fixed with a load-time hot cache (batch-converted fp32 A **and** B per
+  (layer, target) — half→float is exact so the math is bit-identical;
+  `omniseed_lora` 77/77 green after the change).
+
+---
+
 ## 10. PHASE-14/2B — ASSISTANT-BEHAVIOR LoRA SIDECAR (2026-09-10)
 
 ### What shipped (this session, all local — no Colab needed)

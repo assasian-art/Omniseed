@@ -241,7 +241,24 @@ the world tokenizer straight from the GGUF, serves a **browser demo console at
 `model:true` + `peak_rss_mb`. `POST /gen` and `POST /ask` accept optional
 `"repeat_penalty"` (default 1.0 = off) and `"repeat_window"` (default 64)
 fields — CTRL-style repetition suppression tuned for the QAT ternary model;
-each request is self-contained (absent fields revert to the defaults). CI:
+each request is self-contained (absent fields revert to the defaults).
+
+**Assistant-behavior LoRA over HTTP (Phase 14):** attach a sidecar for the
+whole process with `--assistant-lora P` (or the `OMNISEED_ASSISTANT_LORA`
+env var, mirroring `OMNISEED_MODEL`), or control it per request — `POST /gen`
+and `POST /ask` accept an optional `"assistant_lora": "path.gguf"` field:
+
+| Request | Effect |
+|---|---|
+| field absent | keeps the current attachment (startup flag/env, if any) |
+| `"assistant_lora": "models/assistant-lora.gguf"` | attaches that sidecar (validated against the base geometry; failure logs an error and serves the unmodified base) |
+| `"assistant_lora": ""` | detaches — the next requests run the base model |
+
+The serialized request loop makes swaps race-free; re-sending an already-
+attached path is a no-op (no reload). `/health` reports
+`"assistant_lora":true|false` so deployments can verify the attachment.
+Path semantics match the CLI `--assistant-lora` flag exactly (same loader,
+same geometry checks). CI:
 `.github/workflows/ci.yml` builds + ctests on ubuntu (gcc) and windows (MSVC)
 with model-less server smokes.
 
