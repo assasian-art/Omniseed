@@ -25,6 +25,7 @@
 #include "omniseed/audio/audio.h"
 #include "omniseed/audio/audio_events.h"
 #include "omniseed/core/gguf_loader.h"
+#include "omniseed/core/lora.h"
 #include "omniseed/core/platform.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tokenizer.h"
@@ -83,6 +84,11 @@ void print_usage() {
         "  --top-k K        keep K highest-probability tokens (0 = all)\n"
         "  --repeat-penalty P  penalize recently generated tokens (1.15-1.25\n"
         "                      breaks loops; 1.0 = off, default 1.0)\n"
+        "  --assistant-lora P  attach a LoRA sidecar (models/assistant-lora.gguf)\n"
+        "                      to steer replies (assistant behavior); used by\n"
+        "                      gen/ask/chat\n"
+        "  --assistant-mode    shorthand for --assistant-lora with the default\n"
+        "                      sidecar path\n"
         "  --seed S         sampling seed, deterministic per seed\n"
         "  --quiet          suppress info logs\n");
 }
@@ -515,11 +521,13 @@ struct Session {
     float repeat_penalty = 1.0f; // 1.0 = off
     uint64_t seed = 42;
     std::string prompt;
+    std::string assistant_lora; // optional LoRA sidecar path
     std::string eval_file;      // ppl: corpus file (else --prompt text)
     int32_t    eval_tokens = 2048;  // ppl: token budget
 
     Tokenizer tok;
     std::unique_ptr<RwkvModel> model;
+    std::unique_ptr<LoraAdapter> lora;
 
     bool load() {
         model = std::make_unique<RwkvModel>();
@@ -558,6 +566,26 @@ struct Session {
         platform::log_info("model loaded: %d layers, %d embd, %d vocab, eos=%d",
                            model->config().n_layers, model->config().n_embd,
                            model->config().n_vocab, eos_id);
+
+        // Assistant-behavior LoRA sidecar (optional; attached BEFORE first
+        // forward so every generation command picks it up).
+        if (!assistant_lora.empty()) {
+            lora = std::make_unique<LoraAdapter>();
+            if (lora->load(assistant_lora)
+                && lora->layer_count() == model->config().n_layers
+                && lora->n_embd() == model->config().n_embd) {
+                model->set_lora(lora.get());
+                platform::log_info(
+                    "assistant LoRA attached: %s (rank %d, scaling %.2f)",
+                    assistant_lora.c_str(), lora->rank(), lora->scaling());
+            } else {
+                platform::log_error(
+                    "assistant LoRA load failed (%s) — continuing WITHOUT it",
+                    lora->valid() ? "geometry mismatch vs base model"
+                                  : lora->error().c_str());
+                lora.reset();
+            }
+        }
         return true;
     }
 
@@ -808,6 +836,10 @@ int main(int argc, char** argv) {
             s.top_k = std::atoi(argv[++i]);
         else if (a == "--repeat-penalty" && i + 1 < argc)
             s.repeat_penalty = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--assistant-lora" && i + 1 < argc)
+            s.assistant_lora = argv[++i];
+        else if (a == "--assistant-mode")
+            s.assistant_lora = "models/assistant-lora.gguf";
         else if (a == "--seed" && i + 1 < argc)
             s.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];

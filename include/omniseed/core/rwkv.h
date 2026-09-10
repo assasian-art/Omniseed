@@ -37,6 +37,7 @@
 
 #include "omniseed/core/bitlinear.h"
 #include "omniseed/core/gguf_loader.h"
+#include "omniseed/core/lora.h"
 #include "omniseed/core/tensor.h"
 
 #include <string>
@@ -164,7 +165,21 @@ public:
     int32_t sample_token(const Tensor& logits, float temperature, int32_t top_k,
                          uint64_t& seed) const;
 
+    // -----------------------------------------------------------------------
+    // Assistant-behavior LoRA (Phase 14, 2B). The adapter lives OUTSIDE the
+    // model (set_lora stores a non-owning pointer); attach it once after
+    // loading both the base GGUF and the sidecar, then forward() adds
+    // y += scaling * B(A·x) on every targeted linear. nullptr (default) = off
+    // — zero cost and bit-identical output when detached.
+    // -----------------------------------------------------------------------
+    void set_lora(const class LoraAdapter* lora) { lora_ = lora; }
+    const class LoraAdapter* lora() const { return lora_; }
+
 private:
+    // y += scaling * B(A·x) for layer l / target; no-op when detached.
+    void apply_targeted(int32_t l, LoraTarget target,
+                        const float* x, float* y,
+                        int64_t out_dim, int64_t in_dim) const;
     bool load_meta(const GgufLoader& gg);
     bool load_weights(const GgufLoader& gg);
 
@@ -187,6 +202,7 @@ private:
                  const float* x, float* y, int64_t out_dim, int64_t in_dim) const;
 
     RwkvConfig cfg_;
+    const class LoraAdapter* lora_ = nullptr;   // non-owning, optional
     std::vector<RwkvLayerWeights> layers_;
     Tensor emb_;                 // fp16 [n_vocab, n_embd]
     Tensor ln0_w_, ln0_b_;       // pre-block-0 layernorm

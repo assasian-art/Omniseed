@@ -43,26 +43,60 @@ bool GgufLoader::read_metadata() {
     (void)n_tensors;   // header count; the tensor section re-reads it in load()
     const uint64_t n_kv      = gguf::read_u64(base, cursor); cursor += 8;
 
+    // Implausible header counts: reserve() would throw std::length_error
+    // (-> abort) instead of failing open() cleanly.
+    if (n_kv > 1000000 || n_tensors > 1000000) {
+        error_ = "GGUF header counts are implausible";
+        return false;
+    }
+
     metadata_.reserve(static_cast<size_t>(n_kv));
 
+    // Bounds-checked read helpers: a malformed / truncated GGUF must yield a
+    // clean open() failure — never an out-of-bounds read, and never an
+    // exception (std::string with a hostile u64 length used to throw
+    // std::length_error, which aborted the process).
+    const uint64_t fsize = file_.size();
+    auto need = [&](size_t n) { return cursor + n <= fsize; };
+    auto read_str = [&](std::string& out) {
+        if (!need(8)) return false;
+        const uint64_t len = gguf::read_u64(base, cursor);
+        cursor += 8;
+        if (len > fsize - cursor) return false;
+        out.assign(reinterpret_cast<const char*>(base + cursor),
+                   static_cast<size_t>(len));
+        cursor += static_cast<size_t>(len);
+        return true;
+    };
+    auto fail = [this](const std::string& key) {
+        error_ = "GGUF metadata truncated at key '" + key + "'";
+        return false;
+    };
+
     for (uint64_t i = 0; i < n_kv; ++i) {
-        const std::string key = gguf::read_string(base, cursor);
+        std::string key;
+        if (!read_str(key)) {
+            error_ = "GGUF metadata: truncated key string";
+            return false;
+        }
 
         MetadataValue val;
+        if (!need(4)) return fail(key);
         val.type = static_cast<GgufType>(gguf::read_i32(base, cursor));
         cursor += 4;
 
         switch (val.type) {
-            case GgufType::UINT8:  val.u64 = base[cursor];               cursor += 1; break;
-            case GgufType::INT8:   val.i64 = static_cast<int8_t>(base[cursor]); cursor += 1; break;
-            case GgufType::UINT16: val.u64 = gguf::read_u16(base, cursor); cursor += 2; break;
-            case GgufType::INT16:  val.i64 = static_cast<int16_t>(gguf::read_u16(base, cursor)); cursor += 2; break;
-            case GgufType::UINT32: val.u64 = gguf::read_u32(base, cursor); cursor += 4; break;
-            case GgufType::INT32:  val.i64 = gguf::read_i32(base, cursor); cursor += 4; break;
-            case GgufType::FLOAT32: val.f64 = gguf::read_f32(base, cursor); cursor += 4; break;
-            case GgufType::BOOL:   val.b = base[cursor] != 0;            cursor += 1; break;
-            case GgufType::STRING: val.str = gguf::read_string(base, cursor); break;
+            case GgufType::UINT8:  if (!need(1)) return fail(key); val.u64 = base[cursor];               cursor += 1; break;
+            case GgufType::INT8:   if (!need(1)) return fail(key); val.i64 = static_cast<int8_t>(base[cursor]); cursor += 1; break;
+            case GgufType::UINT16: if (!need(2)) return fail(key); val.u64 = gguf::read_u16(base, cursor); cursor += 2; break;
+            case GgufType::INT16:  if (!need(2)) return fail(key); val.i64 = static_cast<int16_t>(gguf::read_u16(base, cursor)); cursor += 2; break;
+            case GgufType::UINT32: if (!need(4)) return fail(key); val.u64 = gguf::read_u32(base, cursor); cursor += 4; break;
+            case GgufType::INT32:  if (!need(4)) return fail(key); val.i64 = gguf::read_i32(base, cursor); cursor += 4; break;
+            case GgufType::FLOAT32: if (!need(4)) return fail(key); val.f64 = gguf::read_f32(base, cursor); cursor += 4; break;
+            case GgufType::BOOL:   if (!need(1)) return fail(key); val.b = base[cursor] != 0;            cursor += 1; break;
+            case GgufType::STRING: if (!read_str(val.str)) return fail(key); break;
             case GgufType::ARRAY: {
+                if (!need(12)) return fail(key);
                 val.elem_type  = static_cast<GgufType>(gguf::read_i32(base, cursor));
                 cursor += 4;
                 val.elem_count = gguf::read_u64(base, cursor);
@@ -73,6 +107,7 @@ bool GgufLoader::read_metadata() {
                 if (val.elem_type == GgufType::STRING) {
                     val.raw.reserve(val.elem_count * 8);   // + actual bytes below
                     for (uint64_t e = 0; e < val.elem_count; ++e) {
+                        if (!need(8)) return fail(key);
                         const uint64_t len = gguf::read_u64(base, cursor);
                         if (cursor + 8 + len > file_.size()) {
                             error_ = "string array out of bounds for key " + key;
@@ -166,22 +201,60 @@ bool GgufLoader::read_tensor_dir() {
 
     tensors_.reserve(static_cast<size_t>(n_tensors));
 
+    // Bounds-checked reads (same rationale as read_metadata): a truncated
+    // tensor directory must fail open() cleanly, never read OOB or throw.
+    const uint64_t fsize = file_.size();
+    auto need = [&](size_t n) { return cursor + n <= fsize; };
+    auto read_str = [&](std::string& out) {
+        if (!need(8)) return false;
+        const uint64_t len = gguf::read_u64(base, cursor);
+        cursor += 8;
+        if (len > fsize - cursor) return false;
+        out.assign(reinterpret_cast<const char*>(base + cursor),
+                   static_cast<size_t>(len));
+        cursor += static_cast<size_t>(len);
+        return true;
+    };
+
     for (uint64_t i = 0; i < n_tensors; ++i) {
         TensorInfo info;
-        info.name = gguf::read_string(base, cursor);
+        if (!read_str(info.name)) {
+            error_ = "GGUF tensor directory: truncated name";
+            return false;
+        }
 
+        if (!need(4)) {
+            error_ = "GGUF tensor '" + info.name + "': truncated n_dims";
+            return false;
+        }
         const uint32_t n_dims = gguf::read_u32(base, cursor);
         cursor += 4;
+        if (n_dims == 0 || n_dims > 64) {   // real tensors have 1-4 dims
+            error_ = "GGUF tensor '" + info.name + "': implausible n_dims";
+            return false;
+        }
 
         info.dims.resize(n_dims);
         for (uint32_t d = 0; d < n_dims; ++d) {
+            if (!need(8)) {
+                error_ = "GGUF tensor '" + info.name + "': truncated dims";
+                return false;
+            }
             info.dims[d] = static_cast<int64_t>(gguf::read_u64(base, cursor));
             cursor += 8;
         }
 
+        if (!need(4)) {
+            error_ = "GGUF tensor '" + info.name + "': truncated dtype";
+            return false;
+        }
         const auto ggtype = static_cast<GgufDType>(gguf::read_i32(base, cursor));
         cursor += 4;
 
+        if (!need(8)) {
+            error_ = "GGUF tensor '" + info.name + "': truncated offset";
+            return false;
+        }
         info.offset = gguf::read_u64(base, cursor);
         cursor += 8;
 
@@ -232,8 +305,13 @@ bool GgufLoader::open(const std::string& path) {
         return false;
     }
     if (!read_magic_version() || !read_metadata() || !read_tensor_dir()) {
-        error_ = error_.empty() ? "malformed GGUF" : error_;
-        file_.close();
+        // Preserve the parse error, then FULLY reset: a bare file_.close()
+        // left metadata_/tensors_/tensor_index_ populated while the mapping
+        // was gone, so later has_tensor()/tensor() built views over wild
+        // pointers (nullptr + offset) instead of returning empty tensors.
+        const std::string err = error_.empty() ? "malformed GGUF" : error_;
+        close();
+        error_ = err;
         return false;
     }
     valid_ = true;

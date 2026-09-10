@@ -51,6 +51,7 @@ set(OMNISEED_CORE_SOURCES
     src/core/rwkv.cpp
     src/core/gguf_loader.cpp
     src/core/tokenizer.cpp
+    src/core/lora.cpp
     src/core/bitlinear_avx2.cpp
     src/vision/mobilenet_v4.cpp
     src/vision/unicompress.cpp
@@ -209,6 +210,24 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_qat_ternary COMMAND omniseed_qat_ternary
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_qat_ternary PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # LoRA sidecar runtime test: synthetic omniseed-lora GGUF (written by the
+    # test itself, no Python) validates loader/math/rejection, then a
+    # real-model attach/detach A/B — skips cleanly when the base GGUF or the
+    # trained smoke sidecar is absent.
+    add_executable(omniseed_lora tests/test_lora.cpp)
+    target_include_directories(omniseed_lora PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_lora PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_lora PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_lora PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_lora COMMAND omniseed_lora
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_lora PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

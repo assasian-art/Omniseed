@@ -91,6 +91,11 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
 }
 
 int64_t Tensor::numel() const {
+    // A default-constructed (no-shape) tensor is EMPTY, not a scalar: it has
+    // no storage and zero elements. Returning the empty-product 1 here made
+    // callers' "numel() == 0 means missing/untargeted" checks pass on
+    // garbage (see LoraAdapter::factors / RwkvModel::apply_targeted).
+    if (shape_.empty()) return 0;
     int64_t n = 1;
     for (const int64_t d : shape_) n *= d;
     return n;

@@ -17,17 +17,14 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-13B (all committed): round-2b QAT status — ternary
-  GGUF bench **28.6 tok/s**, gen **26.3 tok/s** @ penalty 1.2, peak RSS
-  **114.7/115.4 MB** (the SIMD ternary path is now FASTER than the i8
-  default's 19.2 tok/s); calm-recipe tooling shipped (`--resume-best`,
-  grad-norm logging every 10 steps, COLAB_QAT round-2b section, commit
-  4b7ea2b). Diagnosis: the exported masters regurgitate in-repo markdown +
-  wikitext fragments — inherited PoC-markdown memorization + an early
-  best@600; PPL 136–160 ≫ the ~39 target — **the runtime is NOT at fault**.
-  Next: **round-3 clean QAT** (fresh PTQ init, no resume, lr 1e-4, kd 1.0,
-  W32 B32, 12k steps, export gate val PPL ≤ 60); i8 stays daily default
-  until then. See §8.
+- **Last updated:** PHASE-14/2B (2026-09-10): **assistant-behavior LoRA
+  sidecar shipped end-to-end** — train/export tool (`tools/lora_chat.py`),
+  runtime loader + RWKV hooks + CLI (`--assistant-lora` / `--assistant-mode`),
+  ctest `omniseed_lora` **77/77** (ctest 5/5 overall). Along the way: fixed
+  GGUF loader crash-on-corrupt-file (bounds-checked parsing), failed-open
+  state leak, and `Tensor::numel()` on empty tensors. See §10. The pending
+  list's LoRA item is CLOSED; remaining: round-3 clean QAT (§8), FocalCodec
+  codebooks (documented-missing), Render live deploy.
 
 ---
 
@@ -703,8 +700,8 @@ The QAT GGUF regurgitates in-repo markdown + wikitext fragments:
 2. **Until round-3 lands: the i8 default model stays the daily default**;
    the QAT ternary GGUF remains the speed/footprint demonstrator (28.6
    tok/s @ ~115 MB) with `--repeat-penalty 1.2` for loop-free demos.
-3. Pending (unchanged): **FocalCodec codebooks**, **LoRA
-   assistant-behavior pass**, **Render live deploy**.
+3. Pending: **FocalCodec codebooks** (documented-missing, §9), **Render
+   live deploy**. ~~LoRA assistant-behavior pass~~ — DONE, see §10.
 
 ---
 
@@ -760,3 +757,68 @@ pure C++17, zero deps). Precise findings:
   publicly as of 2026-09-10. FocalCodec-Stream causal ONNX exports
   (experimental, v0.0.2) are the most promising future path if a distilled
   encoder (<10 MB int8) appears.
+
+---
+
+## 10. PHASE-14/2B — ASSISTANT-BEHAVIOR LoRA SIDECAR (2026-09-10)
+
+### What shipped (this session, all local — no Colab needed)
+
+The pending **LoRA assistant-behavior pass** is DONE end-to-end:
+
+- **Training/export tool** `tools/lora_chat.py` (offline only, venv): classic
+  LoRA B·A on the 6 big linears per layer (att r/k/v/o + ffn key/value — the
+  tensors the runtime quantizes), rank 8 alpha 16, B zero-init (step 0 ==
+  base), teacher-forced CE on ANSWER tokens only over the exact
+  `User: ...\n\nAssistant:` template, AdamW + cosine LR + warmup, lockstep
+  batch, `--sample` greedy demo, resume from `models/lora_chat.pt`, and a
+  sidecar exporter (`omniseed-lora` GGUF: rank/alpha/scaling/layer_count/
+  n_embd/base_vocab metadata + F16 A/B tensors, ~2.7 MB for the 0.1B model).
+- **Runtime loader** `include/omniseed/core/lora.h` + `src/core/lora.cpp`:
+  `LoraAdapter::load()` validates architecture + geometry, `factors(l, t)`
+  returns zero-copy f16 views, `apply_lora()` adds
+  `y += scaling * B(A·x)` with the A·x product HOISTED (O(in·rank + out·rank)
+  vs the naive O(out·in·rank) — ~250x fewer f16 reads per ffn linear).
+- **RWKV hooks** (`rwkv.h/.cpp`): `set_lora(nullptr)` default = detached,
+  bit-identical output, zero cost; `forward()` adds the delta after each of
+  the 6 targeted projections per layer.
+- **CLI** (`src/cli/main.cpp`): `--assistant-lora P` and `--assistant-mode`
+  (default `models/assistant-lora.gguf`) on gen/ask/chat; attaches before the
+  first forward, logs rank/scaling, falls back to unmodified generation with
+  a logged error on load/geometry mismatch.
+- **Runtime test** `tests/test_lora.cpp` → ctest `omniseed_lora`, **77/77**:
+  the test writes a synthetic `omniseed-lora` GGUF itself (no Python), then
+  checks load/geometry, factor views (incl. empty-on-untargeted),
+  `apply_lora` vs a scalar reference (max diff 0.00e+00), malformed-sidecar
+  rejection (wrong arch, truncated directory, truncated payloads — clean
+  `open()` failures, no crash), and a REAL-model A/B on the QAT GGUF + the
+  trained smoke sidecar `models/assistant-lora-test.gguf`: attached logits
+  shift max 1.76e-01, detaching restores the baseline BIT-IDENTICALLY.
+
+Bugs found & fixed while wiring this in (the C++ path had never compiled):
+
+- `rwkv.h` declared `class LoraTarget` — elaborated a phantom CLASS that
+  clashes with the real `enum class` from lora.h; now includes `lora.h`.
+- `apply_targeted` compared Tensors to nullptr / dereferenced `*f.b` (no
+  compile); now checks `numel() == 0`.
+- **`Tensor::numel()` returned 1 for a default-constructed (no-shape)
+  tensor** — broke every "empty view" check; fixed to return 0 (src/core/
+  tensor.cpp). Existing suites still green.
+- **`GgufLoader::open()` left metadata_/tensors_ populated on a failed
+  parse** (bare `file_.close()`) → later `tensor()` calls built views over
+  wild pointers. Now full `close()` reset with the error preserved.
+- **GGUF parsing crashed (uncaught std::length_error → abort, exit
+  0xc0000409) on malformed/truncated files** — a corrupt model would have
+  killed the CLI at runtime. `read_metadata`/`read_tensor_dir` are now fully
+  bounds-checked (implausible header counts, truncated keys/strings/dims/
+  dtype/offset all fail `open()` cleanly).
+
+Status: `ctest 5/5` (206 platform + 13 real-weights + 17 sides + 8
+qat-ternary + 77 lora). The i8/ternary daily-default and round-3 QAT plan
+are unchanged; the sidecar is a NEW, independent axis — assistant behavior
+trains without ever touching the quantized base.
+
+NEXT (LoRA): real behavior pass needs GPU-quantity steps (minutes on Colab
+vs ~hours on CPU: `python tools/lora_chat.py --steps 2000 --lr 1e-3`), then
+`--assistant-mode` demos + server `/gen` pass-through. Optional: per-target
+scaling metadata for fine control, multi-adapter stacking.

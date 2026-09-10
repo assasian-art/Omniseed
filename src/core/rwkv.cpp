@@ -13,6 +13,7 @@
 // =============================================================================
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/gguf_loader.h"
+#include "omniseed/core/lora.h"
 #include "omniseed/core/platform.h"
 
 #include <algorithm>
@@ -457,6 +458,22 @@ void RwkvModel::project(const Tensor& W, const Tensor& scales,
 // ===========================================================================
 // Forward: one token step
 // ===========================================================================
+// ===========================================================================
+// LoRA delta (Phase 14, 2B): y += scaling * B(A·x) when an adapter is set.
+// Targets are the 6 big linears per layer — the same tensors the ternary
+// base quantizes (att r/k/v/o + ffn key/value). No-op when detached, so the
+// default path stays bit-identical.
+// ===========================================================================
+void RwkvModel::apply_targeted(int32_t l, LoraTarget target,
+                               const float* x, float* y,
+                               int64_t out_dim, int64_t in_dim) const {
+    if (lora_ == nullptr) return;
+    const LoraAdapter::Factors f = lora_->factors(l, target);
+    if (f.a.numel() == 0 || f.b.numel() == 0) return;   // untargeted pair
+    LoraAdapter::apply_lora(f.b, f.a, lora_->scaling(), x, y,
+                            out_dim, in_dim);
+}
+
 void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
     const int32_t E = cfg_.n_embd;
     const int32_t H = cfg_.n_heads;
@@ -516,9 +533,12 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         const double p0 = dbg_prof() ? platform::now_ms() : 0.0;
         std::vector<float> r(E), k(E), kk(E), v(E), g(E);
         project(w.W_r, w.sc_r, w.r_scale, xr.data(), r.data(), E, E);  // raw (no sigmoid)
+        apply_targeted(l, LoraTarget::Receptance, xr.data(), r.data(), E, E);
         project(w.W_k, w.sc_k, w.k_scale, xk.data(), k.data(), E, E);
+        apply_targeted(l, LoraTarget::Key, xk.data(), k.data(), E, E);
         std::memcpy(kk.data(), k.data(), E * sizeof(float));     // kk = k * k_k below
         project(w.W_v, w.sc_v, w.v_scale, xv.data(), v.data(), E, E);
+        apply_targeted(l, LoraTarget::Value, xv.data(), v.data(), E, E);
         if (dbg_nan() && l == 0) {
             dbg_check("xr", xr.data(), E);
             dbg_check("proj_r", r.data(), E);
@@ -665,6 +685,7 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
 
         std::vector<float> attn_out(E);
         project(w.W_o, w.sc_o, w.o_scale, yg.data(), attn_out.data(), E, E);
+        apply_targeted(l, LoraTarget::Output, yg.data(), attn_out.data(), E, E);
         if (dbg_nan() && l == 0) {
             dbg_check("y", y.data(), E);
             dbg_check("yn", yn.data(), E);
@@ -697,8 +718,10 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
 
         std::vector<float> fk(cfg_.ffn_inter), fv(E);
         project(w.F_key, w.sc_fk, w.fk_scale, xv2.data(), fk.data(), cfg_.ffn_inter, E);
+        apply_targeted(l, LoraTarget::FfnKey, xv2.data(), fk.data(), cfg_.ffn_inter, E);
         for (int32_t i = 0; i < cfg_.ffn_inter; ++i) fk[i] = squared_relu(fk[i]);
         project(w.F_value, w.sc_fv, w.fv_scale, fk.data(), fv.data(), E, cfg_.ffn_inter);
+        apply_targeted(l, LoraTarget::FfnValue, fk.data(), fv.data(), E, cfg_.ffn_inter);
         for (int32_t i = 0; i < E; ++i) x[i] += fv[i];
         if (dbg_prof()) {
             ProfSections& p = prof();
