@@ -705,3 +705,58 @@ The QAT GGUF regurgitates in-repo markdown + wikitext fragments:
    tok/s @ ~115 MB) with `--repeat-penalty 1.2` for loop-free demos.
 3. Pending (unchanged): **FocalCodec codebooks**, **LoRA
    assistant-behavior pass**, **Render live deploy**.
+
+---
+
+## 9. PHASE-14 — CLEANUP + PENDING MODEL WORK + MODAL PIPELINE (2026-09-10)
+
+### Cleanup (committed f39ce1d)
+
+Deleted (regenerable / superseded): `build/`, `build-asan/`, `state/`, root
+`qat_log.txt`, `tools/COLAB_QAT.md` (Colab superseded by Modal — see
+`docs/MODAL_QAT_GUIDE.md`), `docs/OMNISEED_MASTER_SPEC.html` (regenerate with
+`python tools/md2html.py docs/OMNISEED_MASTER_SPEC.md`), `models/qat_ckpt-OLD.pt`,
+`models/qat_masters.pt`, `models/rwkv7-0.1B-ternary-qat-old.gguf`,
+`models/goose28.safetensors` (proven bit-identical to the Hakureirm download),
+`models/whisper-tiny.safetensors`, `models/model.safetensors`.
+Kept: `.venv/`, daily i8 + current ternary QAT GGUFs, round-3 resume ckpt
+(`models/qat_ckpt.pt`), sidecar GGUFs, vocab, mel_filters.npz, configs,
+`corpus_eval.txt`, all src/ tests/ tools/ docs/.
+Repo size **4.8 GB → 1.0 GB**; `models/` **4.7 GB → 2.4 GB**. Full rebuild +
+ctest 4/4 green after cleanup.
+
+Re-download one-liners (converters are offline; they read local files):
+
+```
+curl -L -o models/model.safetensors        https://huggingface.co/Hakureirm/rwkv7-0.1b-hf/resolve/main/model.safetensors
+curl -L -o models/whisper-tiny.safetensors https://huggingface.co/openai/whisper-tiny/resolve/main/model.safetensors
+```
+
+(`mel_filters.npz` + tokenizer json were already needed and kept; whisper-tiny
+repo files needed by `tools/convert_senses.py`: model.safetensors only —
+tokenizer is at `models/whisper-tiny-tokenizer.json` from the same repo if
+deleted: `https://huggingface.co/openai/whisper-tiny/resolve/main/tokenizer.json`.)
+
+### P2A — FocalCodec/SemantiCodec survey: DOCUMENTED-MISSING
+
+No suitable public checkpoint fits the runtime envelope (~115 MB total RSS,
+pure C++17, zero deps). Precise findings:
+
+- **FocalCodec** (`lucadellalib/focalcodec_50hz`, also 25hz / 12_5hz and the
+  causal 2k/4k/65k variants): license **Apache-2.0** (good), but
+  `model.safetensors` is **568 MB / 142M F32 params** — the encoder is a
+  finetuned **microsoft/wavlm-large** (~300M params backbone). 5× the entire
+  RSS budget before adding the decoder. Tensor layout: monolithic PyTorch
+  state dict (FocalModulation blocks + wav2vec2-style transformer), would
+  require a full focal-modulation forward in C++.
+- **SemantiCodec** (`haoheliu/SemantiCodec`, MIT): the semantic k-means
+  codebooks alone are `codebook_2048_0.npy` **50 MB** (2048×6144 fp32 —
+  AudioMAE ViT-L/16 1024-dim 6-position concat), codebook_8192 200 MB; the
+  inference checkpoints (AudioMAE encoder + SoundStream decoder) are ~1 GB.
+- Verdict: **both would blow the memory envelope; runtime stays on the
+  Goertzel-lite band-energy fallback** in `src/audio/focal_codec.cpp` (24
+  log-spaced bands → semantic codes). What is missing is a **<=10 MB semantic
+  speech-codec codebook + encoder** with a permissive license — none exists
+  publicly as of 2026-09-10. FocalCodec-Stream causal ONNX exports
+  (experimental, v0.0.2) are the most promising future path if a distilled
+  encoder (<10 MB int8) appears.
