@@ -117,7 +117,11 @@ private:
             en_id_ = 50262, no_ts_id_ = 50363;
 
     // Greedy autoregressive decode over the encoder frames (real ASR).
-    bool decode_greedy(const Tensor& enc, std::vector<int32_t>& out_ids) const;
+    // Prompt variant: timestamps enabled (HF whisper default, loop-resistant)
+    // or the classic <|notimestamps|> prompt.
+    enum DecPrompt { kPromptTimestamps, kPromptNoTimestamps };
+    bool decode_greedy(const Tensor& enc, std::vector<int32_t>& out_ids,
+                       DecPrompt prompt_mode = kPromptTimestamps) const;
 
     bool valid_ = false;
     mutable std::string error_;   // set even from const methods

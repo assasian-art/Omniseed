@@ -17,14 +17,18 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-14/2B (2026-09-10): **assistant-behavior LoRA
-  sidecar shipped end-to-end** — train/export tool (`tools/lora_chat.py`),
-  runtime loader + RWKV hooks + CLI (`--assistant-lora` / `--assistant-mode`),
-  ctest `omniseed_lora` **77/77** (ctest 5/5 overall). Along the way: fixed
-  GGUF loader crash-on-corrupt-file (bounds-checked parsing), failed-open
-  state leak, and `Tensor::numel()` on empty tensors. See §10. The pending
-  list's LoRA item is CLOSED; remaining: round-3 clean QAT (§8), FocalCodec
-  codebooks (documented-missing), Render live deploy.
+- **Last updated:** PHASE-15 (2026-09-11): **real end-to-end ASR shipped** —
+  the whisper-tiny decoder now transcribes a real LibriSpeech fixture clip to
+  the exact official-HF output (`<|0.00|> Experience proves this.<|4.00|>`,
+  timestamps included) in ~4 s, silence fails cleanly, `omniseed_sides` 22/22
+  with a 100%-word-overlap assertion vs an HF-validated reference (§11).
+  Staged oracle proofs: mel matches `WhisperFeatureExtractor` to 1.1e-4, the
+  encoder matches the official HF encoder to 1.1e-3 on the same sliced input.
+  Previous: PHASE-14/2B — assistant-behavior LoRA sidecar end-to-end
+  (`tools/lora_chat.py`), runtime loader + RWKV hooks + CLI (`--assistant-lora`
+  / `--assistant-mode`), ctest `omniseed_lora` 77/77 (ctest 5/5 overall). See
+  §10/§11. Remaining: round-3 clean QAT (§8), FocalCodec codebooks
+  (documented-missing), Render live deploy.
 
 ---
 
@@ -289,8 +293,8 @@ me with a few questions about your search?" **Peak RSS 202.8 MB** (budget
 2. **CI on Linux** is the natural next proof for this pass: the byte-exact
    readers, POSIX fd_/mmap path, and socket shim are now CI-relevant — watch
    the ubuntu-latest job in `.github/workflows/ci.yml`.
-3. **Whisper decoder weights**: autoregressive decoder → real end-to-end ASR
-   (encoder is already real).
+3. ~~Whisper decoder weights~~ — DONE, see §11 (real end-to-end ASR,
+   oracle-verified to official-HF parity).
 4. **FocalCodec codebooks**: last algorithmic-fallback sense; extend
    `convert_senses.py` when a suitable public checkpoint is identified.
 5. **Tie-window test note**: `test_real_weights` records a continuation with
@@ -845,3 +849,97 @@ NEXT (LoRA): real behavior pass needs GPU-quantity steps (minutes on Colab
 vs ~hours on CPU: `python tools/lora_chat.py --steps 2000 --lr 1e-3`), then
 `--assistant-mode` demos + server `/gen` pass-through. Optional: per-target
 scaling metadata for fine control, multi-adapter stacking.
+
+---
+
+## 11. PHASE-15 — REAL END-TO-END ASR (whisper-tiny decoder, 2026-09-11)
+
+The whisper decoder went from "garbage bytes / 70 s pathological loops" to
+**official-parity transcription** on a real LibriSpeech clip, with every
+pipeline stage proven against the official HF implementation.
+
+### What was broken (four stacked bugs, found by staged oracle bisection)
+
+1. **Decoder prefill was missing.** The step loop only ever cached the NEWEST
+   row's K/V; the first "fix" primed prompt rows 0..2 from the RAW token
+   embedding at every layer — but layer l must see each row's layer-(l-1)
+   output. Layers > 0 attended over garbage K/V and the decoder never emitted
+   <|endoftext|>: 224 junk steps ≈ 70 s per transcribe. Fixed with a shared
+   `process_row` lambda (row through ALL layers: cache K/V from LN1(x), then
+   self-attn over the causal prefix → cross-attn → MLP, in place) used by the
+   sequential prompt prefill AND every generation step — one exact numeric
+   sequence for both paths.
+2. **Vocab piece-bytes were decoded from raw f16 bits.** The converter stores
+   each piece byte as an f16 VALUE (`np.uint8 → <f2`), so element i's bits are
+   an IEEE half encoding, not the byte. Reading the low byte produced the
+   garbage; fixed with `half_to_float(elems[o])`. (Was invisible before bug 1:
+   silence emitted nothing.)
+3. **HF generation policy was absent.** Raw greedy argmax loops on non-speech
+   tokens and misses EOT. Ported the exact processors `model.generate` runs
+   for whisper: `suppress_tokens` (the 92-entry generation_config list),
+   `begin_suppress_tokens` [220, EOT] at step 0, and the
+   WhisperTimeStampLogitsProcessor rules (mask <|notimestamps|>, timestamp
+   pairing: after a pair only text, after a lone ts only ts/EOT, monotonic
+   timestamps, initial timestamp ∈ [0.00, 1.00] (max_initial_timestamp_index
+   1), and the logsumexp "timestamps beat text" gate over suppressed logits).
+   Default prompt is now HF's [SOT, <|en|>, <|transcribe|>] with timestamps
+   ENABLED (HF's whisper default — the ts tokens suppress hallucination
+   loops); the classic <|notimestamps|> prompt is `kPromptNoTimestamps`
+   (masks all ts tokens for the segment).
+4. **Trailing-silence padding dominated the runtime.** compute_mel pads to the
+   30 s whisper window; the encoder then spent 96% of its FLOPs on zero
+   frames. Fixed: after pass-1 the trailing all-silent frames are trimmed
+   (energy gate > 1e-10 per windowed frame) BEFORE log-mel/normalization, so
+   normalization still uses the clip's true max. 1.98 s clip: mel 3000 → 102
+   frames, encode+decode ≈ 4 s total. Digital silence now fails cleanly with
+   "audio too short for the encoder (need >= 2 mel frames)" (encode() guards
+   T_in < 2 so the stride-2 conv can't emit zero frames → NaN attention).
+
+### Oracle proofs (tools/dbg_whisper_ref.py — official HF, local checkpoint)
+
+- mel: C++ vs `WhisperFeatureExtractor` (30 s pad, torch.stft center=True,
+  official mel_filters.npz) → **max|diff| 1.1e-4** (f16-filterbank rounding).
+  (The old C++ path used the wrong mel scale + per-frame normalization — both
+  replaced earlier in this pass: librosa Slaney-scale fallback + GLOBAL max.)
+- encoder: C++ (trimmed input) vs HF WhisperModel.encoder on the SAME 199-
+  frame mel (HF gated at 3000; oracle drives conv stem + pos + layers manually)
+  → **max|diff| 1.1e-3** (f16 weights). The 4-block bidirectional-MHA encoder
+  was already exact; the [dec] step-0 logits matched too — bugs 1–3 were all
+  in the decoder shell around the weights.
+- generation: official `model.generate` (greedy AND beam-5) on this clip →
+  [28503, 25019, 341, 13] = " Experience proves this." — the C++ decoder now
+  emits exactly `<|0.00|> Experience proves this.<|4.00|>`. The environment
+  was validated with whisper.cpp's jfk.wav → canonical JFK sentence.
+- **The fixture's DeepSpeech label ("she had your dark suit…") is NOT what
+  whisper-tiny produces for this clip.** tests/fixtures/manifest.txt now holds
+  the HF-validated transcription ("Experience proves this."), and
+  tools/get_fixtures.py documents why (the test asserts parity with the
+  official model, not the archive label).
+
+### Test + tooling changes
+
+- `tests/test_sides.cpp`: real-clip ASR block (16 kHz mono s16 WAV loader,
+  manifest reader, word-overlap ≥ 0.5 after stripping <|…|> tokens, bounded
+  runtime) + silence expectations updated (clean-error-or-empty is correct for
+  digital silence). **omniseed_sides 22/22.**
+- `tools/get_fixtures.py`: manifest reference = HF-validated transcription
+  (see above).
+- `tools/dbg_whisper_ref.py` (new, offline): staged HF oracle — `--stage
+  mel|enc|gen|all`, `--compare-mel` diff, `--slice-mel N` for trimmed-input
+  encoder comparisons.
+- `tools/dbg_mel.cpp` (new, unregistered like dbg_sensory.cpp): dumps C++
+  mel/enc for the oracle; `OMNISEED_DBG_IDS=1` adds transcribe ids.
+- `src/audio/whisper_tiny.cpp`: cross_v bias wired (whisper ships no k_proj
+  biases), erf GELU, logits vector + HF policy, `DecPrompt` enum.
+- Temporary OMNISEED_DBG_MEL/[logits] dump instrumentation removed; the
+  pre-existing env-gated OMNISEED_DBG sweep + top-5 probes remain.
+
+### Verification (Phase 15)
+
+- ctest **5/5**: omniseed_platform 206/206, omniseed_real_weights 13/13,
+  omniseed_sides **22/22**, omniseed_qat_ternary 8/8, omniseed_lora 77/77.
+- Zero /W4 warnings; fresh CMake configure clean; debug targets unregistered.
+
+NEXT (ASR): optional language auto-detect (<|SOT|> only prompt), server `POST
+/transcribe` endpoint exposing the real decoder, streaming mel for live
+capture. These do not block round-3 QAT or the Render deploy.

@@ -259,7 +259,12 @@ def convert_decoder(args, w):
     # token embedding doubles as the lm_head (whisper ties them)
     tok = T('model.decoder.embed_tokens.weight')            # [V, 384]
     w.add_tensor('whisper.dec.tok_embd', tok.shape, F16, f16_bytes(tok))
-    add16('whisper.dec.pos_embed', T('model.decoder.embed_positions.weight'))
+    pos = T('model.decoder.embed_positions.weight')          # [448, 384]
+    w.add_tensor('whisper.dec.pos_embed', pos.shape, F16, f16_bytes(pos))
+    # NOTE: the HF whisper checkpoint stores proper nn.Linear weights
+    # ([out, in] — verified: layers.0.fc1.weight = [1536, 384]); they are
+    # written here UNCHANGED and match the C++ dense_f16 row-major layout.
+    # (Conv1D transposition would be WRONG for this checkpoint family.)
     add16('whisper.dec_ln.weight', T('model.decoder.layer_norm.weight'))
     add16('whisper.dec_ln.bias', T('model.decoder.layer_norm.bias'))
 
