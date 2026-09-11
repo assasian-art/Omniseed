@@ -37,6 +37,9 @@ struct PcmAudio {
 
     // Loads a 16-bit mono WAV (PCM) file. Returns false on unsupported files.
     static bool load_wav(const std::string& path, PcmAudio& out);
+
+    // Same, from an in-memory RIFF/WAVE blob (HTTP /asr request body).
+    static bool load_wav_bytes(const std::string& data, PcmAudio& out);
 };
 
 // ---------------------------------------------------------------------------

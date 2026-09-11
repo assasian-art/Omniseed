@@ -257,6 +257,18 @@ and `POST /ask` accept an optional `"assistant_lora": "path.gguf"` field:
 The serialized request loop makes swaps race-free; re-sending an already-
 attached path is a no-op (no reload). `/health` reports
 `"assistant_lora":true|false` so deployments can verify the attachment.
+
+**Real ASR over HTTP (Phase 15):** `POST /asr` accepts either raw WAV bytes
+(16 kHz mono 16-bit PCM; any Content-Type) or JSON `{"wav_b64": "..."}`
+(base64 of the same), and returns `{"text": "<|0.00|> ...<|4.00|>",
+"seconds": 4.3}` — the whisper-tiny encoder + greedy decoder with HF's exact
+generation policy (suppress tokens, timestamp pairing/monotonicity rules),
+oracle-verified to official-HF parity (§13). Silence/noise/too-short clips
+return a clean `{"error": "..."}` (the trailing-silence mel trim leaves < 2
+frames). The 73 MB sidecar loads lazily on the first `/asr` call so text-only
+deployments never pay for it; `/health` reports `"asr":"real"|"fallback"|
+false`. Request bodies are read to their full `Content-Length` (100 MB cap);
+sanity smoke: `curl --data-binary @clip.wav localhost:8080/asr`.
 Path semantics match the CLI `--assistant-lora` flag exactly (same loader,
 same geometry checks). CI:
 `.github/workflows/ci.yml` builds + ctests on ubuntu (gcc) and windows (MSVC)

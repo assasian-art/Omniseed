@@ -10,6 +10,12 @@
 //    POST /gen            -> raw generation (json body: {"prompt": "...",
 //                           "repeat_penalty": 1.2, "repeat_window": 64,
 //                           "assistant_lora": "path/to/sidecar.gguf"})
+//    POST /asr            -> whisper-tiny transcription. Body is either RAW
+//                           16 kHz mono 16-bit PCM WAV bytes (Content-Type:
+//                           audio/wav or application/octet-stream) or JSON
+//                           {"wav_b64": "..."}. Returns {"text": ..., 
+//                           "seconds": ...}; clean error on silence/too-short
+//                           audio (the mel trim leaves < 2 frames).
 //
 //  Assistant-behavior LoRA: attach a sidecar at startup with
 //  --assistant-lora P (or OMNISEED_ASSISTANT_LORA), or swap it per request
@@ -20,6 +26,7 @@
 //  Deployment target: Render/Docker (see docs/DEPLOYMENT.md).
 // =============================================================================
 #include "omniseed/agent/agent.h"
+#include "omniseed/audio/audio.h"
 #include "omniseed/core/platform.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tokenizer.h"
@@ -27,8 +34,11 @@
 #include "omniseed/memory/memory.h"
 #include "omniseed/core/tensor.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <thread>
 #include <vector>
@@ -117,8 +127,7 @@ float json_num_field(const std::string& body, const std::string& key,
     const char* begin = body.c_str() + cpos + 1;
     char* end = nullptr;
     const float v = std::strtof(begin, &end);
-    return (end == begin) ? dflt : v;
-}
+    return (end == begin) ? dflt : v;}
 
 // One-page demo console: a browser chat box against POST /gen. No assets,
 // no CDNs — everything inline so it works on an air-gapped LAN too.
@@ -223,6 +232,133 @@ document.getElementById('f').addEventListener('submit', async e => {
 // Current LoRA attachment (server is serialized, so one global is race-free).
 LoraAdapter* server_lora = nullptr;
 std::string  server_lora_path;
+
+// Whisper-tiny ASR sidecar: loaded lazily on the first /asr request (most
+// deployments never call it — don't pay the 73 MB mmap at boot). Serialized
+// request loop makes the lazy init race-free. Decode-sidecar tensors are
+// optional: encoder-only sidecars answer with the documented fallback text.
+WhisperTiny* server_whisper = nullptr;
+
+bool server_asr_ready() {
+    if (server_whisper) return true;
+    server_whisper = new WhisperTiny();
+    if (!server_whisper->load("models/whisper-tiny-encoder.gguf")) {
+        platform::log_error("asr: whisper sidecar load failed: %s",
+                            server_whisper->error().c_str());
+        delete server_whisper;
+        server_whisper = nullptr;
+        return false;
+    }
+    platform::log_info(
+        "asr: whisper sidecar loaded (decoder %s)",
+        server_whisper->decoder_loaded() ? "real" : "fallback");
+    return true;
+}
+
+// Read exactly `len` more bytes off the socket (Content-Length body).
+bool recv_exact(Socket_t s, std::string& out, size_t len) {
+    out.resize(out.size() + len);
+    size_t got = 0;
+    char* dst = out.data() + out.size() - len;
+    while (got < len) {
+#ifdef _WIN32
+        const int n = ::recv(s, dst + got,
+                             static_cast<int>(len - got), 0);
+#else
+        const ssize_t n = ::recv(s, dst + got, len - got, 0);
+#endif
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Pull headers + a complete body off the socket. Greedy servers may keep a
+// keep-alive connection open, so reads continue until Content-Length is
+// satisfied or the peer closes (n == 0). Returns false on socket errors.
+bool read_request(Socket_t s, std::string& headers, std::string& body) {
+    std::string acc;
+    char buf[8192];
+    size_t header_end = std::string::npos;
+    while (header_end == std::string::npos) {
+#ifdef _WIN32
+        const int n = ::recv(s, buf, sizeof(buf), 0);
+#else
+        const ssize_t n = ::recv(s, buf, sizeof(buf), 0);
+#endif
+        if (n <= 0) return false;
+        acc.append(buf, static_cast<size_t>(n));
+        header_end = acc.find("\r\n\r\n");
+    }
+    headers = acc.substr(0, header_end);
+    body = acc.substr(header_end + 4);
+    // Content-Length (case-insensitive header scan; portable tolower walk).
+    size_t cl = std::string::npos;
+    for (size_t p = 0; p + 16 < headers.size(); ++p) {
+        static const char kCl[] = "content-length:";
+        bool hit = true;
+        for (size_t j = 0; j < 15; ++j) {
+            if (std::tolower(static_cast<unsigned char>(headers[p + j])) !=
+                kCl[j]) {
+                hit = false;
+                break;
+            }
+        }
+        if (hit) {
+            cl = std::strtoul(headers.c_str() + p + 15, nullptr, 10);
+            break;
+        }
+    }
+    if (cl == std::string::npos) return true;             // bodyless request
+    if (cl > 100u * 1024u * 1024u) return false;          // sane cap: 100 MB
+    while (body.size() < cl) {
+#ifdef _WIN32
+        const int n = ::recv(s, buf,
+                             static_cast<int>(std::min(sizeof(buf),
+                                 cl - body.size())), 0);
+#else
+        const ssize_t n = ::recv(s, buf, std::min(sizeof(buf),
+                                 cl - body.size()), 0);
+#endif
+        if (n <= 0) return false;
+        body.append(buf, static_cast<size_t>(n));
+    }
+    body.resize(cl);                                      // trim over-read
+    return true;
+}
+
+// Standard base64 decode (RFC 4648; whitespace tolerated). Returns false on
+// any character outside the alphabet/padding.
+bool base64_decode(const std::string& in, std::string& out) {
+    static const int8_t T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,
+        -1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,-1,0,1,
+        2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,
+        -1,-1,-1,-1,-1,-1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,
+        42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+    out.clear();
+    out.reserve(in.size() / 4 * 3 + 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char c : in) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u == ' ' || u == '\r' || u == '\n' || u == '\t') continue;
+        const int8_t v = T[u];
+        if (v == -1) return false;                        // illegal char
+        if (v == -2) break;                               // '=' padding: stop
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
+        }
+    }
+    return true;
+}
 
 // Attach a LoRA sidecar to the model, or detach it. Returns true when a
 // sidecar is now attached; logs (never throws) on failure.
@@ -346,17 +482,15 @@ int main(int argc, char** argv) {
         Socket_t client = ::accept(listener, nullptr, nullptr);
         if (client == kInvalidSocket) continue;
 
-        char buf[4096] = {0};
-#ifdef _WIN32
-        const int n = ::recv(client, buf, sizeof(buf) - 1, 0);
-#else
-        const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
-#endif
-        if (n <= 0) {
+        // /asr bodies are far larger than one recv; read headers + full body
+        // once (Content-Length honored). Text endpoints below use the same
+        // `body` string as before.
+        std::string req_headers, body;
+        if (!read_request(client, req_headers, body)) {
             ::closesocket(client);
             continue;
         }
-        const std::string req(buf, static_cast<size_t>(n));
+        const std::string& req = req_headers;
 
         // request line: METHOD PATH HTTP/x
         const auto sp1 = req.find(' ');
@@ -366,9 +500,6 @@ int main(int argc, char** argv) {
         const std::string path =
             (sp1 == std::string::npos || sp2 == std::string::npos)
                 ? "" : req.substr(sp1 + 1, sp2 - sp1 - 1);
-        const auto body_pos = req.find("\r\n\r\n");
-        const std::string body = body_pos == std::string::npos
-            ? "" : req.substr(body_pos + 4);
 
         if (path == "/" || path == "/index.html") {
             respond(client, demo_page(), "text/html; charset=utf-8");
@@ -377,6 +508,11 @@ int main(int argc, char** argv) {
                             (have_model ? "true" : "false") +
                             ",\"assistant_lora\":" +
                             (server_lora ? "true" : "false") +
+                            ",\"asr\":" +
+                            (server_whisper
+                                 ? (server_whisper->decoder_loaded()
+                                        ? "\"real\"" : "\"fallback\"")
+                                 : "false") +
                             ",\"peak_rss\":" +
                             std::to_string(platform::peak_rss_bytes() / 1048576) +
                             "}";
@@ -416,6 +552,58 @@ int main(int argc, char** argv) {
             const std::string out =
                 loop.generate(st, seed, 160, {Tokenizer::kEosId}, nullptr);
             respond(client, "{\"text\":\"" + out + "\"}");
+        } else if (path == "/asr" && method == "POST") {
+            // `body` was already fully read by read_request above.
+            if (!server_asr_ready()) {
+                respond(client,
+                        "{\"error\":\"whisper sidecar unavailable\"}");
+            } else {
+                // Body: raw WAV bytes, or JSON {"wav_b64": "..."}.
+                std::string wav;
+                const bool json = !body.empty() && body[0] == '{';
+                if (json) {
+                    if (!base64_decode(json_field(body, "wav_b64"), wav)) {
+                        respond(client,
+                                "{\"error\":\"invalid base64 payload\"}");
+                        ::closesocket(client);
+                        continue;
+                    }
+                } else {
+                    wav = std::move(body);
+                }
+                PcmAudio audio;
+                if (!PcmAudio::load_wav_bytes(wav, audio)) {
+                    respond(client, "{\"error\":\"bad WAV payload\"}");
+                } else {
+                    const std::clock_t t0 = std::clock();
+                    std::string text;
+                    const bool ok = server_whisper->transcribe(audio, text);
+                    const double secs = static_cast<double>(
+                        std::clock() - t0) / CLOCKS_PER_SEC;
+                    if (!ok) {
+                        // Clean, quoted error (silence/noise/too-short).
+                        std::string e;
+                        for (const char c : server_whisper->error()) {
+                            if (c == '"' || c == '\\') e.push_back('\\');
+                            if (static_cast<unsigned char>(c) >= 0x20)
+                                e.push_back(c);
+                        }
+                        respond(client, "{\"error\":\"" + e + "\"}");
+                    } else {
+                        std::string q;
+                        q.reserve(text.size() + 8);
+                        for (const char c : text) {   // JSON-safe quote
+                            if (c == '"' || c == '\\') q.push_back('\\');
+                            if (static_cast<unsigned char>(c) >= 0x20 ||
+                                c == '\t')
+                                q.push_back(c);
+                        }
+                        respond(client,
+                                "{\"text\":\"" + q + "\",\"seconds\":" +
+                                std::to_string(secs) + "}");
+                    }
+                }
+            }
         } else {
             respond(client, "{\"error\":\"not found\"}");
         }

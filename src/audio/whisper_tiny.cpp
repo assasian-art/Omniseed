@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <unordered_map>
 
 namespace omniseed {
@@ -27,12 +28,20 @@ bool PcmAudio::load_wav(const std::string& path, PcmAudio& out) {
         platform::log_error("audio: cannot open %s", path.c_str());
         return false;
     }
+    std::string data((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    return load_wav_bytes(data, out);
+}
 
-    char hdr[12];
-    f.read(hdr, 12);
-    if (f.gcount() != 12 || std::memcmp(hdr, "RIFF", 4) != 0 ||
-        std::memcmp(hdr + 8, "WAVE", 4) != 0) {
-        platform::log_error("audio: not a WAV file: %s", path.c_str());
+bool PcmAudio::load_wav_bytes(const std::string& data, PcmAudio& out) {
+    const char* p = data.data();
+    const size_t total = data.size();
+    auto need = [&](size_t off, size_t n) {
+        return off + n <= total;
+    };
+    if (total < 12 || std::memcmp(p, "RIFF", 4) != 0 ||
+        std::memcmp(p + 8, "WAVE", 4) != 0) {
+        platform::log_error("audio: not a WAV blob (%zu bytes)", total);
         return false;
     }
 
@@ -41,31 +50,27 @@ bool PcmAudio::load_wav(const std::string& path, PcmAudio& out) {
     bool have_fmt = false, have_data = false;
     std::vector<int16_t> pcm;
 
-    while (f.good()) {
-        char cid[4] = {0};
+    size_t off = 12;
+    while (off + 8 <= total) {
+        const char* cid = p + off;
         uint32_t sz = 0;
-        f.read(cid, 4);
-        f.read(reinterpret_cast<char*>(&sz), 4);
-        if (f.gcount() != 4) break;
-
+        std::memcpy(&sz, p + off + 4, 4);          // little-endian container
+        off += 8;
         if (std::memcmp(cid, "fmt ", 4) == 0) {
-            char fmt[16] = {0};
-            f.read(fmt, std::min<uint32_t>(sz, 16));
-            std::memcpy(&channels, fmt + 2, 2);
-            std::memcpy(&rate, fmt + 4, 4);
-            std::memcpy(&bits, fmt + 14, 2);
+            if (!need(off, 16)) return false;
+            std::memcpy(&channels, p + off + 2, 2);
+            std::memcpy(&rate, p + off + 4, 4);
+            std::memcpy(&bits, p + off + 14, 2);
             have_fmt = true;
-            if (sz > 16) f.seekg(static_cast<std::streamoff>(sz - 16), std::ios::cur);
         } else if (std::memcmp(cid, "data", 4) == 0) {
-            const size_t n = sz / 2;
+            const size_t avail = std::min<size_t>(sz, total - off);
+            const size_t n = avail / 2;
             pcm.resize(n);
-            f.read(reinterpret_cast<char*>(pcm.data()),
-                   static_cast<std::streamsize>(sz));
+            std::memcpy(pcm.data(), p + off, n * 2);
             have_data = true;
             break;
-        } else {
-            f.seekg(static_cast<std::streamoff>(sz), std::ios::cur);
         }
+        off += sz + (sz & 1);                      // chunks are word-aligned
     }
 
     if (!have_fmt || !have_data) {

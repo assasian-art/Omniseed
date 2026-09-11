@@ -85,6 +85,13 @@ Options: `--model PATH`, `--prompt TEXT`, `--max-tokens N`, `--quiet`.
 | `/health` | GET | — | `{"ok":true,"model":true,"assistant_lora":false,"peak_rss":42}` |
 | `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64}` | `{"reply":"..."}` |
 | `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64}` | `{"text":"..."}` |
+| `/asr` | POST | raw 16 kHz mono 16-bit WAV bytes, or `{"wav_b64":"<base64>"}` | `{"text":"<|0.00|> ...<|4.00|>","seconds":4.3}`; `{"error":"..."}` on silence/noise/too-short clips |
+
+`/asr` (Phase 15) runs the real whisper-tiny encoder + greedy decoder (HF
+official-parity: suppress tokens + timestamp rules). The sidecar
+(`models/whisper-tiny-encoder.gguf`) loads lazily on the first `/asr` call;
+`/health` reports `"asr":"real"|"fallback"|false` after that. Transcription
+includes whisper timestamp tokens; strip `<|...|>` spans for plain text.
 
 Assistant-behavior LoRA: start the server with `--assistant-lora
 models/assistant-lora.gguf` (or `OMNISEED_ASSISTANT_LORA`), or pass
