@@ -13,7 +13,12 @@
 #include "omniseed/trading/simulate.h"
 #include "omniseed/agent/sub_agents.h"
 #include "omniseed/runtime/introspection.h"
+#include "omniseed/runtime/cloud_bridge.h"
+#include "omniseed/trading/finance.h"
+#include "omniseed/trading/reasoning_tools.h"
 #include "omniseed/agent/agent.h"
+
+#include <map>
 
 #include <cmath>
 #include <cstdio>
@@ -565,6 +570,162 @@ static void test_introspection() {
     CHECK(cfg.trading_mode && cfg.state_fingerprint);
 }
 
+// ===========================================================================
+// Finance math: NPV/IRR/Black-Scholes + sandbox interpreter
+// ===========================================================================
+static void test_finance() {
+    TEST("finance: NPV/IRR/Black-Scholes, sandbox interpreter");
+
+    // NPV of -100 today + 110 next year at 10% = 0.
+    CHECK(std::fabs(finance_npv(0.10, {-100.0, 110.0})) < 1e-9);
+
+    // IRR of the same stream = 10%.
+    double irr = 0.0;
+    CHECK(finance_irr({-100.0, 110.0}, irr));
+    CHECK(std::fabs(irr - 0.10) < 1e-4);
+    // No sign change -> no IRR.
+    CHECK(!finance_irr({10.0, 20.0, 30.0}, irr));
+
+    // Put-call parity: C - P = S - K*exp(-rT).
+    const double S = 100, K = 105, r = 0.05, sig = 0.2, T = 0.5;
+    const double parity = bs_call(S, K, r, sig, T) - bs_put(S, K, r, sig, T);
+    CHECK(std::fabs(parity - (S - K * std::exp(-r * T))) < 1e-9);
+    // Degenerate inputs price at 0.
+    CHECK(bs_call(100, 100, 0.05, 0.0, 1.0) == 0.0);
+
+    // Sandbox: allowed functions work.
+    auto res = FinanceInterpreter::evaluate("2 + 3 * 4");
+    CHECK(res.ok && std::fabs(res.value - 14.0) < 1e-12);
+    res = FinanceInterpreter::evaluate("(2 + 3) * 4");
+    CHECK(res.ok && std::fabs(res.value - 20.0) < 1e-12);
+    res = FinanceInterpreter::evaluate("sqrt(144)");
+    CHECK(res.ok && std::fabs(res.value - 12.0) < 1e-12);
+    res = FinanceInterpreter::evaluate("max(3, 7) * min(2, 5)");
+    CHECK(res.ok && std::fabs(res.value - 14.0) < 1e-12);
+    res = FinanceInterpreter::evaluate("npv(0.1, -100, 110)");
+    CHECK(res.ok && std::fabs(res.value) < 1e-9);
+    res = FinanceInterpreter::evaluate("irr(-100, 110)");
+    CHECK(res.ok && std::fabs(res.value - 0.10) < 1e-4);
+    res = FinanceInterpreter::evaluate("bscall(100, 100, 0.05, 0.2, 1)");
+    CHECK(res.ok && res.value > 0.0);
+
+    // Sandbox: hostile inputs refused.
+    CHECK(!FinanceInterpreter::evaluate("system('rm -rf /')").ok);
+    CHECK(!FinanceInterpreter::evaluate("__import__('os')").ok);
+    CHECK(!FinanceInterpreter::evaluate("1/0").ok);
+    CHECK(!FinanceInterpreter::evaluate("pow(10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10)").ok);
+    CHECK(!FinanceInterpreter::evaluate("").ok);
+}
+
+// ===========================================================================
+// Reasoning tools: doc reader parsing, DDG parse, tool invocation
+// ===========================================================================
+static void test_reasoning_tools() {
+    TEST("reasoning tools: html_to_text, ddg parse, registry invocation");
+
+    const std::string html =
+        "<html><head><style>body{color:red}</style></head><body>"
+        "<h1>Filing&nbsp;Summary</h1>"
+        "<script>evil()</script>"
+        "<p>Revenue rose 10% &amp; costs fell.</p></body></html>";
+    const std::string text = html_to_text(html);
+    CHECK(text.find("evil") == std::string::npos);
+    CHECK(text.find("body{color:red}") == std::string::npos);
+    CHECK(text.find("Filing Summary") != std::string::npos);
+    CHECK(text.find("Revenue rose 10% & costs fell.") != std::string::npos);
+
+    CHECK(is_fetchable_url("http://example.com/x"));
+    CHECK(is_fetchable_url("https://sec.gov/filing.htm"));
+    CHECK(!is_fetchable_url("file:///etc/passwd"));
+    CHECK(!is_fetchable_url("ftp://x"));
+    CHECK(!is_fetchable_url("http://"));
+
+    // Canned fetcher -> the registered tools work end-to-end offline.
+    static const std::string ddg_page =
+        "<a rel=\"nofollow\" class=\"result__a\" "
+        "href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Faapl\""
+        ">AAPL filing</a>"
+        "<a class=\"result__snippet\">Ten-K summary text</a>";
+    ToolRegistry reg;
+    register_reasoning_tools(reg, [](const std::string& url,
+                                     std::string& response,
+                                     std::string& err) {
+        (void)url;
+        err.clear();
+        response = ddg_page;
+        return true;
+    });
+    CHECK(reg.has("web_search"));
+    CHECK(reg.has("finance_calc"));
+    CHECK(reg.has("code_interpreter"));
+    CHECK(reg.has("document_reader"));
+
+    bool ok = false;
+    const std::string search_out =
+        reg.invoke("web_search", "{\"query\":\"AAPL 10-K\"}", ok);
+    CHECK(ok);
+    CHECK(search_out.find("https://example.com/aapl") != std::string::npos);
+    CHECK(search_out.find("AAPL filing") != std::string::npos);
+
+    ok = false;
+    const std::string calc_out =
+        reg.invoke("finance_calc", "{\"expression\":\"2^10\"}", ok);
+    CHECK(ok && calc_out.find("1024") != std::string::npos);
+
+    ok = true;
+    reg.invoke("finance_calc", "{\"expression\":\"sqrt(-1)\"}", ok);
+    CHECK(!ok);
+
+    ok = false;
+    const std::string doc_out = reg.invoke(
+        "document_reader", "{\"url\":\"https://sec.gov/x.htm\"}", ok);
+    CHECK(ok);
+    CHECK(doc_out.find("Ten-K summary") != std::string::npos);
+
+    // web_search with a FAILING fetcher must degrade to a JSON error, not
+    // an exception.
+    ToolRegistry reg2;
+    register_reasoning_tools(reg2, [](const std::string&, std::string&,
+                                      std::string& err) {
+        err = "offline";
+        return false;
+    });
+    ok = false;
+    const std::string err_out =
+        reg2.invoke("web_search", "{\"query\":\"x\"}", ok);
+    CHECK(!ok && err_out.find("offline") != std::string::npos);
+}
+
+// ===========================================================================
+// Cloud bridge: URL parsing, response parsing, local fallback
+// ===========================================================================
+static void test_cloud_bridge() {
+    TEST("cloud bridge: parse providers, honest fallback, hybrid routing");
+
+    // No key -> local mode, ask() fails with a clear error and no network.
+    CloudBridge nokey;
+    CHECK(!nokey.available());
+    std::string reply, err;
+    CHECK(!nokey.ask("hello", reply, err));
+    CHECK(err.find("local mode") != std::string::npos);
+
+    // HybridRouter: local when no bridge; escalates research-looking asks
+    // only when a bridge is available.
+    HybridRouter local_router(nullptr);
+    const auto d1 = HybridRouter::route("what time is it", false);
+    CHECK(!d1.use_cloud);
+    const auto d2 = HybridRouter::route(
+        "analyze the macroeconomic implications of a fed rate hike and "
+        "compare them to 2019 earnings trends across sectors, then research "
+        "the sec filings", true);
+    CHECK(d2.use_cloud);
+    const auto d3 = HybridRouter::route("buy or hold?", true);
+    CHECK(!d3.use_cloud);
+    std::string r2, e2;
+    CHECK(!local_router.ask_cloud("deep research", r2, e2));
+    CHECK(e2.find("unavailable") != std::string::npos);
+}
+
 int main() {
     test_indicators();
     test_signals();
@@ -577,6 +738,9 @@ int main() {
     test_news_feed();
     test_sub_agents();
     test_introspection();
+    test_finance();
+    test_reasoning_tools();
+    test_cloud_bridge();
 
     platform::log_info("---- trading tests: %d passed, %d failed ----",
                        g_passed, g_failed);

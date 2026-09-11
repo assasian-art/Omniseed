@@ -78,7 +78,10 @@ set(OMNISEED_CORE_SOURCES
     src/trading/trading_engine.cpp
     src/trading/news_feed.cpp
     src/trading/simulate.cpp
+    src/trading/finance.cpp
+    src/trading/reasoning_tools.cpp
     src/runtime/introspection.cpp
+    src/runtime/cloud_bridge.cpp
     src/agent/sub_agents.cpp
 )
 

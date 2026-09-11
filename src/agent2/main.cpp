@@ -19,8 +19,11 @@
 // =============================================================================
 #include "omniseed/core/platform.h"
 #include "omniseed/agent/sub_agents.h"
+#include "omniseed/runtime/cloud_bridge.h"
 #include "omniseed/runtime/introspection.h"
+#include "omniseed/trading/finance.h"
 #include "omniseed/trading/news_feed.h"
+#include "omniseed/trading/reasoning_tools.h"
 #include "omniseed/trading/simulate.h"
 
 #include <algorithm>
@@ -75,6 +78,7 @@ struct Args {
     std::string csv_dir = "models/market";
     std::string news_dir = "models/news";
     std::string strategy = "balanced";
+    std::string prompt;             // cloud: one-shot ask
     double years = 5.0;
     double capital = 100000.0;
     int32_t interval = 60;
@@ -95,6 +99,7 @@ Args parse_args(int argc, char** argv, int start) {
         else if (s == "--csv-dir" && has_val) a.csv_dir = v;
         else if (s == "--news-dir" && has_val) a.news_dir = v;
         else if (s == "--strategy" && has_val) a.strategy = v;
+        else if (s == "--prompt" && has_val) a.prompt = v;
         else if (s == "--backtest-years" && has_val) a.years = std::atof(v.c_str());
         else if (s == "--capital" && has_val) a.capital = std::atof(v.c_str());
         else if (s == "--interval" && has_val) a.interval = std::atoi(v.c_str());
@@ -510,13 +515,41 @@ int cmd_metacognition(const Args& a) {
 }
 
 // ===========================================================================
-// cloud (Phase-3 fills the HTTP client; status-only here by design)
+// cloud — hybrid reasoning bridge status + optional one-shot ask
 // ===========================================================================
-int cmd_cloud() {
-    const bool has_key = std::getenv("OMNISEED_CLOUD_KEY") != nullptr;
-    std::printf("cloud bridge: %s\n",
-                has_key ? "key present (OMNISEED_CLOUD_KEY)"
-                        : "not configured — local AgentLoop only (fallback)");
+int cmd_cloud(const Args& a) {
+    CloudBridge::Config cfg;
+    CloudBridge bridge(cfg);
+    std::printf("cloud bridge : %s\n",
+                bridge.available()
+                    ? "configured (OMNISEED_CLOUD_KEY present)"
+                    : "not configured — local AgentLoop only (fallback)");
+    std::printf("provider     : %s model %s\n",
+                cfg.provider == CloudBridge::Provider::Anthropic
+                    ? "anthropic-compatible"
+                    : "openai-compatible",
+                cfg.model.c_str());
+    std::printf("TLS note     : zero-dep runtime has no TLS stack; set "
+                "OMNISEED_CLOUD_PROXY=http://127.0.0.1:PORT for https "
+                "providers\n");
+
+    // Optional one-shot ask: --prompt "complex question"
+    if (!a.prompt.empty()) {
+        if (!bridge.available()) {
+            std::printf("[cloud] no key — answering locally is the "
+                        "AgentLoop's job (omniseed ask)");
+            return 1;
+        }
+        const auto d = HybridRouter::route(a.prompt, bridge.available(),
+                                           true);
+        std::printf("route        : %s\n", d.reason.c_str());
+        std::string reply, err;
+        if (!bridge.ask(a.prompt, reply, err)) {
+            std::printf("[cloud] error: %s\n", err.c_str());
+            return 2;
+        }
+        std::printf("[cloud] %s\n", reply.c_str());
+    }
     return 0;
 }
 
@@ -536,7 +569,7 @@ int main(int argc, char** argv) {
     if (cmd == "trading-watch")    return cmd_trading_watch(a);
     if (cmd == "introspect")       return cmd_introspect();
     if (cmd == "metacognition")    return cmd_metacognition(a);
-    if (cmd == "cloud")            return cmd_cloud();
+    if (cmd == "cloud")            return cmd_cloud(a);
 
     print_usage();
     return 1;
