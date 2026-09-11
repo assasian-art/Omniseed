@@ -1,7 +1,8 @@
 # OmniSeed — Master Specification
 
-**Version:** 2.6 (Phase-15 — real end-to-end ASR at official-HF parity: /asr endpoint,
-oracle-verified whisper-tiny port, Modal GPU training pipeline) · **Date:** 2026-09-11 ·
+**Version:** 3.0 (Phase-16 — Trading Expert Mode: multi-agent trading framework,
+paper/Alpaca execution, self-awareness + metacognition, optional cloud-reasoning
+bridge) · **Date:** 2026-09-11 ·
 **Language:** pure C++17
 **Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
 RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 114.7–115.4 MB on the
@@ -386,7 +387,58 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
    integration is the natural upgrade when the 300 MB cap is relaxed.
 4. **Catalog III (#81–100)** — research-frontier items; interfaces reserved as noted.
 
-## 10. Phase-15 — Real ASR + Modal training (v2.6)
+## 10. Phase-16 — Trading Expert Mode + Self-Awareness (v3.0)
+
+### 10a. Trading framework (all pure C++17, zero deps)
+
+| Component | Files | Notes |
+|---|---|---|
+| Market data + CSV | `src/trading/trading_engine.cpp`, `tools/fetch_market_data.py` | OHLCV bars; Yahoo/Stooq/synthetic sources; intraday-exact round-trips |
+| Signals | `SignalGenerator` | SMA/EMA/RSI-Wilder/MACD/Bollinger/ATR; coherent voting (+2 dip / −2 overbought); **no look-ahead** |
+| Risk | `RiskManager` | fractional Kelly (2% zero-evidence probe), 8% stops, 20% drawdown halt, exposure caps |
+| Backtester | `Backtester` | next-bar-open fills, 5 bps fees + 2 bps slippage, signal exits, Sharpe/Sortino/maxDD/PF/CAGR |
+| Paper broker | `src/trading/simulate.cpp` | slippage+fee fills, live re-marking, equity curves |
+| News | `src/trading/news_feed.cpp`, `tools/fetch_news.py` | RSS/Atom + GUID dedup, boundary-aware lexicon sentiment, ticker entities, breaking alerts |
+| Sub-agents | `src/agent/sub_agents.cpp` | MarketAnalyst (tech+news blend, weighted consensus), NewsMonitor (interrupts), RiskManager (vetoes), Execution, Research, TradingWatchdog |
+| Alpaca adapter | `src/trading/broker_alpaca.cpp` | REST v2, **PAPER default**, mockable transport, local order validation before any network call |
+
+**CLI (omniseed_agent2):** `trading-analyze`, `trading-watch`,
+`trading-simulate`, `trading-execute`, `introspect`, `metacognition`, `cloud`.
+Full workflows + safety rules: `docs/TRADING_GUIDE.md`.
+
+**Honest disclaimer (repeated by every trading command):** losses are minimized
+by discipline, never eliminated; backtests prove the past; paper trading only
+unless the two-key live gauntlet is passed.
+
+### 10b. Self-awareness & metacognition (structured, not sentient)
+
+| Piece | File | What it honestly does |
+|---|---|---|
+| SelfModel | `src/runtime/introspection.cpp` | identity + mission + a capability map marked real/partial/absent |
+| GoalTracker | same | priority-sorted goals with double-exact persistence ('OKGD') |
+| ActionRationale | same | "I chose X because Y" with stated confidence; outcome resolution → confidence-accuracy calibration ('OKRA') |
+| PurposeReflection | same | mission-anchored answer grounded in the actual goal list + decision log |
+| Metacognition | same | knowledge gaps, OVERCONFIDENT detection (gap > 0.10 over ≥5 samples), evidence-shrunk strategy confidence |
+
+This is **Claude-Mythos-style structured introspection over real runtime
+state** — the agent can audit its own calibration and name what it does not
+know. It is not a claim of sentience.
+
+### 10c. AGI-level reasoning (hybrid: local-first + optional cloud)
+
+* **Local edge** stays on the RWKV-7 kernel + deterministic analytics.
+* **CloudBridge** (`src/runtime/cloud_bridge.cpp`): OpenAI/Anthropic-compatible
+  chat APIs over a minimal HTTP/1.1 shim. No key → local mode, silently.
+  The zero-dep runtime has **no TLS**: https requires the user's local relay
+  (`OMNISEED_CLOUD_PROXY`) and is refused loudly otherwise.
+* **HybridRouter** escalates multi-part research asks (size/complexity
+  heuristic) when a bridge exists; everything else answers locally.
+* **Reasoning tools** (registered into ToolRegistry, mockable for tests):
+  `web_search` (DuckDuckGo), `finance_calc` (NPV/IRR/Black-Scholes via the
+  sandboxed `FinanceInterpreter`), `code_interpreter` (sandbox by
+  construction — whitelisted math only), `document_reader` (HTML→text).
+
+## 10z. Phase-15 — Real ASR + Modal training (v2.6)
 
 **ASR (2026-09-11):** the whisper-tiny decoder transcribes real speech at
 official-HF parity. Four stacked bugs fixed (decoder prefill via a shared

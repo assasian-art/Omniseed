@@ -16,9 +16,16 @@ GLM-5.3-FLASH
 - **Build:** `build.bat` (auto-detects VS via vswhere) or
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
-  `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-15 CLOSE-OUT (2026-09-11): **ASR at official-HF
-  parity + `POST /asr` HTTP endpoint + Modal GPU training pipeline.** Real
+  `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
+  `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
+- **Last updated:** PHASE-16 OMEGA PASS (2026-09-11): **Trading Expert Mode +
+  self-awareness + hybrid cloud reasoning.** Multi-agent trading framework
+  (signals/risk/backtester/paper broker/Alpaca-paper adapter, oracle-verified
+  no-look-ahead), structured introspection (self-model, goals, decision
+  rationale + calibration, metacognition), optional cloud bridge + reasoning
+  tools. ctest 6/6. Honest scope: loss minimization, not elimination.
+  Previous: PHASE-15 CLOSE-OUT — ASR at official-HF
+  parity + `POST /asr` HTTP endpoint + Modal GPU training pipeline. Real
   end-to-end transcription (`<|0.00|> Experience proves this.<|4.00|>`, ~4 s,
   omniseed_sides 22/22, oracle mel 1.1e-4 / encoder 1.1e-3 / generate parity),
   server `POST /asr` (raw WAV or wav_b64, lazy sidecar, /health "asr" field),
@@ -989,3 +996,107 @@ python tools/modal_train.py lora --steps 2000    # assistant sidecar, minutes
    then Render live deploy.
 3. Optional ASR follow-ups: language auto-detect, streaming mel, browser
    console mic capture wired to /asr.
+
+---
+
+## 13. PHASE-16 — OMEGA PASS: TRADING + SELF-AWARENESS (2026-09-11)
+
+Scope honored from the user brief: trading expert, multi-agent, AGI-style
+hybrid reasoning, Mythos-style self-awareness — with the honest boundary that
+"loss is not a concept" became **loss minimization through risk discipline**.
+Every trading command prints the disclaimer. No guaranteed-profit claims
+anywhere.
+
+### Commits (one per phase)
+| Phase | Commit | Content |
+|---|---|---|
+| 1+2 | `67a13cd` | trading core + news + sub-agents + introspection (16 files, 4009 insertions) |
+| 3 | `9b3b56e` | cloud bridge + finance math + sandboxed reasoning tools |
+| 4 | `1d0a44a` | Alpaca client (paper-first) + trading-execute gauntlet |
+| 5 | (this) | docs + push |
+
+### 13a. Trading framework (Phase 1)
+- `include/omniseed/trading/trading_engine.h` + impl: OHLCV bars + CSV
+  (intraday-exact round-trip), MarketDataFeed, SignalGenerator
+  (SMA20/50/200, EMA, RSI-14 Wilder, MACD 12/26/9, Bollinger 20/2σ, ATR-14;
+  coherent voting: oversold dip +2 beats its own downtrend −1), PositionManager,
+  RiskManager (quarter-Kelly from realized stats → 2% zero-evidence probe;
+  8% stop, optional TP, 20% drawdown halt, exposure cap), Backtester
+  (next-bar-open fills, 5 bps fee + 2 bps slippage, signal exits, metrics).
+- Verified against **real data**: 1254 AAPL daily bars (Yahoo chart API, no
+  key) → 45 trades, 75.6% win, PF 1.51, maxDD 1.41% (momentum preset).
+  No-look-ahead proven by test: truncating the future never changes past
+  equity. Constant-return Sharpe reports 0 (zero variance), not ∞.
+- `tools/fetch_market_data.py`: stooq → yahoo → deterministic SYNTH fallback
+  (stooq now behind a JS proof-of-work wall; yahoo works).
+- `src/trading/news_feed.cpp`: tolerant RSS/Atom ingest + GUID dedup,
+  boundary-aware lexicon sentiment (\"miss\" never matches \"mission\"),
+  ticker entity extraction, recency-weighted aggregates, breaking alerts.
+- `src/agent/sub_agents.cpp`: MarketAnalystAgent (tech+news blend,
+  weighted consensus with tie→Hold), NewsMonitorAgent (→
+  SensoryInterruptSystem p9), RiskManagerAgent (concentration/dd vetoes),
+  ExecutionAgent (paper routing), ResearchAgent (briefs), TradingWatchdog.
+- CLI `omniseed_agent2 trading-analyze / trading-watch / trading-simulate`.
+
+### 13b. Self-awareness (Phase 2) — structured, not sentient
+- `src/runtime/introspection.cpp`: SelfModel (capability map marked
+  real/partial/absent — live data, real execution, fundamentals are ABSENT),
+  GoalTracker ('OKGD' persistence, double-exact priorities — a 4-byte
+  priority write corrupted goals on reload, fixed), ActionRationale ('OKRA':
+  \"I chose X because Y\" + confidence; resolve_latest → confidence-accuracy
+  calibration), PurposeReflection (mission-anchored, grounded in the actual
+  log), Metacognition (knowledge gaps, OVERCONFIDENT at gap>0.10/≥5 samples,
+  evidence-shrunk strategy confidence: 30 observations ≈ 6% weight).
+- Wired: watch loop logs every fill + veto to `state/rationale.bin`;
+  `AgentLoop::Config.trading_mode` + `state_fingerprint` flags added.
+- CLI: `introspect`, `metacognition`.
+
+### 13c. Hybrid reasoning (Phase 3)
+- `src/runtime/cloud_bridge.cpp`: OpenAI/Anthropic-compatible chat over a
+  minimal HTTP/1.1 shim (IPv4, redirects, header-carrying request_json).
+  **No TLS in the zero-dep runtime**: https requires OMNISEED_CLOUD_PROXY
+  (user's local relay) and is refused loudly otherwise — never silently
+  downgraded. No key = local mode, silently.
+- HybridRouter escalates multi-part research asks only.
+- `src/trading/finance.cpp`: NPV, bisection IRR (refuses no-sign-change),
+  Black-Scholes (put-call parity tested), FinanceInterpreter sandbox
+  (whitelist-only functions, arg-count caps, finiteness checks, hostile
+  inputs refused in tests).
+- `src/trading/reasoning_tools.cpp`: web_search (DuckDuckGo parse + URL
+  unwrap, injectable fetcher), finance_calc, code_interpreter (sandbox by
+  construction), document_reader (HTML→text, 20 KB prompt bound).
+- CLI: `cloud` (status + one-shot `--prompt` ask).
+
+### 13d. Execution (Phase 4)
+- `src/trading/broker_alpaca.cpp`: Alpaca REST v2 — account/positions/orders,
+  **PAPER endpoint by default**, keys from env only, local order validation
+  BEFORE any network call (symbol/qty/side matrix tested), string-numeric
+  JSON parsing (Alpaca style), mockable transport (full offline lifecycle
+  test).
+- CLI `trading-execute`: live mode = `--live-trading` AND typing exactly
+  `I ACCEPT REAL LOSS` (no env/flag shortcut; verified abort exit 2);
+  account must be ACTIVE; positions echoed after fills.
+
+### 13e. Verification
+- `omniseed_trading`: **2129 checks, 0 failed** (indicators, signal
+  determinism + no-look-ahead, CSV, positions, Kelly/stops/dd gates,
+  metrics, backtest invariants, RSS/sentiment/entities, consensus, broker,
+  introspection persistence + calibration, finance parity, sandbox refusals,
+  mock Alpaca).
+- ctest **6/6** (platform 206 + real_weights 13 + sides 22 + qat_ab 8 +
+  lora + trading 2129). Zero /W4 warnings. Peak RSS of every new CLI
+  command: **< 5 MB** (trading stack is budget-free; models not loaded).
+
+### Honest boundary (docs/TRADING_GUIDE.md carries the same)
+Loss minimization, not elimination. Backtests prove the past. Real trading
+requires broker API + market data + the two-key live gauntlet. Live feed,
+SEC/earnings fundamentals, and full vision backbone remain documented gaps.
+
+### NEXT STEPS (updated)
+1. **Modal one-shot training** (unchanged, user-triggered):
+   `python tools/modal_train.py qat --fresh` → ternary graduation at val
+   PPL ≤ 60 (§12 recipe).
+2. Trading follow-ups when the user wants depth: streaming quote adapter
+   (websocket), SEC/earnings document pipeline into ResearchAgent,
+   calibration-driven position-size scaling.
+3. Optional: browser console exposes paper-portfolio status via the server.
