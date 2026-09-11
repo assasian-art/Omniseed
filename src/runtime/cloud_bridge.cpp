@@ -364,6 +364,14 @@ bool CloudBridge::post_json(const std::string& url, const std::string& body,
 bool CloudBridge::get_text(const std::string& url, int timeout_s,
                            std::string& response, int& status,
                            std::string& err) {
+    return request_json("GET", url, "", {}, timeout_s, response, status, err);
+}
+
+bool CloudBridge::request_json(
+        const std::string& method, const std::string& url,
+        const std::string& body,
+        const std::map<std::string, std::string>& headers, int timeout_s,
+        std::string& response, int& status, std::string& err) {
     Url u = split_url(url);
     if (!u.valid) { err = "bad url"; return false; }
     if (u.tls) {
@@ -374,9 +382,11 @@ bool CloudBridge::get_text(const std::string& url, int timeout_s,
             return false;
         }
         u = split_url(proxy);
-        u.path = url;
+        u.path = url;                       // absolute-URI for the relay
     }
-    return http_exchange(u, "GET", "", "", {}, timeout_s, response, status, err);
+    return http_exchange(u, method, body,
+                         body.empty() ? "" : "application/json",
+                         headers, timeout_s, response, status, err);
 }
 
 bool CloudBridge::ask(const std::string& prompt, std::string& reply,

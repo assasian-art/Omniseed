@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 
 namespace omniseed {
@@ -55,6 +56,14 @@ public:
                           const std::string& content_type, int timeout_s,
                           std::string& response, int& status,
                           std::string& err);
+
+    // Generic request with custom headers (broker auth, etc.). GET when
+    // method=="GET" (body ignored); https hosts require the relay env.
+    static bool request_json(const std::string& method, const std::string& url,
+                             const std::string& body,
+                             const std::map<std::string, std::string>& headers,
+                             int timeout_s, std::string& response, int& status,
+                             std::string& err);
 
     // GET text (doc_reader/web tools).
     static bool get_text(const std::string& url, int timeout_s,

@@ -21,10 +21,13 @@
 #include "omniseed/agent/sub_agents.h"
 #include "omniseed/runtime/cloud_bridge.h"
 #include "omniseed/runtime/introspection.h"
+#include "omniseed/trading/broker_alpaca.h"
 #include "omniseed/trading/finance.h"
 #include "omniseed/trading/news_feed.h"
 #include "omniseed/trading/reasoning_tools.h"
 #include "omniseed/trading/simulate.h"
+
+#include <iostream>
 
 #include <algorithm>
 #include <chrono>
@@ -63,7 +66,10 @@ void print_usage() {
         "                    [--strategy momentum|mean-reversion|balanced]\n"
         "  introspect        self-model, goals, rationale, purpose\n"
         "  metacognition     confidence calibration + knowledge gaps\n"
-        "  cloud             cloud-reasoning bridge status (optional key)\n");
+        "  cloud             cloud-reasoning bridge status (optional key)\n"
+        "  trading-execute   --ticker AAPL --side buy --qty 10 [--live-trading]\n"
+        "                    Alpaca order (PAPER default; live needs typed\n"
+        "                    confirmation)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +77,9 @@ void print_usage() {
 // ---------------------------------------------------------------------------
 struct Args {
     std::string ticker = "AAPL";
+    std::string side = "buy";
+    double qty = 0.0;
+    bool live_trading = false;
     std::string tickers;
     std::string timeframe = "1d";
     std::string csv;
@@ -92,6 +101,9 @@ Args parse_args(int argc, char** argv, int start) {
         const bool has_val = i + 1 < argc;
         const std::string v = has_val ? argv[i + 1] : "";
         if (s == "--ticker" && has_val) a.ticker = v;
+        else if (s == "--side" && has_val) a.side = v;
+        else if (s == "--qty" && has_val) a.qty = std::atof(v.c_str());
+        else if (s == "--live-trading") { a.live_trading = true; continue; }
         else if (s == "--tickers" && has_val) a.tickers = v;
         else if (s == "--timeframe" && has_val) a.timeframe = v;
         else if (s == "--csv" && has_val) a.csv = v;
@@ -553,6 +565,78 @@ int cmd_cloud(const Args& a) {
     return 0;
 }
 
+// ===========================================================================
+// trading-execute — Alpaca broker order (paper-first safety gauntlet)
+// ===========================================================================
+int cmd_trading_execute(const Args& a) {
+    const bool live = std::getenv("OMNISEED_LIVE_CONFIRM") != nullptr &&
+                      std::string(std::getenv("OMNISEED_LIVE_CONFIRM")) ==
+                          "I ACCEPT REAL LOSS";
+    if (a.live_trading && !live) {
+        std::printf(
+            "[execute] --live-trading requires typing the confirmation\n"
+            "  phrase at the prompt (no env/flag shortcuts).\n"
+            "  This is REAL money on the LIVE endpoint.\n"
+            "  Type exactly: I ACCEPT REAL LOSS\n> ");
+        std::string line;
+        if (!std::getline(std::cin, line) || line != "I ACCEPT REAL LOSS") {
+            std::printf("[execute] confirmation failed — aborting.\n");
+            return 2;
+        }
+    }
+
+    AlpacaClient::Config cfg;
+    cfg.endpoint = a.live_trading ? AlpacaClient::Endpoint::Live
+                                  : AlpacaClient::Endpoint::Paper;
+    AlpacaClient client(cfg);
+    std::printf("[execute] endpoint : %s\n",
+                a.live_trading ? "LIVE (real money)" : "PAPER (fake money)");
+    if (!client.valid()) {
+        std::printf("[execute] keys not configured (env):\n"
+                    "  export ALPACA_API_KEY_ID=...\n"
+                    "  export ALPACA_API_SECRET_KEY=...\n");
+        return 2;
+    }
+
+    // Local validation BEFORE any network call.
+    std::string why;
+    if (!AlpacaClient::validate_order(a.ticker, a.qty, a.side, why)) {
+        std::printf("[execute] invalid order: %s\n", why.c_str());
+        return 1;
+    }
+
+    // Account check: trading only when the account is ACTIVE.
+    AlpacaClient::Account acct;
+    if (!client.get_account(acct)) {
+        std::printf("[execute] account check failed: %s\n",
+                    client.error().c_str());
+        return 2;
+    }
+    std::printf("[execute] account   : %s, equity %.2f, cash %.2f\n",
+                acct.status.c_str(), acct.equity, acct.cash);
+    if (acct.status != "ACTIVE") {
+        std::printf("[execute] account not ACTIVE — refusing.\n");
+        return 2;
+    }
+
+    std::string order_id;
+    if (!client.submit_market_order(a.ticker, a.qty, a.side, order_id)) {
+        std::printf("[execute] order failed: %s\n",
+                    client.error().c_str());
+        return 2;
+    }
+    std::printf("[execute] ORDER PLACED: %s %s %.0f -> id %s\n",
+                a.side.c_str(), a.ticker.c_str(), a.qty, order_id.c_str());
+    std::printf("[execute] verify on the Alpaca dashboard; positions:\n");
+    std::vector<AlpacaClient::BrokerPosition> pos;
+    if (client.get_positions(pos))
+        for (const auto& p : pos)
+            std::printf("  %s: %.0f @ %.2f (now %.2f, P&L %+.2f)\n",
+                        p.symbol.c_str(), p.qty, p.avg_entry_price,
+                        p.current_price, p.unrealized_pl);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -570,6 +654,7 @@ int main(int argc, char** argv) {
     if (cmd == "introspect")       return cmd_introspect();
     if (cmd == "metacognition")    return cmd_metacognition(a);
     if (cmd == "cloud")            return cmd_cloud(a);
+    if (cmd == "trading-execute")  return cmd_trading_execute(a);
 
     print_usage();
     return 1;

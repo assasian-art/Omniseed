@@ -14,6 +14,7 @@
 #include "omniseed/agent/sub_agents.h"
 #include "omniseed/runtime/introspection.h"
 #include "omniseed/runtime/cloud_bridge.h"
+#include "omniseed/trading/broker_alpaca.h"
 #include "omniseed/trading/finance.h"
 #include "omniseed/trading/reasoning_tools.h"
 #include "omniseed/agent/agent.h"
@@ -726,6 +727,84 @@ static void test_cloud_bridge() {
     CHECK(e2.find("unavailable") != std::string::npos);
 }
 
+// ===========================================================================
+// Alpaca client: order validation, mock transport, paper-first defaults
+// ===========================================================================
+static void test_alpaca() {
+    TEST("alpaca: order validation, mock transport, paper-first");
+
+    // Pure validation (no network, no keys).
+    std::string why;
+    CHECK(AlpacaClient::validate_order("AAPL", 10, "buy", why));
+    CHECK(AlpacaClient::validate_order("BRK.B", 1, "sell", why));
+    CHECK(!AlpacaClient::validate_order("", 10, "buy", why));
+    CHECK(!AlpacaClient::validate_order("aapl", 10, "buy", why));   // lowercase
+    CHECK(!AlpacaClient::validate_order("AAPL", 0, "buy", why));
+    CHECK(!AlpacaClient::validate_order("AAPL", -5, "buy", why));
+    CHECK(!AlpacaClient::validate_order("AAPL", 10, "short", why));
+    CHECK(!AlpacaClient::validate_order("TOOLONGTICKER", 1, "buy", why));
+
+    // Paper-first default: config without explicit endpoint stays paper.
+    AlpacaClient::Config dflt;
+    CHECK(dflt.endpoint == AlpacaClient::Endpoint::Paper);
+
+    // Mock transport: account + order lifecycle offline.
+    static const std::string acct_json =
+        "{\"account_number\":\"123\",\"status\":\"ACTIVE\"," 
+        "\"cash\":\"50000.00\",\"equity\":\"61234.56\"," 
+        "\"buying_power\":\"120000.00\"}";
+    static const std::string order_json =
+        "{\"id\":\"ord-9f3a\",\"symbol\":\"AAPL\",\"qty\":\"10\"," 
+        "\"side\":\"buy\",\"status\":\"new\"}";
+    int calls = 0;
+    AlpacaClient::Config cfg;
+    cfg.key_id = "test-key"; cfg.secret_key = "test-secret";
+    AlpacaClient mock(cfg, [&](const std::string& method,
+                               const std::string& path,
+                               const std::string& body, int& status,
+                               std::string& response) {
+        ++calls;
+        if (method == "GET" && path == "/v2/account") {
+            status = 200; response = acct_json; return true;
+        }
+        if (method == "POST" && path == "/v2/orders") {
+            // Echo validation: the client must have validated the body.
+            CHECK(body.find("\"symbol\":\"AAPL\"") != std::string::npos);
+            CHECK(body.find("\"qty\":10") != std::string::npos);
+            status = 200; response = order_json; return true;
+        }
+        status = 404; return true;
+    });
+    CHECK(mock.valid());
+    CHECK(mock.is_paper());
+
+    AlpacaClient::Account acct;
+    CHECK(mock.get_account(acct));
+    CHECK(acct.status == "ACTIVE");
+    // Alpaca sends numerics as JSON strings — the parser accepts both forms.
+    CHECK(std::fabs(acct.equity - 61234.56) < 0.01);
+    CHECK(std::fabs(acct.cash - 50000.0) < 0.01);
+
+    std::string order_id;
+    CHECK(mock.submit_market_order("AAPL", 10, "buy", order_id));
+    CHECK(order_id == "ord-9f3a");
+    CHECK(calls == 2);
+
+    // Garbage orders are refused locally — no network call happens.
+    const int calls_before = calls;
+    CHECK(!mock.submit_market_order("aapl", 10, "buy", order_id));
+    CHECK(!mock.submit_market_order("AAPL", 0, "buy", order_id));
+    CHECK(calls == calls_before);
+
+    // Keys are NOT picked up when env vars are absent (CI has none) —
+    // the default-constructed client is invalid.
+    AlpacaClient nokeys;
+    CHECK(!nokeys.valid());
+    std::vector<AlpacaClient::BrokerPosition> pos;
+    CHECK(!nokeys.get_positions(pos));
+    CHECK(nokeys.error().find("not configured") != std::string::npos);
+}
+
 int main() {
     test_indicators();
     test_signals();
@@ -741,6 +820,7 @@ int main() {
     test_finance();
     test_reasoning_tools();
     test_cloud_bridge();
+    test_alpaca();
 
     platform::log_info("---- trading tests: %d passed, %d failed ----",
                        g_passed, g_failed);
