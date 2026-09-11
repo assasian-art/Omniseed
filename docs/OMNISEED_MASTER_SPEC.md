@@ -1,6 +1,7 @@
 # OmniSeed — Master Specification
 
-**Version:** 2.3 (Phase-13B — round-2b QAT status: ternary path faster than i8; round-3 clean-QAT gate) · **Date:** 2026-09-09 ·
+**Version:** 2.6 (Phase-15 — real end-to-end ASR at official-HF parity: /asr endpoint,
+oracle-verified whisper-tiny port, Modal GPU training pipeline) · **Date:** 2026-09-11 ·
 **Language:** pure C++17
 **Target envelope:** < 300 MB peak RSS at inference — **observed: 155–158 MB with the
 RWKV-7 0.1B model + both sense encoders loaded, 15–21 tok/s (AVX2); 114.7–115.4 MB on the
@@ -343,10 +344,19 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
   four mode combinations.
 - **Real-weights suite** (`tests/test_real_weights.cpp`, skips if no GGUF):
   **13/13** — loader integrity, finite logits, stable greedy continuation, RSS cap.
-- **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **17/17** —
+- **Senses suite** (`tests/test_sides.cpp`, skips if no sidecars): **22/22** —
   whisper encoder end-to-end on synthetic mel (real bidirectional MHA),
-  **greedy decoder transcription** (silence → EOT → empty transcript,
-  bounded runtime), ternary vision projection, all-finite outputs.
+  **real end-to-end ASR on a LibriSpeech fixture** (`<|0.00|> Experience
+  proves this.<|4.00|>` — 100% word overlap vs the HF-validated reference,
+  bounded runtime), clean-error silence handling, ternary vision projection,
+  all-finite outputs.
+- **ASR oracle parity (Phase 15):** staged proofs against the official HF
+  implementation (`tools/dbg_whisper_ref.py`, local checkpoint): C++ mel vs
+  `WhisperFeatureExtractor` **max|diff| 1.1e-4**; C++ encoder vs
+  `WhisperModel.encoder` on identical sliced input **max|diff| 1.1e-3** (f16
+  weights); official `model.generate` (greedy **==** beam-5) reproduces the
+  C++ decoder's exact token stream. Environment sanity: whisper.cpp's
+  jfk.wav → the canonical JFK sentence.
 - **Warnings:** zero under MSVC `/W4` (Release); AddressSanitizer clean on the
   senses suite after the null-optional-bias + mmap-lifetime fixes.
 - **Checkpoint equivalence:** official Goose-2.8 0.1B and Hakureirm 0.1B proven
@@ -369,14 +379,31 @@ full ternary (1.58-bit) variant of a bigger checkpoint.
    val PPL ≤ 60 (recipe + `--resume-best`/grad-norm tooling in
    `tools/qat_ternary.py` / `tools/COLAB_QAT.md`). Until then the i8 model
    stays the daily default.
-2. **Whisper decoder language coverage** — end-to-end greedy ASR works in pure C++
-   (silence → EOT verified; real MHA encoder feeds real cross-attention); true
-   speech transcripts need audio test fixtures and optional timestamp handling.
+2. ~~Whisper decoder~~ — **DONE (Phase 15)**: real end-to-end ASR in pure C++,
+   official-HF parity (see §8 oracle numbers), `POST /asr` exposes it over
+   HTTP. Optional follow-ups: language auto-detect, streaming mel.
 3. **WebRTC (#19)** — replaced by the leaner UDP beacon in-budget; a libdatachannel
    integration is the natural upgrade when the 300 MB cap is relaxed.
 4. **Catalog III (#81–100)** — research-frontier items; interfaces reserved as noted.
 
-## 10. Phase-Omega — Grand Unification (v2.2)
+## 10. Phase-15 — Real ASR + Modal training (v2.6)
+
+**ASR (2026-09-11):** the whisper-tiny decoder transcribes real speech at
+official-HF parity. Four stacked bugs fixed (decoder prefill via a shared
+`process_row`; vocab bytes are f16 *values*; HF generation policy — 92
+suppress tokens, begin-suppress, timestamp pairing/monotonicity rules;
+trailing-silence 30 s-padding trim). Fixture policy: the DeepSpeech archive
+label is NOT whisper-tiny's output for the clip — `tests/fixtures/manifest.txt`
+carries the HF-validated transcription and the test asserts model parity.
+
+**Modal GPU training:** `tools/modal_qat.py` (Modal app: chunked ternary QAT
+`train_chunk`, assistant-LoRA `train_lora`, `export_best` artifact report;
+Volume `omniseed-models`) + `tools/modal_train.py` (chunk-loop orchestrator)
++ `docs/MODAL_QAT_GUIDE.md`. Same local tools run remotely on a T4 — round-3
+recipe (fresh init, lr 1e-4, KD 1.0, W32/B32) and the val PPL ≤ 60
+graduation gate are encoded in the defaults.
+
+## 11. Phase-Omega — Grand Unification (v2.2)
 
 All feature registries (deepseek VOL.I/II, grok grounded registry, z.ai
 universe) were triaged against the <300 MB C++17 reality. Implemented now

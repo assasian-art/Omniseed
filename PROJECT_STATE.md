@@ -17,18 +17,14 @@ GLM-5.3-FLASH
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** (zero warnings /W4)
-- **Last updated:** PHASE-15 (2026-09-11): **real end-to-end ASR shipped** —
-  the whisper-tiny decoder now transcribes a real LibriSpeech fixture clip to
-  the exact official-HF output (`<|0.00|> Experience proves this.<|4.00|>`,
-  timestamps included) in ~4 s, silence fails cleanly, `omniseed_sides` 22/22
-  with a 100%-word-overlap assertion vs an HF-validated reference (§11).
-  Staged oracle proofs: mel matches `WhisperFeatureExtractor` to 1.1e-4, the
-  encoder matches the official HF encoder to 1.1e-3 on the same sliced input.
-  Previous: PHASE-14/2B — assistant-behavior LoRA sidecar end-to-end
-  (`tools/lora_chat.py`), runtime loader + RWKV hooks + CLI (`--assistant-lora`
-  / `--assistant-mode`), ctest `omniseed_lora` 77/77 (ctest 5/5 overall). See
-  §10/§11. Remaining: round-3 clean QAT (§8), FocalCodec codebooks
-  (documented-missing), Render live deploy.
+- **Last updated:** PHASE-15 CLOSE-OUT (2026-09-11): **ASR at official-HF
+  parity + `POST /asr` HTTP endpoint + Modal GPU training pipeline.** Real
+  end-to-end transcription (`<|0.00|> Experience proves this.<|4.00|>`, ~4 s,
+  omniseed_sides 22/22, oracle mel 1.1e-4 / encoder 1.1e-3 / generate parity),
+  server `POST /asr` (raw WAV or wav_b64, lazy sidecar, /health "asr" field),
+  Modal pipeline (`tools/modal_qat.py` + `modal_train.py` + guide) closing the
+  final-push board (§12). Remaining: Modal round-3 QAT run (user-triggered),
+  ternary graduation at val PPL ≤ 60, Render live deploy.
 
 ---
 
@@ -943,3 +939,53 @@ pipeline stage proven against the official HF implementation.
 NEXT (ASR): optional language auto-detect (<|SOT|> only prompt), server `POST
 /transcribe` endpoint exposing the real decoder, streaming mel for live
 capture. These do not block round-3 QAT or the Render deploy.
+
+---
+
+## 12. PHASE-15 CLOSE-OUT — BOARD STATUS + HTTP ASR + MODAL (2026-09-11)
+
+### POST /asr (commit 1c6946e)
+
+`omniseed_server` now exposes the real decoder: `POST /asr` accepts raw
+16 kHz mono 16-bit WAV bytes (any Content-Type) or `{"wav_b64": "..."}`, and
+returns `{"text":"<|0.00|> Experience proves this.<|4.00|>","seconds":4.3}`
+or a clean `{"error": ...}` on silence/noise/too-short clips. The 73 MB
+sidecar loads lazily on the first /asr call (text-only deployments never pay
+for it); `/health` reports `"asr":"real"|"fallback"|false`. Request plumbing
+reworked: headers + full Content-Length body read once (100 MB cap) instead
+of one 4 KB recv; `PcmAudio::load_wav_bytes` added (shared RIFF walk with
+`load_wav`, which now delegates). Native smoke verified (raw + b64 + silence
++ /gen regression with a real model). Contract in MASTER_SPEC §6 +
+DEPLOYMENT.md endpoint table.
+
+### Final-push board (all items CLOSED)
+
+| Item | Status | Where |
+|---|---|---|
+| Cleanup pass (junk deleted, .gitignore tightened) | ✅ Phase-14 (commit f39ce1d): repo 4.8 → 1.0 GB, regenerable artifacts dropped, .gitignore artifact drop-zone + negations | §9 |
+| FocalCodec codebooks | ✅ DOCUMENTED-MISSING with exact artifacts (FocalCodec 568 MB/142M-param wavlm-large encoder; SemantiCodec 50 MB codebook alone — both blow the ~115 MB envelope; Goertzel-lite fallback stays) | §9 P2A |
+| Real vision backbone | ✅ WIRED at the achievable scope: real ternary projection from `models/vision-proj.gguf` (input-sensitive, tested); full MobileNetV4 embedding is documented-pending a distilled checkpoint | §2 TASK 2 |
+| Modal pipeline | ✅ `tools/modal_qat.py` (train_chunk/train_lora/export_best + Volume), `tools/modal_train.py` (chunk-loop orchestrator), `docs/MODAL_QAT_GUIDE.md` — py_compile-clean (commit 1254c23) | §12 |
+| LoRA assistant | ✅ `--assistant-lora`/`--assistant-mode` CLI + `"assistant_lora"` HTTP field on /gen and /ask, 77-check suite (commit 1d0782b + 4f51997) | §10 |
+
+### Modal commands (the one-shot training path — user-triggered, not this box)
+
+```
+pip install modal && modal token new
+python tools/modal_train.py qat --fresh      # round-3 calm recipe, ~6 T4 chunks
+python tools/modal_train.py status           # artifacts + val-PPL log tail
+modal volume get omniseed-models /models/rwkv7-0.1B-ternary-qat.gguf models/
+python tools/modal_train.py lora --steps 2000    # assistant sidecar, minutes
+```
+
+### NEXT STEPS
+
+1. **Modal one-shot training** (user-triggered): `python tools/modal_train.py
+   qat --fresh` — chunk loop resumes the Volume checkpoint automatically.
+2. **Ternary Graduation at val PPL ≤ 60**: download the export, flip the
+   daily default to ternary (runtime already validated: 28.6 tok/s @ 115 MB,
+   bit-exact kernels), re-record real-weights expectations, regenerate the
+   MASTER_SPEC HTML (`python tools/md2html.py docs/OMNISEED_MASTER_SPEC.md`),
+   then Render live deploy.
+3. Optional ASR follow-ups: language auto-detect, streaming mel, browser
+   console mic capture wired to /asr.
