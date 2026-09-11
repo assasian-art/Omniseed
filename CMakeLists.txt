@@ -36,6 +36,7 @@ option(OMNISEED_BUILD_TESTS  "Build the unit test suite"                ON)
 option(OMNISEED_BUILD_CLI    "Build the omniseed CLI"                   ON)
 option(OMNISEED_BUILD_SERVER "Build the optional HTTP server"           OFF)
 option(OMNISEED_BUILD_SHARED "Build omniseed_core as a shared library"  OFF)
+option(OMNISEED_BUILD_AGENT2 "Build omniseed_agent2 (trading + introspection CLI)" ON)
 option(OMNISEED_WERROR       "Treat warnings as errors"                 OFF)
 
 # HTTP server is opt-in; the vendored single-header lives in third_party/.
@@ -74,6 +75,11 @@ set(OMNISEED_CORE_SOURCES
     src/agent/compute_throttle.cpp
     src/agent/flash_skills.cpp
     src/agent/agent_intel.cpp
+    src/trading/trading_engine.cpp
+    src/trading/news_feed.cpp
+    src/trading/simulate.cpp
+    src/runtime/introspection.cpp
+    src/agent/sub_agents.cpp
 )
 
 if(OMNISEED_BUILD_SHARED)
@@ -228,6 +234,21 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_lora COMMAND omniseed_lora
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_lora PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # Trading framework: deterministic signal/risk/backtest math on synthetic
+    # bars (no network, no fixtures needed).
+    add_executable(omniseed_trading tests/test_trading.cpp)
+    target_include_directories(omniseed_trading PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_trading PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_trading PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_trading PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_trading COMMAND omniseed_trading
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # --------------------------------- CLI binary --------------------------------
@@ -263,6 +284,22 @@ if(OMNISEED_BUILD_SERVER)
     endif()
     if(WIN32)
         target_link_libraries(omniseed_server PRIVATE ws2_32)
+    endif()
+endif()
+
+# -------------------------- Introspection + trading CLI ----------------------
+# Separate binary so the core CLI stays lean; shares omniseed_core.
+if(OMNISEED_BUILD_AGENT2)
+    add_executable(omniseed_agent2 src/agent2/main.cpp)
+    target_include_directories(omniseed_agent2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(omniseed_agent2 PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(omniseed_agent2 PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_agent2 PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_agent2 PRIVATE -Wall -Wextra)
     endif()
 endif()
 

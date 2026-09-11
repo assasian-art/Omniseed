@@ -225,6 +225,16 @@ public:
         // max_new_tokens in half; at hard_mb, stop generating immediately.
         // 0 = disabled (defaults 260/295 when enabled).
         bool     rss_guard      = false;
+        // ---------------------------------------------------------------
+        // Phase-16 (trading + self-awareness):
+        // ---------------------------------------------------------------
+        // Trading Mode: activate the multi-agent trading swarm context
+        // (analyst/news/risk/execution verdicts may be consulted by the
+        // host CLI; the loop itself stays model-pure).
+        bool     trading_mode     = false;
+        // State fingerprint: print the introspective self-marker (who/what/
+        // purpose + active goals) at the top of each reply, Mythos-style.
+        bool     state_fingerprint = false;
     };
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,
