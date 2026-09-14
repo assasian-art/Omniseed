@@ -8,6 +8,12 @@
 #  How it fits together:
 #    * Base model: models/model.safetensors via RWKV7Ternary (qat_ternary.py)
 #      — frozen; its ternary-STE forward IS the runtime's math.
+#      --gguf-base P overrides EVERY tensor with the values read back from
+#      the served omniseed GGUF (ternary nibbles + per-row scales, int8
+#      gates/head, f16 embedding), so the trained sidecar optimizes exactly
+#      the weights the C++ runtime serves. Masters are set to
+#      T·(scale·in/nnz) so TernarySTE(masters) reproduces the served
+#      dequantized ternary EXACTLY (round(M/s)=T and absmean(M)=s).
 #    * Trainable: classic LoRA factors B·A on the 6 big linears per layer
 #      (att r/k/v/o + ffn key/value — the same tensors the runtime carries as
 #      ternary), rank 8, alpha 16, B initialised to zero (step 0 == base).
@@ -48,10 +54,12 @@
 #  the end-to-end path (the runtime test asserts the delta changes output).
 # =============================================================================
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import struct
 import sys
 import time
 
@@ -65,6 +73,197 @@ from qat_ternary import (            # noqa: E402
 from convert_to_omniseed import (    # noqa: E402
     K, GgufWriter, F16,
 )
+
+# -----------------------------------------------------------------------------
+# Served-GGUF base loading (--gguf-base): read back the exact quantized math
+# the C++ runtime serves, so the LoRA trains ON the deployment weights.
+# -----------------------------------------------------------------------------
+_GGUF_KV_SZ = {0: 1, 1: 1, 2: 1, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+               10: 8, 11: 8, 12: 8}
+
+
+def _gguf_walk(path):
+    """Parse an OmniSeed GGUF: returns (blob, kvs, {name: (rowmajor_shape,
+    dtype, data_offset)}, data_base). Offsets are relative to data_base.
+    kvs holds scalar numeric metadata (u32/i32/u64/f64 -> int/float)."""
+    with open(path, 'rb') as f:
+        blob = f.read()
+    n_tensors, n_kv = struct.unpack('<2Q', blob[8:24])
+    pos = 24
+    kvs = {}
+
+    def rstr(p):
+        n = struct.unpack('<Q', blob[p:p + 8])[0]
+        p += 8
+        return blob[p:p + n], p + n
+
+    for _ in range(n_kv):
+        key, pos = rstr(pos)
+        t = struct.unpack('<I', blob[pos:pos + 4])[0]
+        pos += 4
+        if t == 8:
+            _, pos = rstr(pos)
+        elif t == 9:
+            at = struct.unpack('<I', blob[pos:pos + 4])[0]
+            pos += 4
+            cnt = struct.unpack('<Q', blob[pos:pos + 8])[0]
+            pos += 8
+            for _ in range(cnt):
+                if at == 8:
+                    _, pos = rstr(pos)
+                else:
+                    pos += _GGUF_KV_SZ[at]
+        elif t in (10, 12):
+            kvs[key.decode()] = struct.unpack('<Q', blob[pos:pos + 8])[0]
+            pos += 8
+        elif t in (4, 5):
+            kvs[key.decode()] = struct.unpack('<I', blob[pos:pos + 4])[0]
+            pos += 4
+        else:
+            pos += _GGUF_KV_SZ[t]
+
+    tensors = {}
+    for _ in range(n_tensors):
+        name, pos = rstr(pos)
+        nd = struct.unpack('<I', blob[pos:pos + 4])[0]
+        pos += 4
+        ne = struct.unpack('<%dQ' % nd, blob[pos:pos + 8 * nd])
+        pos += 8 * nd
+        dt = struct.unpack('<I', blob[pos:pos + 4])[0]
+        pos += 4
+        off = struct.unpack('<Q', blob[pos:pos + 8])[0]
+        pos += 8
+        # ne is REVERSED row-major (cols, rows) -> restore [rows, cols]
+        tensors[name.decode()] = (tuple(reversed(ne)), dt, off)
+    return blob, kvs, tensors, pos
+
+
+def _gguf_dequant_ternary(blob, shape, off):
+    """Unpack dtype-40 nibbles (row-major [out, in]; 0x1=+1, 0xF=-1) and
+    dequantize with the per-out-row fp32 scales stored alongside."""
+    out_dim, in_dim = shape
+    row_bytes = (in_dim + 1) // 2
+    raw = np.frombuffer(blob, dtype=np.uint8,
+                        count=out_dim * row_bytes, offset=off)
+    raw = raw.reshape(out_dim, row_bytes)
+    lo = (raw & 0x0F).astype(np.int8)
+    hi = ((raw >> 4) & 0x0F).astype(np.int8)
+    t = np.empty((out_dim, in_dim), dtype=np.int8)
+    t[:, 0::2] = np.where(lo < 8, lo, lo - 16)
+    t[:, 1::2] = np.where(hi < 8, hi, hi - 16)
+    return t
+
+
+def _file_sha12(path):
+    """First 12 hex chars of the file's sha256 — cheap content identity for
+    the base-stamp (catches resume-with-different-weights mistakes)."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def apply_gguf_base(model, gguf_path):
+    """Overwrite every frozen tensor + master with the SERVED values from an
+    omniseed GGUF. Masters are placed at T·(scale·in/nnz) so TernarySTE
+    reproduces the file's dequantized ternary exactly."""
+    blob, kvs, tensors, base = _gguf_walk(gguf_path)
+    t = model.torch
+    if kvs.get('omniseed.layer_count', model.L) != model.L or \
+            kvs.get('omniseed.embedding_length', model.E) != model.E:
+        raise SystemExit(
+            f'[lora] FATAL: GGUF geometry mismatch — base model is '
+            f'L={model.L} E={model.E}, GGUF reports '
+            f'L={kvs.get("omniseed.layer_count")} '
+            f'E={kvs.get("omniseed.embedding_length")}')
+
+    def f32(name):
+        shape, dt, off = tensors[name]
+        assert dt == 0, (name, dt)
+        n = int(np.prod(shape))
+        a = np.frombuffer(blob, dtype='<f4', count=n, offset=base + off)
+        return torch.from_numpy(a.astype('<f4')).float().reshape(shape)
+
+    def f16(name):
+        shape, dt, off = tensors[name]
+        assert dt == 1, (name, dt)
+        n = int(np.prod(shape))
+        a = np.frombuffer(blob, dtype='<f2', count=n, offset=base + off)
+        return torch.from_numpy(a.astype('<f4')).float().reshape(shape)
+
+    def i8dq(name):
+        """int8 + per-row scale -> fp32 [rows, cols] (row-major as stored)."""
+        shape, dt, off = tensors[name + '.weight']
+        assert dt == 4, (name, dt)
+        n = int(np.prod(shape))
+        q = np.frombuffer(blob, dtype=np.int8, count=n, offset=base + off)
+        sshape, sdt, soff = tensors[name + '.scale']
+        assert sdt == 0 and sshape[0] == shape[0], (name, sshape)
+        s = np.frombuffer(blob, dtype='<f4', count=shape[0],
+                          offset=base + soff)
+        d = q.reshape(shape).astype(np.float32) * s[:, None]
+        return torch.from_numpy(np.ascontiguousarray(d))
+
+    def ternary(name):
+        """(T int8 [out,in], scale fp32 [out]) for dtype-40 linears."""
+        wname, sname = name + '.weight', name + '.scale'
+        shape, dt, off = tensors[wname]
+        assert dt == 40, (name, dt)
+        tt = _gguf_dequant_ternary(blob, shape, base + off)
+        sshape, sdt, soff = tensors[sname]
+        assert sdt == 0 and sshape[0] == shape[0], (name, sshape)
+        s = np.frombuffer(blob, dtype='<f4', count=shape[0],
+                          offset=base + soff)
+        return tt, s
+
+    V, E = model.V, model.E
+    p = model.p
+    p['emb'] = f16('token.embd')
+    p['ln0w'] = f32('blocks.0.ln0.weight').reshape(-1)
+    p['ln0b'] = f32('blocks.0.ln0.bias').reshape(-1)
+    p['lnow'] = f32('ln_out.weight').reshape(-1)
+    p['lnob'] = f32('ln_out.bias').reshape(-1)
+    p['head'] = i8dq('head')                            # [V, E]
+
+    n_masters = 0
+    for l in range(model.L):
+        d = f'l{l}.'
+        g = f'blocks.{l}.'
+        for a in ('ln1.weight', 'ln1.bias', 'ln2.weight', 'ln2.bias'):
+            p[d + a] = f32(g + a).reshape(-1)
+        for a, b in (('x_r', 'tmix_r'), ('x_w', 'tmix_w'),
+                     ('x_k', 'tmix_k'), ('x_v', 'tmix_v'),
+                     ('x_a', 'tmix_a'), ('x_g', 'tmix_g')):
+            p[d + a] = f32(g + 'att.' + b).reshape(-1)
+        # int8 low-rank gates are stored TRANSPOSED; python wants the HF
+        # orientation (w1 [E, rank], w2 [rank, E], ...)
+        for a in ('w1', 'w2', 'a1', 'a2', 'g1', 'g2', 'v1', 'v2'):
+            p[d + a] = i8dq(g + 'att.' + a).t().contiguous()
+        p[d + 'w0'] = f32(g + 'att.w_bias').reshape(-1)
+        p[d + 'a0'] = f32(g + 'att.a_bias').reshape(-1)
+        p[d + 'v0'] = f32(g + 'att.v_bias').reshape(-1)
+        p[d + 'k_k'] = f32(g + 'att.k_k').reshape(-1)
+        p[d + 'k_a'] = f32(g + 'att.k_a').reshape(-1)
+        # r_k participates as [H, D] in the attention bonus (the GGUF stores
+        # it flat 768 = H*D)
+        p[d + 'r_k'] = f32(g + 'att.r_k').view(model.H, model.D)
+        p[d + 'lnxw'] = f32(g + 'att.gn.weight').view(model.H, model.D)
+        p[d + 'lnxb'] = f32(g + 'att.gn.bias').view(model.H, model.D)
+        p[d + 'fxk'] = f32(g + 'ffn.tmix_v').reshape(-1)
+        # masters: T·(scale·in/nnz) => TernarySTE(masters) == T·scale EXACTLY
+        for name in ('att.receptance', 'att.key', 'att.value', 'att.output',
+                     'ffn.key', 'ffn.value'):
+            tt, s = ternary(g + name)
+            nnz = np.maximum((tt != 0).sum(axis=1, keepdims=True), 1)
+            factor = (tt.shape[1] / nnz).astype(np.float32)
+            M = tt.astype(np.float32) * (s[:, None] * factor)
+            W0 = torch.from_numpy(np.ascontiguousarray(M))
+            model.masters[d + name].data = W0
+            n_masters += 1
+    print(f'[lora] base: GGUF {gguf_path} — every tensor = served values '
+          f'({n_masters} ternary masters placed at T·(s·in/nnz) so the STE '
+          f'forward is the exact served math)')
 
 # -----------------------------------------------------------------------------
 # Corpus: small instruction/chat pairs, formatted exactly like the C++
@@ -170,10 +369,15 @@ def encode_example(tok, user_text, reply_text):
 # -----------------------------------------------------------------------------
 class LoraRWKV7(RWKV7Ternary):
     """RWKV7Ternary with rank-r LoRA on every master linear. The base stays
-    frozen (its ternary-STE forward is the runtime's math); only A/B train."""
+    frozen (its ternary-STE forward is the runtime's math); only A/B train.
+    With gguf_base set, every tensor is overwritten with the exact served
+    GGUF values BEFORE the LoRA factors are created."""
 
-    def __init__(self, st_path, header, data_start, rank=8, alpha=16.0):
+    def __init__(self, st_path, header, data_start, rank=8, alpha=16.0,
+                 gguf_base=''):
         super().__init__(st_path, header, data_start)
+        if gguf_base:
+            apply_gguf_base(self, gguf_base)
         t = self.torch
         self.rank, self.alpha = rank, alpha
         self.scaling = alpha / rank
@@ -220,6 +424,12 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument('--safetensors', default='models/model.safetensors')
+    ap.add_argument('--gguf-base', default='',
+                    help='train on the SERVED omniseed GGUF (ternary/quant '
+                         'weights read back exactly): pass the same path '
+                         'you serve with --model (e.g. '
+                         'models/rwkv7-0.1B-ternary-qat.gguf); the '
+                         'safetensors stays the geometry source')
     ap.add_argument('--corpus-file', default='',
                     help='TSV "user<TAB>reply" lines; default = builtin set')
     ap.add_argument('--steps', type=int, default=120)
@@ -290,7 +500,8 @@ def main():
     ensure_checkpoint(args.safetensors)
     header, data_start = load_safetensors(args.safetensors)
     model = LoraRWKV7(args.safetensors, header, data_start,
-                      rank=args.rank, alpha=args.alpha)
+                      rank=args.rank, alpha=args.alpha,
+                      gguf_base=args.gguf_base)
     model.to_device(device)
 
     _mb = max(float(t.detach().abs().max()) for t in model.lora_B.values())
@@ -302,6 +513,14 @@ def main():
 
     optimizer = torch.optim.AdamW(model.lora_params, lr=args.lr,
                                   weight_decay=0.0, betas=(0.9, 0.95))
+
+    # Effective training base + content stamp: LoRA deltas are base-specific,
+    # so the checkpoint and sidecar record exactly which weights they fit.
+    base_path = args.gguf_base if args.gguf_base else args.safetensors
+    base_id = _file_sha12(base_path)
+    print(f'[lora] training base: {"GGUF (served values)" if args.gguf_base else "PTQ safetensors"}'
+          f' — {base_path}')
+    print(f'[lora] base stamp: {base_id}')
 
     def cosine_lr(step):
         if step < args.warmup:
@@ -345,6 +564,16 @@ def main():
     global_step = 0
     if os.path.exists(args.ckpt):
         ck = torch.load(args.ckpt, map_location='cpu', weights_only=True)
+        if 'base_id' in ck and ck['base_id'] != base_id:
+            raise SystemExit(
+                f'[lora] FATAL: checkpoint was trained on base '
+                f'"{ck.get("base", "?")}" ({ck["base_id"]}) but this run '
+                f'uses "{os.path.basename(base_path)}" ({base_id}) — LoRA '
+                f'deltas are base-specific. Start fresh or pass the '
+                f'original --gguf-base/--safetensors.')
+        if 'base_id' not in ck:
+            print('[lora] note: checkpoint predates base stamping '
+                  '(no base_id recorded)')
         with torch.no_grad():
             for full, a in ck['A'].items():
                 model.lora_A[full].copy_(a)
@@ -494,7 +723,9 @@ def main():
                 'best_step': best_step,
                 'best_eval_loss': best_loss,
                 'format_version': args.format_version,
-                'rank': args.rank, 'alpha': args.alpha},
+                'rank': args.rank, 'alpha': args.alpha,
+                'base_id': base_id,
+                'base': os.path.basename(base_path)},
                args.ckpt)
     print(f'[lora] checkpoint saved: {args.ckpt} (step {global_step}, best '
           f'{best_loss:.3f} @ {best_step}, {time.time() - started:.0f}s)')
@@ -513,6 +744,8 @@ def main():
     w.add_i32('lora.trained_steps', global_step)
     w.add_i32('lora.best_step', best_step)
     w.add_i32('lora.format_version', args.format_version)
+    w.add_str('lora.base_id', base_id)
+    w.add_str('lora.base', os.path.basename(base_path))
 
     def add16(name, arr):
         a = np.ascontiguousarray(arr.detach().cpu().numpy(), '<f2')

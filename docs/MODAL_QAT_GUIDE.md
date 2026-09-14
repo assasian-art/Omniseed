@@ -77,9 +77,12 @@ The sidecar then also plugs into the server: `--assistant-lora P` at boot or
 best-snapshot export, zero-delta fallback). A healthy run:
 
 ```bash
-# CPU overnight (~3000 steps) — or the Modal GPU line above (minutes)
+# CPU overnight (~3000 steps) — or the Modal GPU line above (minutes).
+# ALWAYS pass --gguf-base with the SAME GGUF you will serve: LoRA deltas
+# are base-specific, and a sidecar fitted on the PTQ safetensors is
+# off-distribution on the served QAT ternary model.
 ./.venv/Scripts/python.exe tools/lora_chat.py --steps 3000 --eval-every 50 \
-    --patience 400
+    --patience 400 --gguf-base models/rwkv7-0.1B-ternary-qat.gguf
 # probe a reply without retraining
 ./.venv/Scripts/python.exe tools/lora_chat.py --sample "What is 2+2?"
 # attach + eyeball three fixed prompts
@@ -94,7 +97,13 @@ memorization signature, not success**. The trainer prints `WARNING` when the
 exported `|B|` drifts past 0.25 (the degenerate run hit 0.30). The export is
 always the **best holdout snapshot**; if holdout never improved it exports a
 zero-delta sidecar (attaching it is a proven no-op). Sidecars carry
-`lora.format_version` (=2).
+`lora.format_version` (=2) plus a `lora.base_id` stamp (sha256/12 of the
+weights file); checkpoints record the same stamp and REFUSE to resume across
+a different base. The Modal `lora` function auto-passes `--gguf-base` when
+the served GGUF is on the Volume (and warns loudly when it falls back to the
+PTQ base). `--gguf-base` reconstructs the exact served ternary: masters are
+set to `T·(scale·in/nnz)` so the STE reproduces the file's dequantized values
+(the recomputed absmean scale can differ by ~1 ulp — fp noise only).
 
 ## Cost sanity
 

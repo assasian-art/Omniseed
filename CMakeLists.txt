@@ -270,6 +270,17 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_train.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_lora_e2e PROPERTIES TIMEOUT 2400)
+
+        # gguf-base mode: train ON the served GGUF (deployment weights);
+        # asserts attach-improves-ppl python-side + cross-engine parity.
+        # Skips internally when the QAT GGUF is absent.
+        add_test(NAME omniseed_lora_gguf
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_gguf.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_lora_gguf PROPERTIES TIMEOUT 2400)
     endif()
 
     # Trading framework: deterministic signal/risk/backtest math on synthetic

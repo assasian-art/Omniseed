@@ -157,6 +157,16 @@ def train_lora(
         "--ckpt", os.path.join(MODELS_DIR, "lora_chat.pt"),
         "--out", os.path.join(MODELS_DIR, "assistant-lora.gguf"),
     ]
+    # Train on the SAME ternary base the C++ runtime serves — a sidecar
+    # fitted on the PTQ base is off-distribution at serve time.
+    gguf_base = os.path.join(MODELS_DIR, "rwkv7-0.1B-ternary-qat.gguf")
+    if os.path.isfile(gguf_base):
+        cmd += ["--gguf-base", gguf_base]
+    else:
+        print("[train_lora] WARNING: no %s on the Volume — falling back to "
+              "the PTQ safetensors base. Run train_chunk + export_best first; "
+              "a PTQ-fitted sidecar may misbehave when attached to the "
+              "served QAT GGUF." % gguf_base)
     res = _run(cmd, REPO_DIR)
     res["done"] = res["exit"] == 0
     volume.commit()

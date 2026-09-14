@@ -63,24 +63,25 @@ constexpr const char* kModelPath = "models/rwkv7-0.1B-ternary-qat.gguf";
 // The python trainer encodes prompts with the world BPE
 // (RwkvTokenizer(vocab_file=...)). The C++ core Tokenizer has no BPE merges,
 // so re-encoding the same string here yields DIFFERENT ids. Both engines must
-// therefore consume the EXACT python token sequence — pinned below (derived
-// deterministically from lora_chat.encode_example; assert-guarded in the
-// driver). The trailing 0 is the world eos/pad token.
+// therefore consume the EXACT python token sequence — pinned below.
+// PROMPT-ONLY: NO trailing eos — training never shows 'Assistant:' + eos
+// (eos only closes a full reply), so a post-eos state is out-of-distribution
+// and poisons generation (measured: the trailing 0 alone garbles the loop).
 std::vector<int32_t> pinned_ids(const std::string& text) {
     struct P { const char* s; std::vector<int32_t> ids; };
     static const std::vector<P> kPrompts = {
         {"User: What is 2+2?\n\nAssistant:",
          {24281, 59, 29956, 59, 30031, 4600, 285, 44, 51, 64, 261, 5585,
-          41693, 59, 261, 5585, 41693, 59, 0}},
+          41693, 59, 261, 5585, 41693, 59}},
         {"User: What is the capital of France?\n\nAssistant:",
          {24281, 59, 29956, 59, 30031, 4600, 22590, 51128, 4706, 44312, 64,
-          261, 5585, 41693, 59, 261, 5585, 41693, 59, 0}},
+          261, 5585, 41693, 59, 261, 5585, 41693, 59}},
         {"User: What color is a banana?\n\nAssistant:",
          {24281, 59, 29956, 59, 30031, 38083, 4600, 332, 45265, 64, 261,
-          5585, 41693, 59, 261, 5585, 41693, 59, 0}},
+          5585, 41693, 59, 261, 5585, 41693, 59}},
         {"User: How many days are in a week?\n\nAssistant:",
          {24281, 59, 29956, 59, 20063, 31370, 30582, 21286, 4596, 332,
-          32454, 64, 261, 5585, 41693, 59, 261, 5585, 41693, 59, 0}},
+          32454, 64, 261, 5585, 41693, 59, 261, 5585, 41693, 59}},
     };
     for (const P& p : kPrompts)
         if (text == p.s) return p.ids;
@@ -164,6 +165,10 @@ int main(int argc, char** argv) {
     const std::string sidecar_path = argv[1];
     const std::string pylogits_path = argv[2];
     const std::string zero_path = argc > 3 ? argv[3] : "";
+    // Parity-only mode: main sidecar == zero sidecar means the caller is
+    // validating BASE parity (python gguf-base vs C++) and no attach delta
+    // is expected. Used by the omniseed_lora_gguf regression driver.
+    const bool parity_only = !zero_path.empty() && zero_path == sidecar_path;
 
     LoraAdapter lora;
     if (!lora.load(sidecar_path)) {
@@ -210,7 +215,7 @@ int main(int argc, char** argv) {
         maxd = std::max(maxd,
             static_cast<double>(std::fabs(base[t] - att[t])));
     std::printf("  attach delta: max|dlogit| = %.3e\n", maxd);
-    CHECK(maxd > 1e-3);
+    CHECK(parity_only || maxd > 1e-3);
 
     // ---- 2: parity with the python-attached forward -------------------------
     float py0 = 0.0f;

@@ -1153,15 +1153,40 @@ deterministic, detach is bit-identical, the zero sidecar is a bit-exact no-op,
 and generation on 3 fixed prompts never degenerates (asserted on the TRAINING
 base in python).
 
-**Known limitation (honest record):** the trainer trains against
-`models/model.safetensors` (PTQ bf16-masters base) while the runtime serves
-`rwkv7-0.1B-ternary-qat.gguf` (QAT round-2/3 export, different timestamps →
-different ternary weights). Cross-engine logits therefore legitimately differ
-(cos ≈ 0.89 measured), and a sidecar that is perfect on its training base is
-still off-distribution on the served QAT base. NEXT: add a `--gguf-base` mode
-to the trainer (or train on the QAT export) so the sidecar optimizes the
-weights the runtime actually serves; until then attach on the QAT base stays
-best-effort and the zero-delta fallback is the safe default.
+**Known limitation → FIXED (Phase-18, same day):** the trainer used to train
+against `models/model.safetensors` (PTQ bf16-masters base) while the runtime
+serves `rwkv7-0.1B-ternary-qat.gguf` (QAT round-2/3 export, different
+timestamps → different ternary weights). Cross-engine logits legitimately
+differed (cos ≈ 0.89 measured), and a sidecar perfect on its training base
+was off-distribution on the served QAT base.
+
+**Phase-18 — `--gguf-base PATH` (trainer now fits the SERVED weights):**
+- `tools/lora_chat.py --gguf-base models/rwkv7-0.1B-ternary-qat.gguf`
+  initializes every frozen master by DECODING the served GGUF itself
+  (f32/f16 tensors direct; ternary = packed nibbles + per-out-row absmean
+  fp32 scales; int8 linears transposed with scales; head int8 [V,E]).
+- Exactness trick: masters are set to `T·(scale_file·in_dim/nnz_row)` so
+  TernarySTE reproduces the file's dequantized ternary (scale = per-row
+  absmean) — the ternary pattern is bit-exact, the recomputed absmean scale
+  differs only by ~1 ulp (fp noise).
+- Verified cross-engine: the python gguf-base forward is **cos 0.999946**
+  vs the C++ runtime on identical ids (pure fp-order difference; argmax
+  matches; earlier cos 0.89 runs were the PTQ/QAT base mismatch, plus a
+  trailing-eos bug in pinned test prompts — both fixed).
+- All guards unchanged (holdout, early stop, best-snapshot, zero-delta
+  fallback, drift warnings). The training base is now PRINTED, stamped
+  `base_id` (sha256/12) into checkpoint + sidecar (`lora.base_id`), and
+  RESUME REFUSES a different base (old checkpoints warn and continue).
+- Modal `train_lora` auto-passes `--gguf-base` when the served GGUF is on
+  the Volume; otherwise warns loudly before falling back to the PTQ base.
+- New ctest `omniseed_lora_gguf` (driver `tests/lora_e2e/e2e_lora_gguf.py`,
+  9 checks): 20-step train with `--gguf-base` on the served GGUF,
+  attach-improves-holdout-ppl ON THE SERVED WEIGHTS via the C++ harness,
+  cross-engine parity ≥ 0.999, determinism + detach integrity, base stamp
+  recorded. Suite total now **8/8 ctest green** (omniseed_lora_e2e ~8 min,
+  omniseed_lora_gguf ~4 min — run separately when a shell window is short).
+- Commit also preserves the user's untracked `train_finish.bat` /
+  `train_lora.bat` helpers verbatim for history.
 
 **Retrain recipe (docs/MODAL_QAT_GUIDE.md):** 3000 steps CPU overnight or
 minutes on GPU; healthy holdout answer-ppl **1.05–3.0 — exactly 1.00 means
