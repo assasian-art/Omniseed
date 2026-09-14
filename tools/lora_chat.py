@@ -17,6 +17,8 @@
 #          omniseed-lora container (GgufWriter):
 #            lora.rank / lora.alpha / lora.scaling / lora.layer_count /
 #            lora.n_embd / lora.base_vocab metadata
+#            lora.format_version (=2, format stamp) / lora.trained_steps /
+#            lora.best_step (holdout-best snapshot, may be < trained_steps)
 #            lora.{l}.att.{receptance,key,value,output}.a  F16 [rank, in]
 #            lora.{l}.att.{...}.b                          F16 [out, rank]
 #            lora.{l}.ffn.{key,value}.a/.b                 F16
@@ -27,9 +29,17 @@
 #  context), AdamW on the LoRA factors, cosine LR + warmup, lockstep batch
 #  (B examples padded through the same RNN core, like qat_ternary eval).
 #
+#  Degenerate-run guards (3000-step forensics, see PROJECT_STATE): holdout
+#  split + early stop; the export is the BEST holdout snapshot (or a
+#  zero-delta no-op sidecar when holdout never improved); B is asserted
+#  exactly 0 at step 0; |B| drift is checked at resume and export.
+#  Healthy holdout answer-ppl is ~1.05-3.0 — EXACTLY 1.00 means memorized,
+#  not good.
+#
 #  Usage (repo root, venv with torch):
 #    ./.venv/Scripts/python.exe tools/lora_chat.py                 # default
-#    python tools/lora_chat.py --steps 400 --lr 1e-3               # real run
+#    python tools/lora_chat.py --steps 3000 --eval-every 50 --patience 400
+#                                              # full retrain (early-stops)
 #    python tools/lora_chat.py --corpus-file my_chat.txt           # custom
 #    python tools/lora_chat.py --sample "What is 2+2?"             # demo only
 #
@@ -38,6 +48,7 @@
 #  the end-to-end path (the runtime test asserts the delta changes output).
 # =============================================================================
 import argparse
+import json
 import math
 import os
 import random
@@ -223,6 +234,16 @@ def main():
     ap.add_argument('--ckpt', default='models/lora_chat.pt')
     ap.add_argument('--out', default='models/assistant-lora.gguf')
     ap.add_argument('--eval-every', type=int, default=20)
+    ap.add_argument('--holdout', type=int, default=8,
+                    help='last N corpus pairs are held out (never trained '
+                         'on); they drive early stop + best-snapshot pick')
+    ap.add_argument('--patience', type=int, default=200,
+                    help='early stop after this many steps without a '
+                         'holdout improvement (0 = disabled)')
+    ap.add_argument('--min-delta', type=float, default=1e-3,
+                    help='minimum holdout-loss improvement to count as best')
+    ap.add_argument('--format-version', type=int, default=2,
+                    help='sidecar format stamp (lora.format_version)')
     ap.add_argument('--sample', default='',
                     help='greedy-generate a reply for this prompt and exit '
                          '(loads the checkpoint when present)')
@@ -242,18 +263,43 @@ def main():
     from hf_rwkv_tokenizer import RwkvTokenizer
     tok = RwkvTokenizer(vocab_file=resolve_vocab())
 
+    pairs = load_corpus(args.corpus_file)
+    if not pairs:
+        raise SystemExit('[lora] FATAL: 0 usable chat pairs — refusing to '
+                         'train on an empty corpus')
     examples = []
-    for u, r in load_corpus(args.corpus_file):
+    for u, r in pairs:
         ids, a0 = encode_example(tok, u, r)
         examples.append((ids, a0))
-    print(f'[lora] corpus: {len(examples)} chat examples '
-          f'(avg {sum(len(i) for i, _ in examples) / len(examples):.0f} tokens)')
+    n_ans = [len(ids) - a0 for ids, a0 in examples]
+    print(f'[lora] corpus: {len(examples)} pairs, mean answer tokens '
+          f'{sum(n_ans) / len(n_ans):.1f} (min {min(n_ans)}, max {max(n_ans)}), '
+          f'mean prompt+answer length '
+          f'{sum(len(i) for i, _ in examples) / len(examples):.0f} tokens')
+    if len(examples) < 4:
+        raise SystemExit('[lora] FATAL: < 4 chat pairs is not trainable')
+
+    n_hold = max(1, min(args.holdout, len(examples) // 5))
+    if len(examples) - n_hold < 2:
+        raise SystemExit('[lora] FATAL: holdout consumes the whole corpus')
+    train_examples = examples[:len(examples) - n_hold]
+    holdout = examples[len(examples) - n_hold:]
+    print(f'[lora] split: {len(train_examples)} train / {n_hold} holdout '
+          f'(holdout is NEVER trained on; it drives early stop)')
 
     ensure_checkpoint(args.safetensors)
     header, data_start = load_safetensors(args.safetensors)
     model = LoraRWKV7(args.safetensors, header, data_start,
                       rank=args.rank, alpha=args.alpha)
     model.to_device(device)
+
+    _mb = max(float(t.detach().abs().max()) for t in model.lora_B.values())
+    if _mb != 0.0:
+        raise SystemExit(f'[lora] FATAL: B init must be exactly zero (max '
+                         f'|B| = {_mb:.3e}) — the step-0 delta would not '
+                         f'match the base model')
+    print('[lora] init check: all B == 0 exactly (step-0 delta == base)')
+
     optimizer = torch.optim.AdamW(model.lora_params, lr=args.lr,
                                   weight_decay=0.0, betas=(0.9, 0.95))
 
@@ -264,6 +310,36 @@ def main():
         t_ = min(1.0, max(0.0, t_))
         return args.lr_min + 0.5 * (args.lr - args.lr_min) \
             * (1 + math.cos(math.pi * t_))
+
+    @torch.no_grad()
+    def answer_loss(batch):
+        """Held-out evaluation: CE over ANSWER tokens only (same mask as
+        training). Returns (loss_sum, n_answer_tokens)."""
+        model.begin_window(False)
+        total = torch.zeros((), device=device)
+        n = 0
+        state = None
+        max_len = max(len(ids) for ids, _ in batch)
+        for j in range(max_len - 1):
+            toks = torch.tensor(
+                [ids[j] if j < len(ids) else 0 for ids, _ in batch],
+                dtype=torch.long, device=device)
+            logits, state = model.step_batch(toks, state)
+            for b, (ids, a0) in enumerate(batch):
+                nxt = j + 1
+                if a0 <= nxt < len(ids):
+                    total = total + torch.nn.functional.cross_entropy(
+                        logits[b].float().unsqueeze(0),
+                        torch.tensor([ids[nxt]], device=device))
+                    n += 1
+        model.end_window()
+        return total, n
+
+    with torch.no_grad():
+        base_total, base_n = answer_loss(holdout)
+    base_loss = (base_total / max(1, base_n)).item()
+    print(f'[lora] holdout base answer-loss {base_loss:.3f} (ppl '
+          f'{math.exp(min(20.0, base_loss)):.2f}) — early-stop reference')
 
     # resume
     global_step = 0
@@ -278,6 +354,12 @@ def main():
             optimizer.load_state_dict(ck['optim'])
         global_step = ck['global_step']
         print(f'[lora] resumed from {args.ckpt} (step {global_step})')
+        _mb = max(float(t.abs().max()) for t in model.lora_B.values())
+        print(f'[lora] resumed B max |.| = {_mb:.3e}')
+        if _mb > 0.25:
+            print('[lora] WARNING: |B| > 0.25 — past-convergence drift '
+                  '(overtrained state). Holdout eval decides, but a fresh '
+                  'run is safer (move the old checkpoint aside first).')
 
     def batch_loss(batch, train):
         """Lockstep batch through the RNN core; CE on ANSWER tokens only.
@@ -310,7 +392,9 @@ def main():
 
     if args.sample:
         model.begin_window(False)
-        ids, _ = encode_example(tok, args.sample, '')
+        # PROMPT-ONLY: no trailing eos — a post-eos state is out-of-
+        # distribution and makes generation start on junk.
+        ids = tok.encode(f'User: {args.sample}\n\nAssistant:')
         st = None
         lg = None
         for i in ids:
@@ -330,35 +414,76 @@ def main():
 
     started = time.time()
     B = args.batch
-    n_starts = len(examples)
+    n_starts = len(train_examples)
+    step_loss_history = []             # per-step answer-token CE (for E2E tests)
+    best_loss, best_step = base_loss, 0
+    best_A = {n: t.detach().cpu().clone() for n, t in model.lora_A.items()}
+    best_B = {n: torch.zeros_like(t.detach().cpu())
+              for n, t in model.lora_B.items()}   # best-at-start == no delta
+    if args.steps <= 0:
+        print('[lora] --steps 0: exporting the zero-delta sidecar '
+              '(attached logits must be bit-identical to the base)')
     while global_step < args.steps:
         lr = cosine_lr(global_step)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
         picks = [(global_step * 7919 + b * 104729) % n_starts for b in range(B)]
-        batch = [examples[p] for p in picks]
+        batch = [train_examples[p] for p in picks]
         total, n_tok = batch_loss(batch, train=True)
         if n_tok == 0:
-            continue
+            raise SystemExit('[lora] FATAL: answer mask selected 0 tokens — '
+                             'answer_start is broken (prompt-format '
+                             'mismatch); refusing to "train" on nothing')
         (total / n_tok).backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.lora_params,
                                                    args.clip).item()
         optimizer.step()
         optimizer.zero_grad()
         global_step += 1
+        step_loss_history.append((total / max(1, n_tok)).item())
+        if global_step <= 5:
+            n_pos = sum(len(ids) - 1 for ids, _ in batch)
+            print(f'[lora] step {global_step}: answer-mask kept '
+                  f'{n_tok}/{n_pos} positions '
+                  f'({100.0 * n_tok / max(1, n_pos):.0f}%; prompts are '
+                  f'masked out of the loss)', flush=True)
         if global_step % 10 == 0:
             print(f'[lora] step {global_step}/{args.steps} '
                   f'loss {(total / max(1, n_tok)).item():.3f} '
                   f'lr={lr:.2e} grad_norm={grad_norm:.2e}', flush=True)
         if args.eval_every > 0 and global_step % args.eval_every == 0:
-            with torch.no_grad():
-                ev_picks = [(global_step * 31 + i) % n_starts
-                            for i in range(B)]
-                ev_total, ev_n = batch_loss([examples[p] for p in ev_picks],
-                                            train=False)
-            print(f'[lora] step {global_step} answer-ppl='
-                  f'{math.exp(min(20.0, ev_total / max(1, ev_n))):.2f}',
-                  flush=True)
+            ev_total, ev_n = answer_loss(holdout)
+            ev = (ev_total / max(1, ev_n)).item()
+            tag = ''
+            if ev < best_loss - args.min_delta:
+                best_loss, best_step = ev, global_step
+                best_A = {n: t.detach().cpu().clone()
+                          for n, t in model.lora_A.items()}
+                best_B = {n: t.detach().cpu().clone()
+                          for n, t in model.lora_B.items()}
+                tag = ' *best*'
+            print(f'[lora] step {global_step} holdout answer-ppl='
+                  f'{math.exp(min(20.0, ev)):.2f}{tag}', flush=True)
+            if args.patience > 0 and global_step - best_step >= args.patience:
+                print(f'[lora] early stop: no holdout improvement for '
+                      f'{args.patience} steps (best {best_loss:.3f} @ '
+                      f'step {best_step})')
+                break
+
+    if best_step == 0:
+        print('[lora] holdout NEVER improved — exporting the ZERO-DELTA '
+              'state (attaching it is exactly a no-op; it can never garble)')
+        with torch.no_grad():
+            for t in model.lora_B.values():
+                t.zero_()
+    elif best_step != global_step:
+        print(f'[lora] restoring best holdout snapshot (loss {best_loss:.3f} '
+              f'@ step {best_step}, not the final step {global_step})')
+        with torch.no_grad():
+            for full, a in best_A.items():
+                model.lora_A[full].copy_(a)
+            for full, b in best_B.items():
+                model.lora_B[full].copy_(b)
 
     torch.save({'A': {n: t.detach().cpu().clone()
                       for n, t in model.lora_A.items()},
@@ -366,10 +491,13 @@ def main():
                       for n, t in model.lora_B.items()},
                 'optim': optimizer.state_dict(),
                 'global_step': global_step,
+                'best_step': best_step,
+                'best_eval_loss': best_loss,
+                'format_version': args.format_version,
                 'rank': args.rank, 'alpha': args.alpha},
                args.ckpt)
-    print(f'[lora] checkpoint saved: {args.ckpt} (step {global_step}, '
-          f'{time.time() - started:.0f}s)')
+    print(f'[lora] checkpoint saved: {args.ckpt} (step {global_step}, best '
+          f'{best_loss:.3f} @ {best_step}, {time.time() - started:.0f}s)')
 
     # ---------------- sidecar export (F16 A/B, scaling in metadata) ---------
     V, E = model.V, model.E
@@ -383,6 +511,8 @@ def main():
     w.add_u64('lora.n_embd', E)
     w.add_u64('lora.base_vocab', V)
     w.add_i32('lora.trained_steps', global_step)
+    w.add_i32('lora.best_step', best_step)
+    w.add_i32('lora.format_version', args.format_version)
 
     def add16(name, arr):
         a = np.ascontiguousarray(arr.detach().cpu().numpy(), '<f2')
@@ -401,7 +531,31 @@ def main():
     size = w.write(args.out)
     print(f'[lora] wrote {args.out}: {size:,} bytes, {n_written} tensors, '
           f'rank {args.rank}, scaling {model.scaling:.3f}, '
-          f'steps {global_step}')
+          f'steps {global_step} (best {best_step}, format v{args.format_version})')
+
+    _mb = max(float(t.detach().abs().max()) for t in model.lora_B.values())
+    if _mb > 0.25:
+        print(f'[lora] WARNING: exported |B| max = {_mb:.3f} (> 0.25) — '
+              f'healthy runs stay well below ~0.1; this looks overtrained')
+    with torch.no_grad():
+        fin_total, fin_n = answer_loss(holdout)
+    fin = (fin_total / max(1, fin_n)).item()
+    print(f'[lora] FINAL holdout answer-ppl {math.exp(min(20.0, fin)):.2f} '
+          f'(base {math.exp(min(20.0, base_loss)):.2f}; healthy 1.05-3.0 — '
+          f'exactly 1.00 = memorized)')
+
+    # Machine-readable summary (tests/e2e_lora_train.py consumes this).
+    summary = {
+        'n_pairs': len(examples), 'n_train': len(train_examples),
+        'n_holdout': len(holdout),
+        'base_holdout_loss': base_loss, 'final_holdout_loss': fin,
+        'best_step': best_step, 'best_holdout_loss': best_loss,
+        'step_loss_history':
+            step_loss_history if len(step_loss_history) <= 64 else [],
+        'global_step': global_step,
+    }
+    print(f'[lora-e2e] {json.dumps(summary)}')
+    return summary
 
 
 if __name__ == '__main__':

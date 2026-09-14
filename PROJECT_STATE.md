@@ -1100,3 +1100,71 @@ SEC/earnings fundamentals, and full vision backbone remain documented gaps.
    (websocket), SEC/earnings document pipeline into ResearchAgent,
    calibration-driven position-size scaling.
 3. Optional: browser console exposes paper-portfolio status via the server.
+
+---
+
+## 14. PHASE-17 — LORA-CHAT DEGENERATE RUN: FORENSICS + GUARDS (2026-09-15)
+
+**The report:** `tools/lora_chat.py` ran 3000 CPU steps → loss 0.000 from
+early steps, grad_norm ~1e-6, answer-ppl exactly 1.00 every eval; the exported
+`assistant-lora.gguf` turned coherent base output into garbage
+("The capital of capital and.") on attach. Suspects were empty answer masks,
+random B-init, or a save/load layout mismatch.
+
+**Forensics (probes on the surviving checkpoint, models/lora_chat.pt):**
+- Answer mask was CORRECT (~40% of positions, prompts masked); corpus had
+  192 real pairs. Not the bug.
+- B-init was CORRECT (zeros — step 0 delta is exactly the base). Not the bug.
+- Export layout was CORRECT: the synthetic `omniseed_lora` suite already
+  validates the GGUF layout + scalar math, and f16-quantizing the checkpoint
+  in python reproduced the C++ behavior exactly. Not the bug.
+- **Actual cause: 66 epochs of memorization on a 60-pair corpus (3000 steps ×
+  batch 4 / 180 examples), then past-convergence drift.** Loss/ppl → 0 on
+  TRAIN pairs while holdout-free evals looked "perfect"; after convergence
+  AdamW (scale-invariant) kept moving B by ~lr per step on ~1e-6 grads →
+  |B| max drifted to **0.30**; the fragile ternary QAT base then turned that
+  0.3-magnitude noise into degenerate loops on attach (base itself already
+  rambles on chat prompts: "The 1950s, the 1950s …"). Python-attached, the
+  same checkpoint memorized verbatim (France answer-ppl 1.00) but
+  cross-contaminated facts ("2+2" → "4 sides.").
+
+**Guards now in tools/lora_chat.py:**
+1. Corpus stats at start (pair count, mean/min/max answer tokens) — FATAL on
+   0 pairs; holdout split (`--holdout`, never trained on).
+2. Answer-token-only CE with the masked fraction printed for the first 5
+   steps; FATAL if the mask selects 0 tokens.
+3. B==0 asserted exactly at init (step-0 delta == base) — plus the runtime
+   side: `--steps 0` exports a zero-delta sidecar and the C++ harness proves
+   attached logits are BIT-identical to the detached base.
+4. Holdout early stop (`--patience`, default 200) + the export is the BEST
+   holdout snapshot (not the final step); if holdout never improved, a
+   ZERO-DELTA sidecar is exported (attach = proven no-op, can never garble).
+5. `|B|` drift warnings (> 0.25 — the degenerate run hit 0.30); checkpoint
+   and sidecar carry `format_version` (=2) + `best_step`/`trained_steps`.
+
+**Regression: ctest `omniseed_lora_e2e`** (driver
+`tests/lora_e2e/e2e_lora_train.py` + harness `tests/test_lora_e2e.cpp`, 21
+checks, auto-skips without the venv/base model): trains 50 steps on
+`tests/fixtures/lora_chat_tiny.tsv` (30 pairs) and asserts loss drops > 10%
+(no step collapses to ~0), mask fractions strictly partial, holdout answer-ppl
+improves vs base, struct-level python GGUF readback is BITWISE-identical to
+the checkpoint, the C++ harness sees a healthy attach delta, attach is
+deterministic, detach is bit-identical, the zero sidecar is a bit-exact no-op,
+and generation on 3 fixed prompts never degenerates (asserted on the TRAINING
+base in python).
+
+**Known limitation (honest record):** the trainer trains against
+`models/model.safetensors` (PTQ bf16-masters base) while the runtime serves
+`rwkv7-0.1B-ternary-qat.gguf` (QAT round-2/3 export, different timestamps →
+different ternary weights). Cross-engine logits therefore legitimately differ
+(cos ≈ 0.89 measured), and a sidecar that is perfect on its training base is
+still off-distribution on the served QAT base. NEXT: add a `--gguf-base` mode
+to the trainer (or train on the QAT export) so the sidecar optimizes the
+weights the runtime actually serves; until then attach on the QAT base stays
+best-effort and the zero-delta fallback is the safe default.
+
+**Retrain recipe (docs/MODAL_QAT_GUIDE.md):** 3000 steps CPU overnight or
+minutes on GPU; healthy holdout answer-ppl **1.05–3.0 — exactly 1.00 means
+memorized, not good**. Also fixed: generation prompts must be encoded WITHOUT
+the trailing eos (a post-eos state is OOD and starts junk; `--sample` and the
+tests do this now).

@@ -71,6 +71,31 @@ modal volume get omniseed-models /models/assistant-lora.gguf models/
 The sidecar then also plugs into the server: `--assistant-lora P` at boot or
 `"assistant_lora": "path.gguf"` per request on `/gen` and `/ask`.
 
+### Retrain recipe + health checks (after the degenerate-run fix)
+
+`tools/lora_chat.py` now has degenerate-run guards (holdout split, early stop,
+best-snapshot export, zero-delta fallback). A healthy run:
+
+```bash
+# CPU overnight (~3000 steps) — or the Modal GPU line above (minutes)
+./.venv/Scripts/python.exe tools/lora_chat.py --steps 3000 --eval-every 50 \
+    --patience 400
+# probe a reply without retraining
+./.venv/Scripts/python.exe tools/lora_chat.py --sample "What is 2+2?"
+# attach + eyeball three fixed prompts
+./build/bin/omniseed gen --model models/rwkv7-0.1B-ternary-qat.gguf \
+    --prompt "User: What is 2+2?
+
+Assistant:" --assistant-lora models/assistant-lora.gguf
+```
+
+Healthy holdout answer-ppl is **~1.05–3.0**. Exactly **1.00 is the
+memorization signature, not success**. The trainer prints `WARNING` when the
+exported `|B|` drifts past 0.25 (the degenerate run hit 0.30). The export is
+always the **best holdout snapshot**; if holdout never improved it exports a
+zero-delta sidecar (attaching it is a proven no-op). Sidecars carry
+`lora.format_version` (=2).
+
 ## Cost sanity
 
 T4 ≈ $0.59/h. A full 12k-step round-3 run at B=32/W=32 historically fits in

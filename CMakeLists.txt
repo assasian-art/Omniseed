@@ -239,6 +239,39 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_lora PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # Assistant-LoRA E2E regression (degenerate-run guard): the driver
+    # trains 12 steps on tests/fixtures/lora_chat_tiny.tsv with the venv
+    # python + tools/lora_chat.py, then drives the omniseed_lora_e2e
+    # harness (round-trip, C++/python logits parity, coherence). Skips
+    # cleanly when the venv/base model is absent. The harness is built
+    # here but invoked BY the driver, not by ctest directly.
+    add_executable(omniseed_lora_e2e tests/test_lora_e2e.cpp)
+    target_include_directories(omniseed_lora_e2e PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_lora_e2e PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_lora_e2e PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_lora_e2e PRIVATE -Wall -Wextra)
+    endif()
+    target_compile_definitions(omniseed_lora_e2e PRIVATE _CRT_SECURE_NO_WARNINGS)
+    set(OMNISEED_VENV_PY
+        "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
+    if(NOT EXISTS "${OMNISEED_VENV_PY}")
+        set(OMNISEED_VENV_PY
+            "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
+    endif()
+    if(EXISTS "${OMNISEED_VENV_PY}")
+        add_test(NAME omniseed_lora_e2e
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_train.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_lora_e2e PROPERTIES TIMEOUT 2400)
+    endif()
+
     # Trading framework: deterministic signal/risk/backtest math on synthetic
     # bars (no network, no fixtures needed).
     add_executable(omniseed_trading tests/test_trading.cpp)
