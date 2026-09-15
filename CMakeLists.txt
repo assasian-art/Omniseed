@@ -281,6 +281,17 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_gguf.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_lora_gguf PROPERTIES TIMEOUT 2400)
+
+        # int8-GGUF base: --gguf-base over models/rwkv7-0.1B-ternary.gguf
+        # (dtype-4 int8 linears ride an identity passthrough in the trainer).
+        # Skips internally when that GGUF is absent.
+        add_test(NAME omniseed_lora_i8
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_i8.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_lora_i8 PROPERTIES TIMEOUT 2400)
     endif()
 
     # Trading framework: deterministic signal/risk/backtest math on synthetic

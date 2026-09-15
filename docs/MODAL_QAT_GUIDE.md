@@ -80,13 +80,18 @@ best-snapshot export, zero-delta fallback). A healthy run:
 # CPU overnight (~3000 steps) — or the Modal GPU line above (minutes).
 # ALWAYS pass --gguf-base with the SAME GGUF you will serve: LoRA deltas
 # are base-specific, and a sidecar fitted on the PTQ safetensors is
-# off-distribution on the served QAT ternary model.
+# off-distribution on the served ternary/int8 model.
+# The big-corpus line downloads a license-clean instruction set (dolly-15k
+# closed-QA excerpts, CC-BY-SA-3.0; cached in models/corpus/):
 ./.venv/Scripts/python.exe tools/lora_chat.py --steps 3000 --eval-every 50 \
-    --patience 400 --gguf-base models/rwkv7-0.1B-ternary-qat.gguf
+    --patience 400 --fetch-corpus 3000 \
+    --gguf-base models/rwkv7-0.1B-ternary.gguf
+# the tiny in-repo set is a FIXTURE (ctest regression) — do not judge
+# quality on it; ~200 hand pairs cannot support real behavior learning
 # probe a reply without retraining
 ./.venv/Scripts/python.exe tools/lora_chat.py --sample "What is 2+2?"
 # attach + eyeball three fixed prompts
-./build/bin/omniseed gen --model models/rwkv7-0.1B-ternary-qat.gguf \
+./build/bin/omniseed gen --model models/rwkv7-0.1B-ternary.gguf \
     --prompt "User: What is 2+2?
 
 Assistant:" --assistant-lora models/assistant-lora.gguf
@@ -101,9 +106,19 @@ zero-delta sidecar (attaching it is a proven no-op). Sidecars carry
 weights file); checkpoints record the same stamp and REFUSE to resume across
 a different base. The Modal `lora` function auto-passes `--gguf-base` when
 the served GGUF is on the Volume (and warns loudly when it falls back to the
-PTQ base). `--gguf-base` reconstructs the exact served ternary: masters are
-set to `T·(scale·in/nnz)` so the STE reproduces the file's dequantized values
-(the recomputed absmean scale can differ by ~1 ulp — fp noise only).
+PTQ base). `--gguf-base` reads back BOTH served quantizations exactly:
+ternary (dtype 40) masters are set to `T·(scale·in/nnz)` so the STE
+reproduces the file's dequantized values (the recomputed absmean scale can
+differ by ~1 ulp — fp noise only), and int8 linears (dtype 4, e.g.
+`rwkv7-0.1B-ternary.gguf`) take the dequantized `q·scale` directly with an
+identity passthrough — int8's 127 levels cannot ride a ternary STE, but the
+LoRA base is frozen so exact passthrough is both legal and cheapest
+(cross-engine parity vs the C++ runtime on the i8 file: cosine 1.000000).
+
+`--corpus fetch` (or `--fetch-corpus N`) swaps the tiny builtin set for a
+downloaded 2–4k-pair corpus; near-duplicate templates are shingle-deduped
+(dupes inflate holdout numbers and push toward memorization). Train on the
+big corpus for real behavior; the tiny fixture only proves the mechanism.
 
 ## Cost sanity
 

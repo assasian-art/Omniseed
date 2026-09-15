@@ -5,7 +5,13 @@
 //  registered with ctest directly; the driver invokes it after training the
 //  tiny in-repo fixture with tools/lora_chat.py).
 //
-//  Usage: omniseed_lora_e2e <sidecar.gguf> <pylogits.npy> [zero_sidecar.gguf]
+//  Usage: omniseed_lora_e2e <sidecar.gguf> <pylogits.npy>
+//                            [zero_sidecar.gguf | --parity-only]
+//                            [--model base.gguf]
+//  --model overrides the base GGUF (default: the QAT file) — used by the
+//  i8-base regression to serve models/rwkv7-0.1B-ternary.gguf.
+//  --parity-only (or a zero-delta sidecar == main sidecar) skips the
+//  attach-delta expectation: the caller is validating BASE parity.
 //
 //  With a zero-delta sidecar (trainer --steps 0), additionally asserts the
 //  runtime contract "attached delta == 0 at step 0": attaching it leaves
@@ -159,12 +165,24 @@ bool non_degenerate(const std::string& s) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
-        std::printf("usage: omniseed_lora_e2e <sidecar.gguf> <pylogits.npy>\n");
+        std::printf("usage: omniseed_lora_e2e <sidecar.gguf> <pylogits.npy>"
+                    " [zero_sidecar.gguf | --parity-only] [--model base.gguf]\n");
         return 2;
     }
     const std::string sidecar_path = argv[1];
     const std::string pylogits_path = argv[2];
-    const std::string zero_path = argc > 3 ? argv[3] : "";
+    std::string zero_path;
+    std::string model_path = kModelPath;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--parity-only") {
+            zero_path = sidecar_path;      // main sidecar must be the zero one
+        } else if (a == "--model" && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (i == 3) {
+            zero_path = a;                 // legacy positional zero sidecar
+        }
+    }
     // Parity-only mode: main sidecar == zero sidecar means the caller is
     // validating BASE parity (python gguf-base vs C++) and no attach delta
     // is expected. Used by the omniseed_lora_gguf regression driver.
@@ -178,8 +196,9 @@ int main(int argc, char** argv) {
     CHECK(lora.valid());
 
     RwkvModel model;
-    if (!model.load(kModelPath)) {
-        std::printf("FAIL: base model load: %s\n", model.error().c_str());
+    if (!model.load(model_path)) {
+        std::printf("FAIL: base model load (%s): %s\n", model_path.c_str(),
+                    model.error().c_str());
         return 1;
     }
     CHECK(lora.layer_count() == model.config().n_layers);
@@ -245,9 +264,9 @@ int main(int argc, char** argv) {
     meand /= V;
     const double cosine = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-30);
     std::printf("  informational cross-engine parity: mean|d| = %.4f, "
-                "cosine = %.6f, argmax %d vs %d "
-                "(bases differ: PTQ safetensors vs QAT gguf)\n",
-                meand, cosine, argmax_c, argmax_p);
+                "cosine = %.6f, argmax %d vs %d (base: %s)\n",
+                meand, cosine, argmax_c, argmax_p,
+                model_path.c_str());
 
     // determinism: a second attached forward must be BIT-identical
     const std::vector<float> att2 = forward(model, ids, logits, st);

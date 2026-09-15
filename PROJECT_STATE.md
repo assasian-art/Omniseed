@@ -1193,3 +1193,36 @@ minutes on GPU; healthy holdout answer-ppl **1.05–3.0 — exactly 1.00 means
 memorized, not good**. Also fixed: generation prompts must be encoded WITHOUT
 the trailing eos (a post-eos state is OOD and starts junk; `--sample` and the
 tests do this now).
+
+**Phase-19 — i8-GGUF base + big-corpus fetch (`--gguf-base` everywhere):**
+- `apply_gguf_base` now dispatches on the STORED dtype of each big linear:
+  dtype 40 (ternary) keeps the `T·(s·in/nnz)` STE trick; dtype 4 (int8
+  row-quant, as in `models/rwkv7-0.1B-ternary.gguf`) loads the dequantized
+  `q·scale` directly and registers the master in an `i8_passthrough` set —
+  `begin_window` substitutes the exact fp32 values instead of ternarizing
+  (127 levels ≠ 3, but the LoRA base is frozen, so identity is exact and
+  cheapest). int8 gates/head/embd decode paths were already shared.
+- Cross-engine proof on the int8 file: python i8-base forward vs the C++
+  runtime serving that GGUF = **cosine 1.000000, mean|d| 0.0000, argmax
+  285 = 285** (identical ids, trained sidecar attached on both sides).
+- Corpus: `--corpus fetch` / `--fetch-corpus N` downloads a license-clean
+  instruction set (databricks-dolly-15k closed-QA excerpts, CC-BY-SA-3.0)
+  from the HF datasets-server into `models/corpus/` (cached TSV, 5xx retry
+  with backoff, FATAL under 200 pairs, shingle dedupe on question
+  templates). Live fetch: **2561 unique pairs in 24 s** (0.56 MB) — vs the
+  ~65-hand-pair builtin (which stays as the ctest fixture only; `--corpus
+  FILE` unchanged). Fetched stats: mean answer 30.1 tokens.
+- Latent bug fixed in the shared GGUF walker: `_GGUF_KV_SZ` mapped u16/i16
+  metadata (types 2/3) to 1 byte instead of 2 (the QAT file simply never
+  carries u16 arrays; the ternary file's header would desync any reader
+  that tried — diagnosed via hexdump, all other type sizes were correct).
+- New ctest `omniseed_lora_i8` (driver `tests/lora_e2e/e2e_lora_i8.py`,
+  10 checks): 20-step train with `--gguf-base` on the int8 GGUF,
+  attach-improves-holdout-loss, bitwise sidecar round-trip, cross-engine
+  parity ≥ 0.999 through the harness. `omniseed_lora_e2e` gained
+  `--parity-only` / `--model base.gguf` flags (backward compatible; the
+  parity print no longer claims the bases differ).
+- Recipe updated (docs/MODAL_QAT_GUIDE.md): train on the BIG corpus with
+  `--gguf-base` set to the exact GGUF you serve; healthy holdout answer-ppl
+  **1.05–3.0 (exactly 1.00 = memorized)**; the tiny fixture is a mechanism
+  test, not a quality judge.

@@ -11,9 +11,13 @@
 #      --gguf-base P overrides EVERY tensor with the values read back from
 #      the served omniseed GGUF (ternary nibbles + per-row scales, int8
 #      gates/head, f16 embedding), so the trained sidecar optimizes exactly
-#      the weights the C++ runtime serves. Masters are set to
-#      T·(scale·in/nnz) so TernarySTE(masters) reproduces the served
-#      dequantized ternary EXACTLY (round(M/s)=T and absmean(M)=s).
+#      the weights the C++ runtime serves. Big linears are placed per their
+#      stored dtype: ternary (dtype 40) masters at T·(scale·in/nnz) so
+#      TernarySTE reproduces the served dequantized ternary EXACTLY
+#      (round(M/s)=T and absmean(M)=s); int8 (dtype 4, e.g.
+#      rwkv7-0.1B-ternary.gguf) masters take the dequantized q·scale
+#      directly with an identity passthrough (127 levels != 3, but the
+#      base is frozen — exact passthrough is legal and cheapest).
 #    * Trainable: classic LoRA factors B·A on the 6 big linears per layer
 #      (att r/k/v/o + ffn key/value — the same tensors the runtime carries as
 #      ternary), rank 8, alpha 16, B initialised to zero (step 0 == base).
@@ -78,7 +82,7 @@ from convert_to_omniseed import (    # noqa: E402
 # Served-GGUF base loading (--gguf-base): read back the exact quantized math
 # the C++ runtime serves, so the LoRA trains ON the deployment weights.
 # -----------------------------------------------------------------------------
-_GGUF_KV_SZ = {0: 1, 1: 1, 2: 1, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+_GGUF_KV_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
                10: 8, 11: 8, 12: 8}
 
 
@@ -251,19 +255,32 @@ def apply_gguf_base(model, gguf_path):
         p[d + 'lnxw'] = f32(g + 'att.gn.weight').view(model.H, model.D)
         p[d + 'lnxb'] = f32(g + 'att.gn.bias').view(model.H, model.D)
         p[d + 'fxk'] = f32(g + 'ffn.tmix_v').reshape(-1)
-        # masters: T·(scale·in/nnz) => TernarySTE(masters) == T·scale EXACTLY
+        # masters, per stored dtype:
+        #   * dtype 40 (ternary): T·(scale·in/nnz) => TernarySTE(masters)
+        #     == T·scale EXACTLY (round(M/s)=T + absmean(M)=s identity)
+        #   * dtype 4 (int8 row-quant, e.g. rwkv7-0.1B-ternary.gguf): the
+        #     dequantized q·scale directly. int8 has 127 levels — a ternary
+        #     STE cannot reproduce it — so these masters ride an IDENTITY
+        #     passthrough in begin_window (legal: the LoRA base is frozen,
+        #     no gradient ever flows through it).
         for name in ('att.receptance', 'att.key', 'att.value', 'att.output',
                      'ffn.key', 'ffn.value'):
-            tt, s = ternary(g + name)
-            nnz = np.maximum((tt != 0).sum(axis=1, keepdims=True), 1)
-            factor = (tt.shape[1] / nnz).astype(np.float32)
-            M = tt.astype(np.float32) * (s[:, None] * factor)
-            W0 = torch.from_numpy(np.ascontiguousarray(M))
+            wdt = tensors[g + name + '.weight'][1]
+            if wdt == 4:
+                W0 = i8dq(g + name)
+                model.i8_passthrough.add(d + name)
+            else:
+                tt, s = ternary(g + name)
+                nnz = np.maximum((tt != 0).sum(axis=1, keepdims=True), 1)
+                factor = (tt.shape[1] / nnz).astype(np.float32)
+                M = tt.astype(np.float32) * (s[:, None] * factor)
+                W0 = torch.from_numpy(np.ascontiguousarray(M))
             model.masters[d + name].data = W0
             n_masters += 1
+    n_i8 = len(model.i8_passthrough)
     print(f'[lora] base: GGUF {gguf_path} — every tensor = served values '
-          f'({n_masters} ternary masters placed at T·(s·in/nnz) so the STE '
-          f'forward is the exact served math)')
+          f'({n_masters} linears: {n_masters - n_i8} ternary masters at '
+          f'T·(s·in/nnz), {n_i8} int8 masters passed through exactly)')
 
 # -----------------------------------------------------------------------------
 # Corpus: small instruction/chat pairs, formatted exactly like the C++
@@ -354,6 +371,100 @@ def load_corpus(path):
     return pairs
 
 
+FETCH_DEFAULT_PAIRS = 3000
+_FETCH_URL = ('https://datasets-server.huggingface.co/rows'
+              '?dataset=databricks%2Fdatabricks-dolly-15k'
+              '&config=default&split=train&offset={off}&length=100')
+_FETCH_UA = 'omniseed-lora/1.0 (offline trainer corpus fetch)'
+
+
+def _fetch_rows(n_pairs):
+    """Stream `n_pairs` dolly-15k rows (instruction, response) via the HF
+    datasets-server JSON API. Only CLOSED-INSTRUCTION rows are used
+    (context == ''), each side truncated to 200 chars. License: CC-BY-SA-3.0.
+    Transient gateway errors (5xx) are retried with backoff."""
+    import urllib.error
+    import urllib.request
+    out = []
+    off = 0
+    while len(out) < n_pairs:
+        req = urllib.request.Request(_FETCH_URL.format(off=off),
+                                     headers={'User-Agent': _FETCH_UA})
+        page = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    page = json.loads(r.read().decode('utf-8'))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise          # 4xx: our URL is wrong, fail loudly
+                if attempt == 3:
+                    raise SystemExit(
+                        f'[lora] FATAL: datasets-server kept returning '
+                        f'HTTP {e.code} after 4 tries — network is up but '
+                        f'the API is failing; retry later or pass '
+                        f'--corpus-file instead')
+                time.sleep(2.0 * (attempt + 1))
+        if page is None:
+            break
+        rows = page.get('rows', [])
+        if not rows:
+            break
+        for row in rows:
+            row = row.get('row', {})
+            if row.get('context', '').strip():
+                continue                     # closed QA only
+            u = (row.get('instruction') or '').strip()
+            a = (row.get('response') or '').strip()
+            if not u or not a:
+                continue
+            out.append((u[:200], ' ' + a[:200]))
+            if len(out) >= n_pairs:
+                break
+        off += len(rows)
+    return out
+
+
+def _model_dedupe(pairs):
+    """Shingle dedupe on the first 28 chars of the question: near-duplicate
+    templates inflate holdout numbers and push the trainer toward
+    memorization (the degenerate-run failure mode)."""
+    seen, out = set(), []
+    for u, a in pairs:
+        k = ' '.join(u.lower().split())[:28]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((u, a))
+    return out
+
+
+def fetch_big_corpus(n_pairs, path=None):
+    """--fetch-corpus / --corpus fetch: download `n_pairs` license-clean
+    chat pairs into models/corpus/ and return the TSV path (cached)."""
+    os.makedirs('models/corpus', exist_ok=True)
+    if not path:
+        path = f'models/corpus/dolly-{n_pairs}.tsv'
+    if os.path.exists(path):
+        n = sum(1 for ln in open(path, encoding='utf-8') if '\t' in ln)
+        print(f'[lora] corpus cache hit: {path} ({n} pairs)')
+        return path
+    print(f'[lora] fetching {n_pairs} dolly-15k pairs (CC-BY-SA-3.0) '
+          f'from the HF datasets-server ...')
+    pairs = _fetch_rows(n_pairs)
+    if len(pairs) < 200:
+        raise SystemExit(f'[lora] FATAL: fetched only {len(pairs)} pairs '
+                         f'(network or API problem) — refusing to train on '
+                         f'a starved corpus; pass --corpus-file instead')
+    pairs = _model_dedupe(pairs)
+    with open(path, 'w', encoding='utf-8') as f:
+        for u, a in pairs:
+            f.write(f'{u.replace(chr(9), " ")}\t{a.replace(chr(9), " ")}\n')
+    print(f'[lora] corpus: {path} — {len(pairs)} unique pairs written')
+    return path
+
+
 def encode_example(tok, user_text, reply_text):
     """Token ids for 'User: <u>\n\nAssistant: <r>' + eos. Returns (ids,
     answer_start) — answer tokens are positions [answer_start, len)."""
@@ -376,6 +487,7 @@ class LoraRWKV7(RWKV7Ternary):
     def __init__(self, st_path, header, data_start, rank=8, alpha=16.0,
                  gguf_base=''):
         super().__init__(st_path, header, data_start)
+        self.i8_passthrough = set()          # masters that must NOT ternarize
         if gguf_base:
             apply_gguf_base(self, gguf_base)
         t = self.torch
@@ -408,6 +520,12 @@ class LoraRWKV7(RWKV7Ternary):
 
     def begin_window(self, use_grad):        # noqa: D102 — base never trains
         super().begin_window(False)
+        # int8 masters: identity passthrough — the dequantized q·scale as
+        # stored. The LoRA base is frozen (no gradient flows through it),
+        # so the exact fp32 values are both correct and cheapest here.
+        if self.i8_passthrough:
+            for n in self.i8_passthrough:
+                self.Wq[n] = self.masters[n].detach()
 
     def lin(self, name, x):
         y = super().lin(name, x)             # frozen ternary base
@@ -430,8 +548,17 @@ def main():
                          'you serve with --model (e.g. '
                          'models/rwkv7-0.1B-ternary-qat.gguf); the '
                          'safetensors stays the geometry source')
+    ap.add_argument('--corpus', default='', dest='corpus_file',
+                    help='alias for --corpus-file; the special value '
+                         '"fetch" downloads a license-clean corpus')
     ap.add_argument('--corpus-file', default='',
                     help='TSV "user<TAB>reply" lines; default = builtin set')
+    ap.add_argument('--fetch-corpus', default='', metavar='N_PAIRS',
+                    help='download a license-clean instruction/chat corpus '
+                         '(databricks-dolly-15k closed-QA excerpts, '
+                         'CC-BY-SA-3.0) of this many pairs into '
+                         'models/corpus/ and train on it; the tiny in-repo '
+                         'set stays a fixture only')
     ap.add_argument('--steps', type=int, default=120)
     ap.add_argument('--batch', type=int, default=4)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -472,6 +599,15 @@ def main():
     sys.path.insert(0, 'models/hf-orig')
     from hf_rwkv_tokenizer import RwkvTokenizer
     tok = RwkvTokenizer(vocab_file=resolve_vocab())
+
+    n_fetch = 0
+    if args.corpus_file == 'fetch':
+        args.corpus_file = ''
+        n_fetch = FETCH_DEFAULT_PAIRS
+    if args.fetch_corpus:
+        n_fetch = max(200, min(int(args.fetch_corpus), 20000))
+    if n_fetch:
+        args.corpus_file = fetch_big_corpus(n_fetch, args.corpus_file)
 
     pairs = load_corpus(args.corpus_file)
     if not pairs:
