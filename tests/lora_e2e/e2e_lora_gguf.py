@@ -8,14 +8,19 @@
 #  deployment weights instead of the PTQ safetensors.
 #
 #  Asserts:
-#    1. the trainer runs 20 steps with --gguf-base models/
+#    1. the trainer runs 24 steps with --gguf-base models/
 #       rwkv7-0.1B-ternary-qat.gguf and all guards stay active
 #    2. python-side attach improves holdout answer-ppl vs base (trained on
-#       that base — this is the honest "attach helps" check)
+#       that base — this is the honest "attach helps" check); the holdout
+#       is TRADING pairs, so the improvement is in the trading domain
 #    3. BASE parity: python (gguf-base) vs C++ runtime logits agree to
 #       fp-order noise (cosine > 0.999) — the gguf reader reproduces the
 #       served math bit-exactly (argmax equal, measured 1.000000)
 #    4. sidecar round-trip stays bitwise (struct-level GGUF readback)
+#
+#  Generation coherence ("one sidecar, many skills": assistant + trading
+#  prompts answered in-domain) lives in ctest omniseed_lora_chat — it needs
+#  the ~50-step regime and its own shell-window budget.
 #
 #  Auto-skips without the venv/base model/QAT GGUF (fixture policy).
 # =============================================================================
@@ -46,6 +51,18 @@ def finish():
     print(f'RESULT: {g_pass} passed, {g_fail} failed')
     sys.exit(0 if g_fail == 0 else 1)
 
+def read_tsv(path):
+    rows = []
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if line.strip() and '\t' in line \
+                    and not line.lstrip().startswith('#'):
+                u, a = line.split('\t', 1)
+                rows.append((u.strip(), a.strip()))
+    return rows
+
+
 def main():
     qat = os.path.join(REPO, 'models', 'rwkv7-0.1B-ternary-qat.gguf')
     st = os.path.join(REPO, 'models', 'model.safetensors')
@@ -57,7 +74,19 @@ def main():
         print('  [skip] OMNISEED_SKIP_LORA_E2E set')
         return
 
-    tsv = os.path.join(REPO, 'tests', 'fixtures', 'lora_chat_tiny.tsv')
+    # COMBINED fixture ("one sidecar, many skills"): everyday-English pairs
+    # first, then trading pairs — the trainer holds out the LAST N pairs, so
+    # the holdout lands entirely in the trading domain and the
+    # attach-improves-loss check is asserted IN the trading domain.
+    tiny = os.path.join(REPO, 'tests', 'fixtures', 'lora_chat_tiny.tsv')
+    trfix = os.path.join(REPO, 'tests', 'fixtures', 'trading_chat.tsv')
+    tsv = os.path.join(REPO, 'models', 'lora_gguf_combined.tsv')
+    with open(tsv, 'w', encoding='utf-8', newline='\n') as f:
+        for src in (tiny, trfix):
+            with open(src, encoding='utf-8') as g:
+                for line in g:
+                    if line.strip() and not line.lstrip().startswith('#'):
+                        f.write(line if line.endswith('\n') else line + '\n')
     ckpt = os.path.join(REPO, 'models', 'lora_gguf_regress.pt')
     sidecar = os.path.join(REPO, 'models', 'lora_gguf_regress.gguf')
     pylogits = os.path.join(REPO, 'models', 'lora_gguf_pylogits.npy')
@@ -65,12 +94,12 @@ def main():
         if os.path.exists(p):
             os.remove(p)
 
-    # ---- 1: train 20 steps ON the served GGUF --------------------------------
+    # ---- 1: train 24 steps ON the served GGUF --------------------------------
     r = subprocess.run(
         [PY, os.path.join(REPO, 'tools', 'lora_chat.py'),
-         '--corpus-file', tsv, '--gguf-base', qat, '--steps', '20',
-         '--batch', '2', '--holdout', '4', '--patience', '0',
-         '--eval-every', '10', '--lr', '6e-4',
+         '--corpus-file', tsv, '--gguf-base', qat, '--steps', '24',
+         '--batch', '2', '--holdout', '6', '--patience', '0',
+         '--eval-every', '12', '--lr', '6e-4',
          '--ckpt', ckpt, '--out', sidecar, '--device', 'cpu'],
         cwd=REPO, capture_output=True, text=True, encoding='utf-8',
         errors='replace', timeout=2400)
@@ -95,7 +124,7 @@ def main():
     if not summary:
         finish()
         return
-    check(len(summary['step_loss_history']) == 20, '20 steps recorded')
+    check(len(summary['step_loss_history']) == 24, '24 steps recorded')
     check(summary['final_holdout_loss'] < summary['base_holdout_loss'],
           'python-side: attach improves holdout loss on the GGUF base '
           f"({summary['base_holdout_loss']:.3f} -> "

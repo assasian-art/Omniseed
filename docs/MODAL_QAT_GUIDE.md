@@ -81,20 +81,30 @@ best-snapshot export, zero-delta fallback). A healthy run:
 # ALWAYS pass --gguf-base with the SAME GGUF you will serve: LoRA deltas
 # are base-specific, and a sidecar fitted on the PTQ safetensors is
 # off-distribution on the served ternary/int8 model.
-# The big-corpus line downloads a license-clean instruction set (dolly-15k
-# closed-QA excerpts, CC-BY-SA-3.0; cached in models/corpus/):
+# The COMBINED corpus is the default recipe ("one sidecar, many skills"):
+# everyday-English (dolly-15k closed-QA excerpts, CC-BY-SA-3.0) + synthetic
+# trading Q&A (tools/fetch_trading_corpus.py, CC-BY-SA-3.0), merged +
+# shuffled by tools/merge_corpora.py. ONE LoRA learns BOTH domains — future
+# skills just add more pairs to the same TSV and retrain.
+./.venv/Scripts/python.exe tools/fetch_trading_corpus.py            # models/corpus/trading_chat.tsv (2000 pairs)
+./.venv/Scripts/python.exe tools/lora_chat.py --fetch-corpus 3000   # models/corpus/dolly-3000.tsv
+./.venv/Scripts/python.exe tools/merge_corpora.py                   # models/corpus/combined_chat.tsv (~4.5k pairs)
 ./.venv/Scripts/python.exe tools/lora_chat.py --steps 3000 --eval-every 50 \
-    --patience 400 --fetch-corpus 3000 \
+    --patience 400 \
+    --corpus models/corpus/combined_chat.tsv \
     --gguf-base models/rwkv7-0.1B-ternary.gguf
-# the tiny in-repo set is a FIXTURE (ctest regression) — do not judge
-# quality on it; ~200 hand pairs cannot support real behavior learning
-# probe a reply without retraining
-./.venv/Scripts/python.exe tools/lora_chat.py --sample "What is 2+2?"
-# attach + eyeball three fixed prompts
+# the tiny in-repo sets are FIXTURES (ctest regressions) — do not judge
+# quality on them; hand-scale pairs cannot support real behavior learning
+# probe replies without retraining ('|' separates prompts, one model load)
+./.venv/Scripts/python.exe tools/lora_chat.py --sample "What is 2+2?|What is the bear call on AAPL?"
+# attach + eyeball fixed prompts through the runtime
 ./build/bin/omniseed gen --model models/rwkv7-0.1B-ternary.gguf \
     --prompt "User: What is 2+2?
 
 Assistant:" --assistant-lora models/assistant-lora.gguf
+# the served QAT base loops under pure greedy: the runtime's Phase-13
+# CTRL repetition penalty (agent_loop.cpp) is the production chat fix —
+# python --sample mirrors it exactly via --repeat-penalty 1.2
 ```
 
 Healthy holdout answer-ppl is **~1.05–3.0**. Exactly **1.00 is the
@@ -119,6 +129,10 @@ LoRA base is frozen so exact passthrough is both legal and cheapest
 downloaded 2–4k-pair corpus; near-duplicate templates are shingle-deduped
 (dupes inflate holdout numbers and push toward memorization). Train on the
 big corpus for real behavior; the tiny fixture only proves the mechanism.
+For the combined skill set, build `models/corpus/combined_chat.tsv` once
+(fetch + merge above) and pass it with `--corpus` — dedupe + seeded shuffle
+keep the holdout domain-mixed, and the merged file is regenerable from the
+checked-in tools.
 
 ## Cost sanity
 

@@ -419,6 +419,12 @@ def _fetch_rows(n_pairs):
             a = (row.get('response') or '').strip()
             if not u or not a:
                 continue
+            # one physical line per pair: strip tabs AND newlines (embedded
+            # newlines fragment the TSV into orphan continuation lines)
+            u = u.replace('\t', ' ')
+            a = a.replace('\t', ' ')
+            u = ' '.join(u.split())
+            a = ' '.join(a.split())
             out.append((u[:200], ' ' + a[:200]))
             if len(out) >= n_pairs:
                 break
@@ -569,6 +575,13 @@ def main():
     ap.add_argument('--alpha', type=float, default=16.0)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--ckpt', default='models/lora_chat.pt')
+    # sampling parity with the C++ runtime (agent_loop.cpp Phase-13): CTRL-
+    # style repetition penalty over the last N GENERATED tokens — the QAT
+    # ternary base loops under pure greedy, so real chat runs enable it.
+    ap.add_argument('--repeat-penalty', type=float, default=1.0,
+                    help='>1 enables the runtime-matched repetition penalty '
+                         '(production chat uses 1.15-1.25)')
+    ap.add_argument('--repeat-window', type=int, default=64)
     ap.add_argument('--out', default='models/assistant-lora.gguf')
     ap.add_argument('--eval-every', type=int, default=20)
     ap.add_argument('--holdout', type=int, default=8,
@@ -613,6 +626,10 @@ def main():
     if not pairs:
         raise SystemExit('[lora] FATAL: 0 usable chat pairs — refusing to '
                          'train on an empty corpus')
+    _aw = sum(len(r.split()) for _, r in pairs)
+    print(f'[lora] corpus: {args.corpus_file or "builtin set"} — '
+          f'{len(pairs)} pairs, mean answer '
+          f'{_aw / max(1, len(pairs)):.1f} words')
     examples = []
     for u, r in pairs:
         ids, a0 = encode_example(tok, u, r)
@@ -756,25 +773,39 @@ def main():
         return total, n_tok
 
     if args.sample:
-        model.begin_window(False)
         # PROMPT-ONLY: no trailing eos — a post-eos state is out-of-
-        # distribution and makes generation start on junk.
-        ids = tok.encode(f'User: {args.sample}\n\nAssistant:')
-        st = None
-        lg = None
-        for i in ids:
-            lg, st = model.step_batch(torch.tensor([i], device=device), st)
-        out = []
-        t = model.torch
-        for _ in range(48):
-            nid = int(lg[0].argmax().item())
-            if nid == 0:
-                break
-            out.append(nid)
-            lg, st = model.step_batch(
-                torch.tensor([nid], device=device), st)
-        model.end_window()
-        print(f'[lora] reply: {tok.decode(out) if out else "(empty)"}')
+        # distribution and makes generation start on junk. '|' separates
+        # multiple prompts so one model load answers many questions.
+        pen = float(args.repeat_penalty)
+        win = max(int(args.repeat_window), 1)
+        for prompt in [p for p in args.sample.split('|') if p.strip()]:
+            model.begin_window(False)
+            ids = tok.encode(f'User: {prompt.strip()}\n\nAssistant:')
+            st = None
+            lg = None
+            for i in ids:
+                lg, st = model.step_batch(
+                    torch.tensor([i], device=device), st)
+            out = []
+            recent = []                      # generated-id ring (Phase-13)
+            for _ in range(48):
+                logits = lg[0].clone().float()
+                if pen > 1.0 and recent:
+                    for t in recent[-win:]:
+                        if 0 <= t < logits.numel():
+                            if logits[t] > 0:
+                                logits[t] /= pen
+                            elif logits[t] < 0:
+                                logits[t] *= pen
+                nid = int(logits.argmax().item())
+                recent.append(nid)
+                if nid == 0:                 # eos: stop before stepping
+                    break
+                out.append(nid)
+                lg, st = model.step_batch(
+                    torch.tensor([nid], device=device), st)
+            model.end_window()
+            print(f'[lora] reply: {tok.decode(out) if out else "(empty)"}')
         return
 
     started = time.time()
@@ -913,14 +944,17 @@ def main():
           f'(base {math.exp(min(20.0, base_loss)):.2f}; healthy 1.05-3.0 — '
           f'exactly 1.00 = memorized)')
 
-    # Machine-readable summary (tests/e2e_lora_train.py consumes this).
+    # Machine-readable summary (tests/e2e_*.py consume this). The payload
+    # keeps a bounded history slice; n_steps_recorded is always the true count.
     summary = {
         'n_pairs': len(examples), 'n_train': len(train_examples),
         'n_holdout': len(holdout),
         'base_holdout_loss': base_loss, 'final_holdout_loss': fin,
         'best_step': best_step, 'best_holdout_loss': best_loss,
         'step_loss_history':
-            step_loss_history if len(step_loss_history) <= 64 else [],
+            step_loss_history if len(step_loss_history) <= 64 else
+            step_loss_history[:32] + step_loss_history[-32:],
+        'n_steps_recorded': len(step_loss_history),
         'global_step': global_step,
     }
     print(f'[lora-e2e] {json.dumps(summary)}')
