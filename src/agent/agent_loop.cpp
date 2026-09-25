@@ -12,10 +12,57 @@
 
 namespace omniseed {
 
+// Assistant stop defaults: the classic base-model failure of answering the
+// question and then inventing the next user turn ("... Paris.\nUser: What is
+// 2+2?") is cut the moment the model starts writing that turn.
+const char* const kAssistantStopDefaults[3] = {
+    "\nUser:", "\nAssistant:", "\nAssistant::"};
+
 namespace {
 // Thread-local-ish handoff from generate() to run(): the uncertainty report
 // of the final answer pass's first logits. (AgentLoop is documented as
 // single-threaded per instance; a plain member is sufficient and zero-cost.)
+
+// ---------------------------------------------------------------------------
+// Stop-string machinery (tail-window match, O(stops) per step):
+//   find_stop(out)   -> index of the first stop embedded in `out` (-1 none)
+//   streamable_len() -> length safe to emit NOW (the last kStopTail-1 bytes
+//                       are still being matched and must be held back)
+// ---------------------------------------------------------------------------
+constexpr size_t kStopTail = 64;   // tail window checked per step
+
+long find_stop_pos(const std::string& out,
+                   const std::vector<std::string>& stops) {
+    // EARLIEST match position across all stops (not first stop in list
+    // order): the trim must cut at the first stop a reader would hit, so an
+    // earlier "\nAssistant:" wins over a later "\nUser:" regardless of the
+    // order the caller listed them in. Every completed match is found on the
+    // step its text first exists (piece sizes are far below kStopTail), so a
+    // fixed scan window never misses one.
+    long best = -1;
+    const size_t scan_from = out.size() > kStopTail
+        ? out.size() - kStopTail : 0;
+    for (const std::string& s : stops) {
+        if (s.empty()) continue;
+        const size_t p = out.find(s, scan_from);
+        if (p != std::string::npos &&
+            (best < 0 || static_cast<long>(p) < best))
+            best = static_cast<long>(p);
+    }
+    return best;
+}
+
+size_t streamable_len(const std::string& out,
+                      const std::vector<std::string>& stops) {
+    size_t longest = 0;
+    for (const std::string& s : stops) longest = std::max(longest, s.size());
+    if (longest == 0) return out.size();
+    // Hold back `longest` (not longest-1) bytes: a stop can complete at any
+    // step and its whole tail (<= longest) must still be un-streamed so the
+    // trimmed reply is exactly what the UI received.
+    const size_t hold = std::min(longest, kStopTail);
+    return out.size() > hold ? out.size() - hold : 0;
+}
 } // namespace
 
 // ===========================================================================
@@ -63,6 +110,12 @@ void AgentLoop::set_sampling(float repeat_penalty, int32_t repeat_window) {
     cfg_.repeat_window = repeat_window;
 }
 
+void AgentLoop::set_stop_strings(const std::vector<std::string>& stops) {
+    // Empty = revert to the construction-time config (request
+    // self-containedness, mirroring set_sampling).
+    active_stops_ = stops.empty() ? cfg_.stop_strings : stops;
+}
+
 std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
                                 int32_t max_tokens,
                                 const std::vector<int32_t>& stop_pieces,
@@ -76,6 +129,14 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
     // Phase 13: repetition-penalty ring of recently generated tokens.
     std::vector<int32_t> recent;
     recent.reserve(static_cast<size_t>(std::max<int32_t>(cfg_.repeat_window, 1)));
+
+    // Stop strings: the set_stop_strings() override wins, else the config.
+    const std::vector<std::string>& stops =
+        !active_stops_.empty() ? active_stops_ : cfg_.stop_strings;
+    // Streamed pieces are held back while they could still be part of a
+    // stop tail, then flushed once proven stop-free (keeps "\nUser:" out
+    // of a chat UI). emitted_off = how much of `out` was already streamed.
+    size_t emitted_off = 0;
 
     for (int32_t i = 0; i < max_tokens; ++i) {
         model_.forward(cursor, st, logits);
@@ -146,8 +207,28 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
 
         out += piece;
 
-        // streaming hook (chat UI): invoked after the piece is committed
-        if (cfg_.on_token) cfg_.on_token(piece);
+        // streaming hook (chat UI): flush everything that can no longer be
+        // part of a stop tail (held back otherwise so "\nUser:" never
+        // reaches the UI even when it is later trimmed from the reply).
+        if (cfg_.on_token && !stops.empty()) {
+            const size_t safe = streamable_len(out, stops);
+            if (safe > emitted_off) {
+                cfg_.on_token(out.substr(emitted_off, safe - emitted_off));
+                emitted_off = safe;
+            }
+        }
+
+        // ---- stop strings: halt + trim the matched tail --------------------
+        if (!stops.empty()) {
+            const long hit = find_stop_pos(out, stops);
+            if (hit >= 0) {
+                out.resize(static_cast<size_t>(hit));
+                break;
+            }
+        }
+
+        // streaming hook (no stops): unchanged per-piece behavior
+        if (cfg_.on_token && stops.empty()) cfg_.on_token(piece);
 
         bool stop = false;
         for (const int32_t sp : stop_pieces) {
@@ -158,6 +239,10 @@ std::string AgentLoop::generate(RwkvState& st, int32_t seed_token,
         if (grammar != nullptr && grammar->complete()) break;
         cursor = id;
     }
+
+    // Flush the held-back remainder (minus any trimmed stop tail).
+    if (cfg_.on_token && !stops.empty() && emitted_off < out.size())
+        cfg_.on_token(out.substr(emitted_off));
     return out;
 }
 

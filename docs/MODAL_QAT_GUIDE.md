@@ -105,6 +105,11 @@ Assistant:" --assistant-lora models/assistant-lora.gguf
 # the served QAT base loops under pure greedy: the runtime's Phase-13
 # CTRL repetition penalty (agent_loop.cpp) is the production chat fix —
 # python --sample mirrors it exactly via --repeat-penalty 1.2
+# Rambling mitigation ladder (weakest to strongest):
+#   1. --stop-defaults on gen/ask/chat (or "stop_defaults": true on /gen, /ask)
+#      cuts the invented "\nUser:" turn the moment it starts — today, zero cost
+#   2. a trained assistant LoRA teaches the model to actually stop (better)
+#   3. both together (strongest; also see docs/DEPLOYMENT.md)
 ```
 
 Healthy holdout answer-ppl is **~1.05–3.0**. Exactly **1.00 is the

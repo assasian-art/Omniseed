@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -94,6 +95,49 @@ void dump_state(RwkvModel& m) {
     const auto& c = m.config();
     std::printf("  layers=%d embd=%d vocab=%d heads=%d/%d ffn=%d\n", c.n_layers,
                 c.n_embd, c.n_vocab, c.n_heads, c.head_size, c.ffn_inter);
+}
+
+// Run the CLI as a subprocess and capture stdout (stop-strings regression:
+// exercises the exact user-facing path -- --stop-defaults on `gen`).
+// NOTE: the exe path is intentionally NOT quoted — _popen routes through
+// `cmd /c`, which strips the first AND last quote of a fully-quoted command
+// line (breaking the spawn); the repo-relative path has no spaces, and the
+// --prompt value's quotes are safe because the line then does not start
+// with one. Tests always run with the repo root as the working directory.
+std::string run_cli(const std::string& exe, const std::string& args) {
+    const std::string cmd = exe + " " + args;
+#ifdef _MSC_VER
+    std::FILE* p = _popen(cmd.c_str(), "r");
+#else
+    std::FILE* p = popen(cmd.c_str(), "r");
+#endif
+    std::string out;
+    if (p == nullptr) return out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+#ifdef _MSC_VER
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+    return out;
+}
+
+// Strip the trailing "[N ms, ... tok/s, ...]" timing line cmd_gen prints.
+std::string strip_timing(std::string out) {
+    size_t p = out.rfind("\n[");
+    while (p != std::string::npos) {
+        const size_t e = out.find('\n', p + 1);
+        const std::string line = out.substr(
+            p + 1, (e == std::string::npos ? out.size() : e) - p - 1);
+        if (line.find(" ms,") != std::string::npos &&
+            line.find("tok/s") != std::string::npos)
+            return out.substr(0, p + 1);
+        if (p == 0) break;
+        p = out.rfind("\n[", p - 1);
+    }
+    return out;
 }
 
 } // namespace
@@ -224,6 +268,75 @@ int main() {
                 "  (memory budget check skipped: OMNISEED_FORCE_FREAD=1)\n");
         } else {
             CHECK(platform::peak_rss_bytes() < 300ull * 1024 * 1024);
+        }
+    }
+
+    // --------------------- 6. stop strings (--stop-defaults) -----------------
+    // The classic base-model failure is answering, then inventing the next
+    // user turn ("... Paris.\nUser: What is 2+2?"). With --stop-defaults the
+    // reply must NOT contain "User:"/"Assistant:"; without the flag the
+    // decoding is byte-identical up to the first stop occurrence (the guard
+    // is a pure post-hoc trim — it never alters token choice).
+    {
+        std::string exe = "build\\bin\\omniseed.exe";
+        std::FILE* f = nullptr;
+#ifdef _MSC_VER
+        if (fopen_s(&f, exe.c_str(), "rb") != 0) f = nullptr;
+#else
+        f = std::fopen(exe.c_str(), "rb");
+#endif
+        if (f != nullptr) {
+            std::fclose(f);
+        } else {
+            exe = "build\\bin\\omniseed";
+            f = nullptr;
+#ifdef _MSC_VER
+            if (fopen_s(&f, exe.c_str(), "rb") != 0) f = nullptr;
+#else
+            f = std::fopen(exe.c_str(), "rb");
+#endif
+            if (f != nullptr) std::fclose(f);
+        }
+        if (f == nullptr && exe != "build\\bin\\omniseed.exe") {
+            std::printf("  (stop-strings check skipped: CLI not built)\n");
+        } else {
+            const std::string base_args =
+                std::string("gen --model ") + kModelPath +
+                " --max-tokens 96 --quiet --prompt "
+                "\"What is the capital of France?\"";
+            const std::string raw0 = run_cli(exe, base_args);
+            const std::string raw1 = run_cli(exe, base_args + " --stop-defaults");
+            const std::string r0 = strip_timing(raw0);
+            const std::string r1 = strip_timing(raw1);
+            CHECK(!r0.empty());
+            CHECK(!r1.empty());
+            CHECK(r1.find("User:") == std::string::npos &&
+                  r1.find("Assistant:") == std::string::npos);
+            // _popen pipes run in text mode: every "\n" the CLI writes
+            // arrives as "\r\n". Normalize trailing CR/LF before comparing.
+            auto rstrip_ws = [](std::string s) {
+                while (!s.empty() && (s.back() == '\r' || s.back() == '\n' ||
+                                      s.back() == ' ' || s.back() == '\t'))
+                    s.pop_back();
+                return s;
+            };
+            // find the first stop occurrence in the unguarded reply
+            size_t cut = std::string::npos;
+            const char* stops[] = {"\nUser:", "\nAssistant:"};
+            for (const char* s : stops) {
+                const auto p = r0.find(s);
+                if (p != std::string::npos && p < cut) cut = p;
+            }
+            if (cut != std::string::npos) {
+                // the guarded reply must equal the unguarded reply truncated
+                // exactly at the first stop (nothing lost, nothing added)
+                CHECK(rstrip_ws(r1) == rstrip_ws(r0.substr(0, cut)));
+                std::printf("  stop guard fired: %zu -> %zu chars\n",
+                            r0.size(), r1.size());
+            } else {
+                // no stop would occur: the flag must be a byte-exact no-op
+                CHECK(rstrip_ws(r1) == rstrip_ws(r0));
+            }
         }
     }
 

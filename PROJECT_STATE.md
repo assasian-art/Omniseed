@@ -1310,3 +1310,56 @@ tests do this now).
   (4560 pairs — Modal GPU minutes per the guide, or CPU overnight), then
   re-probe `--sample` for dual-domain quality; fixture suites stay as the
   mechanism regression only.
+
+---
+
+## 16. PHASE-20b — GENERATION STOP-STRINGS (2026-09-16)
+
+The base model answers a question and then invents the next user turn
+("… Paris.\nUser: What is 2+2?"). Stop strings cut that at the token level:
+
+decoding halts the moment the decoded tail matches any stop string
+(last-64-chars window, earliest-position match across all stops), the
+matched tail is trimmed from the reply, and streamed output is held back
+while it could still complete a stop (so "\nUser:" never reaches a chat
+UI). Zero effect on token choice — a pure output-boundary guard.
+
+- **Runtime** (`include/omniseed/agent/agent.h`, `src/agent/agent_loop.cpp`):
+  `Config.stop_strings` + `set_stop_strings()` (server mirror of
+  `set_sampling`: empty list reverts to construction-time config so requests
+  stay self-contained); `kAssistantStopDefaults` = `\nUser:`, `\nAssistant:`,
+  `\nAssistant::` (the doubled colon catches the model restarting the
+  assistant header with a typo). `generate()` gained the tail check +
+  trim + streaming hold-back; no-stop paths are untouched.
+- **CLI**: `--stop TEXT` (repeatable) + `--stop-defaults` on `gen`, `ask`,
+  `chat`; usage text updated.
+- **Server**: `POST /gen` and `POST /ask` accept `"stop": ["\\nUser:", …]`
+  and `"stop_defaults": true` (combined with explicit entries; absent
+  fields leave stops unchanged, `"stop": []` reverts to defaults). The
+  server has NO `/chat` endpoint — chat over HTTP is `/ask` — so the two
+  real endpoints carry the field. Plain-bytes parser (the vendored runtime
+  has no JSON decoder); no `/chat` demo-page change needed.
+- **ctest** (`omniseed_real_weights`, now **17/17**): drives the real CLI
+  binary twice on the i8 GGUF ("What is the capital of France?", 96 tokens)
+  — with `--stop-defaults` the reply contains NO "User:"/"Assistant:" and
+  equals the unguarded reply truncated exactly at the first stop (nothing
+  lost, nothing added); without the flag the output is byte-identical to
+  the guard being absent (no-op when no stop would occur). Skips cleanly
+  when the CLI isn't built. Test-infrastructure notes: `_popen` routes
+  through `cmd /c` (no quoting of the exe path — cmd strips a fully-quoted
+  command's first/last quote — and backslash separators, forward slashes
+  split), and text-mode pipes turn "\n" into "\r\n" (whitespace-normalized
+  comparison).
+- **Caught by the new test mid-flight:** the first implementation returned
+  the first stop in LIST order; when "\nAssistant:" completed EARLIER in
+  the text than "\nUser:" the trim point was wrong (truncated reply ≠
+  unguarded prefix). Fixed to earliest-position match across all stops.
+- **Docs — rambling mitigation ladder** (MASTER_SPEC CLI table + server
+  contract, DEPLOYMENT endpoint table, MODAL_QAT_GUIDE recipe):
+  `--stop-defaults` (cut the invented turn — today, zero cost) **<**
+  trained assistant LoRA (the model actually stops — better) **<** both.
+- **Verification:** zero /W4 warnings; omniseed_tests **206/206**,
+  omniseed_real_weights **17/17**, omniseed_sides **22/22** (one earlier
+  run showed the ASR wall-clock bound jittering under back-to-back suite
+  load — clean run passes), omniseed_qat_ternary **8/8**,
+  omniseed_trading **2129/0**.

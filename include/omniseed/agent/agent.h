@@ -178,6 +178,14 @@ private:
 };
 
 // ===========================================================================
+// Stop strings — halt decoding when the decoded tail matches any of these.
+// The assistant default set (
+// "\nUser:", "\nAssistant:", "\nAssistant::") covers the classic base-model
+// failure of answering, then inventing the next user turn.
+// ===========================================================================
+extern const char* const kAssistantStopDefaults[3];
+
+// ===========================================================================
 // AgentLoop — the perceive/think/act cycle
 // ===========================================================================
 class AgentLoop {
@@ -202,6 +210,11 @@ public:
         // Streaming: invoked per decoded piece during generate() (chat UI).
         // nullptr = buffered (default). Must not throw.
         std::function<void(const std::string&)> on_token;
+        // Stop strings: generation halts as soon as the decoded tail (last
+        // 64 chars) matches any of these; the matched tail is TRIMMED from
+        // the reply and streamed output is held back until it is proven
+        // stop-free, so "\nUser:" never reaches a chat UI. Empty = disabled.
+        std::vector<std::string> stop_strings;
         // ---------------------------------------------------------------
         // Phase-Omega additions (all default-off unless noted):
         // ---------------------------------------------------------------
@@ -277,6 +290,11 @@ public:
     // the defaults) keeps requests self-contained.
     void set_sampling(float repeat_penalty, int32_t repeat_window);
 
+    // Per-request stop strings (server mirror of Config.stop_strings): an
+    // EMPTY list reverts to the construction-time defaults, so each request
+    // is self-contained. Same race-free argument as set_sampling().
+    void set_stop_strings(const std::vector<std::string>& stops);
+
     // --- Prefix cache access (Phase-Omega) --------------------------------
     // Snapshot the CURRENT WKV state under cfg_.prefix_key. Call after a
     // turn whose prompt is representative (or from the runtime's idle loop).
@@ -298,6 +316,7 @@ private:
     const ComputeThrottle& throttle_;
     SelfImprovement&      improve_;
     Config                cfg_;
+    std::vector<std::string> active_stops_;   // set_stop_strings() override
 
     // Phase-Omega state (tiny: scalars + one 0.59 MB-class cache)
     PrefixCache    prefix_cache_;

@@ -84,6 +84,9 @@ void print_usage() {
         "  --top-k K        keep K highest-probability tokens (0 = all)\n"
         "  --repeat-penalty P  penalize recently generated tokens (1.15-1.25\n"
         "                      breaks loops; 1.0 = off, default 1.0)\n"
+        "  --stop TEXT       halt when the decoded tail matches TEXT\n"
+        "                      (repeatable); --stop-defaults enables the\n"
+        "                      assistant set: \\nUser:, \\nAssistant:, \\nAssistant::\n"
         "  --assistant-lora P  attach a LoRA sidecar (models/assistant-lora.gguf)\n"
         "                      to steer replies (assistant behavior); used by\n"
         "                      gen/ask/chat\n"
@@ -524,6 +527,7 @@ struct Session {
     std::string assistant_lora; // optional LoRA sidecar path
     std::string eval_file;      // ppl: corpus file (else --prompt text)
     int32_t    eval_tokens = 2048;  // ppl: token budget
+    std::vector<std::string> stop_strings;   // --stop (repeatable)
 
     Tokenizer tok;
     std::unique_ptr<RwkvModel> model;
@@ -638,6 +642,7 @@ int cmd_gen(Session& s) {
     cfg.top_k = s.top_k;
     cfg.repeat_penalty = s.repeat_penalty;
     cfg.seed = s.seed;
+    cfg.stop_strings = s.stop_strings;
     static ToolRegistry dummy;
     static MemoryCrystals mem;
     static ComputeThrottle thr;
@@ -668,6 +673,7 @@ int cmd_ask(Session& s) {
     UserFeedbackLoop feedback;
     AgentLoop::Config cfg;
     cfg.max_new_tokens = s.max_tokens;
+    cfg.stop_strings = s.stop_strings;
 
     AgentLoop loop(*s.model, s.tok, tools, mem, thr, imp, cfg);
     const AgentLoop::Result r = loop.run(s.prompt);
@@ -785,6 +791,7 @@ int cmd_chat(Session& s) {
     cfg.temperature = s.temperature;
     cfg.top_k = s.top_k;
     cfg.repeat_penalty = s.repeat_penalty;
+    cfg.stop_strings = s.stop_strings;
     // Streaming: print each piece as it is decoded, then finish the line
     // after generation completes (Result.reply holds the same text).
     cfg.on_token = [](const std::string& piece) {
@@ -836,6 +843,12 @@ int main(int argc, char** argv) {
             s.top_k = std::atoi(argv[++i]);
         else if (a == "--repeat-penalty" && i + 1 < argc)
             s.repeat_penalty = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--stop" && i + 1 < argc)
+            s.stop_strings.push_back(argv[++i]);
+        else if (a == "--stop-defaults") {
+            for (const char* d : kAssistantStopDefaults)
+                s.stop_strings.push_back(d);
+        }
         else if (a == "--assistant-lora" && i + 1 < argc)
             s.assistant_lora = argv[++i];
         else if (a == "--assistant-mode")

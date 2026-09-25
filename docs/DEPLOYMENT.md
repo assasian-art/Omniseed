@@ -83,9 +83,19 @@ Options: `--model PATH`, `--prompt TEXT`, `--max-tokens N`, `--quiet`.
 | Endpoint | Method | Body | Result |
 |---|---|---|---|
 | `/health` | GET | — | `{"ok":true,"model":true,"assistant_lora":false,"peak_rss":42}` |
-| `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64}` | `{"reply":"..."}` |
-| `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64}` | `{"text":"..."}` |
+| `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64,"stop":["\\nUser:"],"stop_defaults":true}` | `{"reply":"..."}` |
+| `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64,"stop":["\\nUser:"],"stop_defaults":true}` | `{"text":"..."}` |
 | `/asr` | POST | raw 16 kHz mono 16-bit WAV bytes, or `{"wav_b64":"<base64>"}` | `{"text":"<|0.00|> ...<|4.00|>","seconds":4.3}`; `{"error":"..."}` on silence/noise/too-short clips |
+
+**Stop strings (mirrors the CLI `--stop` / `--stop-defaults`):** decoding
+halts as soon as the decoded tail matches any `"stop": [...]` entry (the
+matched tail is trimmed from the reply and held back from any streamed
+output); `"stop_defaults": true` enables the assistant set (`\nUser:`,
+`\nAssistant:`, `\nAssistant::`). Absent fields leave stops unchanged and
+`"stop": []` reverts to the server-construction defaults — every request
+stays self-contained. **Rambling mitigation ladder:** `--stop-defaults`
+(cut the invented next turn — today) **<** a trained assistant LoRA (the
+model simply stops answering — better) **<** both together.
 
 `/asr` (Phase 15) runs the real whisper-tiny encoder + greedy decoder (HF
 official-parity: suppress tokens + timestamp rules). The sidecar

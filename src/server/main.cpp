@@ -6,9 +6,11 @@
 //    GET  /health         -> {"ok":true,"model":bool,"peak_rss":MB}
 //    POST /ask            -> one agent turn (json body: {"task": "...",
 //                           "repeat_penalty": 1.2, "repeat_window": 64,
+//                           "stop": ["\\nUser:"], "stop_defaults": true,
 //                           "assistant_lora": "path/to/sidecar.gguf"})
 //    POST /gen            -> raw generation (json body: {"prompt": "...",
 //                           "repeat_penalty": 1.2, "repeat_window": 64,
+//                           "stop": ["\\nUser:"], "stop_defaults": true,
 //                           "assistant_lora": "path/to/sidecar.gguf"})
 //    POST /asr            -> whisper-tiny transcription. Body is either RAW
 //                           16 kHz mono 16-bit PCM WAV bytes (Content-Type:
@@ -128,6 +130,46 @@ float json_num_field(const std::string& body, const std::string& key,
     char* end = nullptr;
     const float v = std::strtof(begin, &end);
     return (end == begin) ? dflt : v;}
+
+// String-array JSON field: "stop": ["\nUser:", "\nAssistant:"] (plain UTF-8
+// bytes; the runtime has no JSON decoder, so escapes stay literal — clients
+// send raw newlines as \\n, which then... is left to the client; documented).
+// Mirrors the CLI's repeatable --stop. Absent key -> unchanged behavior.
+std::vector<std::string> json_stop_array(const std::string& body) {
+    std::vector<std::string> stops;
+    const auto kpos = body.find("\"stop\"");
+    if (kpos == std::string::npos) return stops;
+    const auto cpos = body.find(':', kpos);
+    if (cpos == std::string::npos) return stops;
+    const auto end = body.find(']', cpos);
+    if (end == std::string::npos) return stops;
+    size_t p = cpos + 1;
+    while (p < end) {
+        const auto q1 = body.find('"', p);
+        if (q1 == std::string::npos || q1 >= end) break;
+        const auto q2 = body.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 > end) break;
+        if (q2 > q1 + 1) stops.push_back(body.substr(q1 + 1, q2 - q1 - 1));
+        p = q2 + 1;
+    }
+    return stops;
+}
+
+// "stop_defaults": true -> the assistant stop set (mirrors CLI
+// --stop-defaults); combined with any explicit "stop" entries.
+std::vector<std::string> request_stops(const std::string& body) {
+    std::vector<std::string> stops = json_stop_array(body);
+    const auto kpos = body.find("\"stop_defaults\"");
+    if (kpos != std::string::npos) {
+        const auto cpos = body.find(':', kpos);
+        if (cpos != std::string::npos &&
+            body.find("true", cpos) < body.find('}', cpos)) {
+            for (const char* d : kAssistantStopDefaults)
+                stops.push_back(d);
+        }
+    }
+    return stops;
+}
 
 // One-page demo console: a browser chat box against POST /gen. No assets,
 // no CDNs — everything inline so it works on an air-gapped LAN too.
@@ -528,10 +570,9 @@ int main(int argc, char** argv) {
             // Optional per-request assistant LoRA (Phase 14): absent field
             // leaves the current attachment untouched (startup flag/env still
             // applies); "" detaches for this request's identity.
-            const std::string want = json_field(body, "assistant_lora");
-            if (!want.empty() || body.find("\"assistant_lora\"")
-                                 != std::string::npos)
-                set_server_lora(model, server_lora, want);
+            // Optional per-request stop strings (mirrors the CLI): absent
+            // fields leave stops unchanged; "stop": [] reverts to defaults.
+            loop.set_stop_strings(request_stops(body));
             const AgentLoop::Result r = loop.run(task);
             respond(client, "{\"reply\":\"" + r.reply + "\"}");
         } else if (path == "/gen" && method == "POST" && have_model) {
@@ -543,6 +584,9 @@ int main(int argc, char** argv) {
             if (!want.empty() || body.find("\"assistant_lora\"")
                                  != std::string::npos)
                 set_server_lora(model, server_lora, want);
+            // Optional per-request stop strings (mirrors the CLI): absent
+            // fields leave stops unchanged; "stop": [] reverts to defaults.
+            loop.set_stop_strings(request_stops(body));
             auto ids = tok.encode_chat(prompt);
             RwkvState st;
             model.init_state(st);

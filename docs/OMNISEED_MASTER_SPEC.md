@@ -244,6 +244,12 @@ the world tokenizer straight from the GGUF, serves a **browser demo console at
 `"repeat_penalty"` (default 1.0 = off) and `"repeat_window"` (default 64)
 fields — CTRL-style repetition suppression tuned for the QAT ternary model;
 each request is self-contained (absent fields revert to the defaults).
+They also accept **stop strings**: `"stop": ["\\nUser:", "\\nAssistant:"]`
+halt decoding the moment the decoded tail matches any entry (the matched
+tail is trimmed, and streamed output is held back so a stop never reaches
+a UI); `"stop_defaults": true` enables the assistant set (`\nUser:`,
+`\nAssistant:`, `\nAssistant::`). Absent fields leave stops unchanged;
+`"stop": []` reverts to the construction-time defaults.
 
 **Assistant-behavior LoRA over HTTP (Phase 14):** attach a sidecar for the
 whole process with `--assistant-lora P` (or the `OMNISEED_ASSISTANT_LORA`
@@ -319,6 +325,7 @@ gives cross-entropy perplexity (PPL ≈ 33 on in-repo markdown, i8 head).
 | `omniseed ask --model M "task"` | one full agent turn (tools+memory) | JSON tool-call transcript |
 | `omniseed chat --model M` | REPL with thinking mode + interrupts | — |
 | `omniseed gen/chat … --repeat-penalty P` | CTRL-style repetition suppression (1.0 = off; 1.15–1.25 breaks text loops on the QAT ternary model; `--repeat-window` sets the recency ring, default 64) | loop-free continuation at full tok/s with no overhead |
+| `omniseed gen/ask/chat … --stop TEXT` (repeatable) / `--stop-defaults` | halt when the decoded tail matches a stop string (assistant set: `\nUser:`, `\nAssistant:`, `\nAssistant::`); matched tail trimmed, streaming held back | base model that rambles into an invented `\nUser:` turn is cut at the answer boundary |
 | `omniseed selftest` | numeric sanity | `selftest OK` |
 
 Observed peak RSS: **< 5 MB** across all demos (no model loaded) and
