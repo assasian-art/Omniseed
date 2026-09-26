@@ -27,7 +27,7 @@
 
 ### Market data (required)
 ```bash
-# Real data (Yahoo chart API, no key). Verify the row count before trusting.
+# Real data (Stooq first, then Yahoo chart API — no key). Verify the row count.
 .venv/Scripts/python.exe tools/fetch_market_data.py --ticker AAPL --timeframe 1d --years 5
 
 # Offline demo (deterministic synthetic GBM — clearly marked SYNTH):
@@ -35,6 +35,29 @@
 ```
 CSVs land in `models/market/<TICKER>_<TF>.csv`. **Always check bar timestamps
 before acting on downloaded data — staleness is invisible to the signal math.**
+
+#### Integrity rules (why a fetch can now *fail* instead of lying)
+
+| Behaviour | Rule |
+|---|---|
+| Provenance | Every CSV carries a trailing `source` column (`stooq`/`yahoo`/`synth`). `load_bars_csv()` reads fields 0..5 and ignores it, so the C++ contract is unchanged. |
+| No silent substitution | A provider failure is **never** replaced with synthetic bars. `--source stooq` (or `yahoo`) that fails prints the provider error and exits **2**, writing **no file**. |
+| Explicit opt-in | `auto` (default) tries Stooq then Yahoo; if both fail it exits **2** unless `--allow-synth` is given, which then falls back to clearly-marked synthetic data. |
+| No clobbering | Synthetic output defaults to `models/market/DEMO_<TF>.csv`, so it can never overwrite a real ticker's file. |
+| `--years` is honoured everywhere | The window is applied to **every** source. Stooq returns its full history, so without the trim a `--years 5` request used to silently deliver decades of bars. |
+| Empty result is a failure | `--years <= 0`, an unparsable/"No data" provider body, or 0 bars after trimming all exit **2**. |
+
+```bash
+# Ask for synthetic explicitly (never touches the network):
+.venv/Scripts/python.exe tools/fetch_market_data.py --source synth --years 1
+
+# Permit the auto fallback to synthetic when every real provider is down:
+.venv/Scripts/python.exe tools/fetch_market_data.py --ticker AAPL --allow-synth
+```
+
+Exit codes: **0** = bars written, **2** = refused/failed (nothing written).
+Characterization tests for all of the above: `tests/test_market_data.py`
+(offline, stdlib-only).
 
 ### News (optional)
 ```bash

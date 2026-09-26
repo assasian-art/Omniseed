@@ -319,6 +319,20 @@ if(OMNISEED_BUILD_TESTS)
     endif()
     add_test(NAME omniseed_trading COMMAND omniseed_trading
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Market-data fetcher integrity: fully offline characterization of
+    # tools/fetch_market_data.py — provenance column, explicit provider
+    # failure (exit 2, no file), --years trim on every source, no implicit
+    # synthetic substitution. Stdlib-only; needs only the venv python.
+    if(EXISTS "${OMNISEED_VENV_PY}")
+        add_test(NAME omniseed_market_data
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_market_data.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_market_data PROPERTIES TIMEOUT 300)
+    endif()
 endif()
 
 # --------------------------------- CLI binary --------------------------------

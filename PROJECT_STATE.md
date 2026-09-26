@@ -18,7 +18,13 @@ GLM-5.3-FLASH
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
   `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
-- **Last updated:** §17 CI BASELINE FIX (2026-09-26): GitHub Actions had been
+- **Last updated:** §18 MARKET-DATA INTEGRITY (2026-09-26): `fetch_market_data.py`
+  could silently substitute synthetic bars (provider failures swallowed, Stooq
+  `--years` ignored, `--source synth` still hit the network). Now: explicit
+  failure → exit 2 + no file, `--allow-synth` opt-in, `source` provenance
+  column, `--years` honoured on every source, synth → `DEMO_<tf>.csv`.
+  39-check offline suite registered as `omniseed_market_data`.
+  Previous: §17 CI BASELINE FIX (2026-09-26): GitHub Actions had been
   red 10+ commits; fixed the Linux/GCC build (nested-`Config` default
   arguments + unguarded `::closesocket` in the server) and made the CI smoke
   steps model-free. Full board 10/10 green locally.
@@ -1459,4 +1465,59 @@ breakage was three independent, stacked faults, none of them new to
 - `windows-latest` no longer ships VS 2022; the pinned
   `-G "Visual Studio 17 2022"` was dropped in `4b78f6e` (this box runs VS 18
   2026, so an unpinned generator is the portable choice).
+
+## 18. MARKET-DATA INTEGRITY (2026-09-26)
+
+`tools/fetch_market_data.py` could silently hand the trading stack **fake
+bars**. Three defects, all fixed; behaviour is now pinned by an offline
+characterization suite.
+
+### Root causes
+
+1. **`--source synth` still hit the network.** The synthetic branch was
+   decided by `demo_synth` only, so an explicit `--source synth` fell through
+   to the stooq/yahoo path. Requesting synthetic data could make real
+   network calls.
+2. **A provider failure was swallowed.** Any exception in the fetch chain
+   fell back to synthetic bars with only a stderr note. A mistyped ticker
+   ("AAPL" instead of "AAPL.US") or a dead provider produced a *valid-looking
+   CSV of random data* that the backtester happily consumed.
+3. **`--years` was ignored for Stooq.** Stooq returns its entire history;
+   the trim only existed on the Yahoo path, so `--years 5` on Stooq silently
+   delivered decades of bars — corrupting every metric that assumes a window.
+
+### Fix applied
+
+- Rewrote the tool around an explicit **`ProviderError`** contract:
+  - `--source stooq|yahoo` that fails → prints the provider error, **exits 2,
+    writes no file**.
+  - `auto` (default) tries stooq → yahoo; if both fail it exits **2** unless
+    **`--allow-synth`** is passed (then, and only then, synthetic bars are
+    substituted, clearly marked).
+  - `--source synth` / `--demo-synth` route straight to synthetic and make
+    **zero** network calls.
+- **Provenance column**: every CSV now ends with a `source` field
+  (`stooq`/`yahoo`/`synth`). `load_bars_csv()` reads fields 0..5 and ignores
+  the extra column, so the C++ contract is unchanged (backward-safe).
+- **`--years` applied in `emit_csv()`** to *every* source — sorts ascending,
+  drops rows older than `newest − years`.
+- **No clobbering**: synthetic output defaults to `models/market/DEMO_<TF>.csv`
+  instead of `<TICKER>_<TF>.csv`.
+- **Empty result is a failure**: `--years <= 0`, an unparsable/"No data"
+  provider body, or 0 bars after trimming all exit **2**.
+
+### Verification
+
+- New `tests/test_market_data.py` — **39 checks, 0 failures**, fully offline
+  (monkeypatches `urllib.request.urlopen` + `time.sleep`; no network, no
+  fixtures). Covers: seeded-determinism, `--source synth` network isolation,
+  explicit-failure exit 2 + no file, `auto` never implicitly synthesizing,
+  `--allow-synth` opt-in, stooq `--years` trim (~104 weekly bars for 2 y,
+  ≤731 d, newest bar retained), junk/empty provider = failure,
+  `DEMO_<tf>.csv` cannot clobber a real ticker file, and the `load_bars_csv()`
+  field contract.
+- Registered in ctest as **`omniseed_market_data`** (`CMakeLists.txt`,
+  venv-gated like the LoRA suites) — passes in 13.9 s.
+- `docs/TRADING_GUIDE.md` §2 documents the integrity rules, exit codes, and
+  the `--allow-synth` / `DEMO_<tf>.csv` behaviour.
 
