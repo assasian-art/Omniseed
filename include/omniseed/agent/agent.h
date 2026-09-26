@@ -150,7 +150,8 @@ public:
         double  replay_min_success_rate = 0.8;  // trust threshold
     };
 
-    explicit SelfImprovement(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    SelfImprovement() : SelfImprovement(Config{}) {}
+    explicit SelfImprovement(const Config& cfg) : cfg_(cfg) {}
 
     // Normalizes a task string to a stable key (lowercase, collapsed ws).
     static std::string task_key(const std::string& task);
@@ -252,8 +253,12 @@ public:
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,
               const ToolRegistry& tools, MemoryCrystals& memory,
+              const ComputeThrottle& throttle, SelfImprovement& improve)
+        : AgentLoop(model, tok, tools, memory, throttle, improve, Config{}) {}
+    AgentLoop(const RwkvModel& model, const Tokenizer& tok,
+              const ToolRegistry& tools, MemoryCrystals& memory,
               const ComputeThrottle& throttle, SelfImprovement& improve,
-              const Config& cfg = Config{}/*gcc-safe*/)
+              const Config& cfg)
         : model_(model), tok_(tok), tools_(tools), memory_(memory),
           throttle_(throttle), improve_(improve), cfg_(cfg) {}
 

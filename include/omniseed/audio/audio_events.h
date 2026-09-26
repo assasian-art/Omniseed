@@ -60,7 +60,8 @@ public:
     struct Config {
         float trigger_threshold = 0.55f;
     };
-    explicit SoundEventDetector(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    SoundEventDetector() : SoundEventDetector(Config{}) {}
+    explicit SoundEventDetector(const Config& cfg) : cfg_(cfg) {}
 
     // Classifies one clip. Returns the strongest event above threshold.
     SoundEventResult detect(const PcmAudio& audio) const;
@@ -85,7 +86,8 @@ public:
         float    match_threshold = 0.62f;
         int32_t  cooldown_frames = 25;    // ~1 s between triggers
     };
-    explicit WakeWordDetector(const Config& cfg = Config{}/*gcc-safe*/);
+    WakeWordDetector() : WakeWordDetector(Config{}) {}
+    explicit WakeWordDetector(const Config& cfg);
 
     // Streaming API: feed audio chunk; returns true on trigger.
     bool push(const PcmAudio& chunk);
@@ -134,7 +136,8 @@ public:
         size_t  baseline_frames = 128;   // frames to learn the baseline
         float   sensitivity     = 3.5f;  // sigma multiplier to flag
     };
-    explicit AudioAnomalyDetector(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    AudioAnomalyDetector() : AudioAnomalyDetector(Config{}) {}
+    explicit AudioAnomalyDetector(const Config& cfg) : cfg_(cfg) {}
 
     // Consumes frame features (from compute_frame_features); returns true
     // when the current frame deviates > sensitivity * sigma from baseline.

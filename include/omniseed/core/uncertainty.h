@@ -49,8 +49,11 @@ public:
     // Numerically stable softmax statistics (max-subtracted).
     static UncertaintyReport analyze(const Tensor& logits);
 
-    static bool should_abstain(const UncertaintyReport& r,
-                               const Config& cfg = Config());
+    // No default argument: GCC rejects a default argument that needs a nested
+    // Config's default member initializers while the enclosing class is still
+    // incomplete. The 1-arg overload supplies the default Config instead.
+    static bool should_abstain(const UncertaintyReport& r);
+    static bool should_abstain(const UncertaintyReport& r, const Config& cfg);
 };
 
 // ---------------------------------------------------------------------------

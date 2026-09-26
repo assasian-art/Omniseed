@@ -38,7 +38,8 @@ public:
         size_t max_snapshots = 8;    // 8 x 0.59 MB ≈ 4.7 MB at 0.1B
     };
 
-    explicit PrefixCache(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    PrefixCache() : PrefixCache(Config{}) {}
+    explicit PrefixCache(const Config& cfg) : cfg_(cfg) {}
 
     // Serialize the current state under `key`. Overwrites an existing entry
     // with the same key; evicts the oldest when full.

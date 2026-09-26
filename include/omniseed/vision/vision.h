@@ -49,7 +49,8 @@ struct UniCompressConfig {
 
 class UniCompress {
 public:
-    explicit UniCompress(const UniCompressConfig& cfg = UniCompressConfig{}/*gcc-safe*/) : cfg_(cfg) {}
+    UniCompress() : UniCompress(UniCompressConfig{}) {}
+    explicit UniCompress(const UniCompressConfig& cfg) : cfg_(cfg) {}
 
     // tokens: [N, C] feature rows; grid_side = sqrt(N). Returns [M <= N, C]
     // where M is the compressed token count, plus the merged token weights.

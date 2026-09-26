@@ -43,7 +43,8 @@ public:
     struct Config {
         float crop_fraction = 0.45f;   // center crop size when no gesture ROI
     };
-    explicit PointerPerception(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    PointerPerception() : PointerPerception(Config{}) {}
+    explicit PointerPerception(const Config& cfg) : cfg_(cfg) {}
 
     // Returns true when the query is deictic and a region was grounded.
     bool ground(const std::string& query, Region& out_region,
@@ -98,7 +99,8 @@ public:
         float motion_threshold = 0.04f;  // per-pixel delta to count as motion
         size_t history = 8;              // points kept for prediction
     };
-    explicit MotionTracker(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    MotionTracker() : MotionTracker(Config{}) {}
+    explicit MotionTracker(const Config& cfg) : cfg_(cfg) {}
 
     // Processes a new frame; returns the motion centroid (cx<0 => no motion).
     TrackPoint update(const Image& frame, uint64_t t_ms);
@@ -129,7 +131,8 @@ public:
         float wave_horizontal_ratio = 1.6f;  // dx/dy above => lateral wave
         float min_motion = 0.02f;
     };
-    explicit GestureRecognizer(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    GestureRecognizer() : GestureRecognizer(Config{}) {}
+    explicit GestureRecognizer(const Config& cfg) : cfg_(cfg) {}
 
     // Feed the per-frame motion centroid; classifies the buffered motion.
     Gesture update(float cx, float cy, float energy);

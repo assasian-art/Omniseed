@@ -35,7 +35,8 @@ public:
         int64_t max_logical    = 1000000; // 1M logical tokens (blueprint)
     };
 
-    explicit StreamingLlm(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    StreamingLlm() : StreamingLlm(Config{}) {}
+    explicit StreamingLlm(const Config& cfg) : cfg_(cfg) {}
 
     // Registers a token; returns true if it is inside the ACTIVE window
     // (i.e. should be fed to the model now).
@@ -99,7 +100,8 @@ public:
         float    entropy_boost  = 0.15f;
     };
 
-    explicit MemoryCrystals(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    MemoryCrystals() : MemoryCrystals(Config{}) {}
+    explicit MemoryCrystals(const Config& cfg) : cfg_(cfg) {}
 
     // Forms a crystal from retired tokens: keeps salient sentences by
     // scoring content words + positions; stores a 64-dim bag embedding.

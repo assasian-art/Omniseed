@@ -49,7 +49,8 @@ public:
         double  strong_sentiment  = 0.65;    // |score| that marks an item
     };
 
-    explicit NewsFeed(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    NewsFeed() : NewsFeed(Config{}) {}
+    explicit NewsFeed(const Config& cfg) : cfg_(cfg) {}
 
     // Parses RSS 2.0 (and tolerates Atom <entry>) XML text; returns the
     // number of NEW items added (GUID-based dedup). Sentiment + tickers are

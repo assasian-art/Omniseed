@@ -428,7 +428,7 @@ static void test_sub_agents() {
 
     // News sentiment must move the blended verdict. Pin the item to "now"
     // so the 24h aggregate window never ages it out of the test.
-    NewsFeed feed({});
+    NewsFeed feed;   // default Config (was `feed({})`, now ambiguous)
     const char* rss =
         "<rss><channel><item><guid>a</guid>"
         "<title>AAPL crashes on fraud probe, shares plunge</title>"

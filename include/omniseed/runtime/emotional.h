@@ -71,7 +71,8 @@ public:
         bool  adapt_responses = true;   // modulate output style
     };
 
-    explicit EmotionalResonance(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    EmotionalResonance() : EmotionalResonance(Config{}) {}
+    explicit EmotionalResonance(const Config& cfg) : cfg_(cfg) {}
 
     // Fuses all available channels into an EmotionalState.
     EmotionalState perceive(const EmotionalInput& in) const;

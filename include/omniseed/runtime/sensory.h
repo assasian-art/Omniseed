@@ -66,7 +66,8 @@ public:
         uint32_t min_enrollments = 2;    // samples before a modality is trusted
     };
 
-    explicit SensoryFingerprint(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
+    SensoryFingerprint() : SensoryFingerprint(Config{}) {}
+    explicit SensoryFingerprint(const Config& cfg) : cfg_(cfg) {}
 
     // Enrolls/updates the stored profile with a new observation
     // (running weighted mean; early samples weigh more).

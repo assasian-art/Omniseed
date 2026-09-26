@@ -51,6 +51,10 @@ UncertaintyReport Uncertainty::analyze(const Tensor& logits) {
     return r;
 }
 
+bool Uncertainty::should_abstain(const UncertaintyReport& r) {
+    return should_abstain(r, Config{});
+}
+
 bool Uncertainty::should_abstain(const UncertaintyReport& r, const Config& cfg) {
     // Flat distribution (no peak at all) or a coin-flip top-2: the kernel is
     // guessing. Greedy still returns top-1, but the agent should know.
