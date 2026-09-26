@@ -1744,3 +1744,82 @@ unchanged — **network in Python, engine never opens a socket**. New doc sectio
 
 
 
+
+## 22. T7+ — SYSTEM-1 DECISION HEAD: "TWO HEADS, ONE BRAIN" (2026-09-26)
+
+The architectural shift requested this pass: stop treating the core decision
+layer as something that needs a Python wrapper. System-1 decision capability now
+lives **inside the C++ runtime** — `omniseed.exe` reads a decision straight off
+the backbone's hidden state without generating a single token. New doc:
+`docs/JEV_INTEGRATION.md` (incl. the Jev/TypeSafe research and its limits).
+
+### C++ — the head (`include/omniseed/decision_head.h`, `src/decision_head.cpp`, new)
+
+- `DecisionHead` projects the post-`ln_out` residual `h[E]` onto a 7-action
+  space with **one matvec** `[A,E] x [E]` + softmax + argmax. No token loop is
+  reachable from `decide()`; it is allocation-free after the first call and
+  never mutates the recurrent state.
+- `DecisionResult { action_type, confidence_score, target_asset, margin,
+  routing, fast_path, matvecs, ms }` + `to_json()`.
+- Fail-closed routing: `ABSTAIN` and `EXPLAIN` can never self-route, however
+  confident. A near-tie fails the margin gate and escalates.
+- Persistence (self-describing LE blob, validated on load) with `set_action()`
+  as the offline-fitting hook. `trained()` is true only when **every** row is
+  fitted, so a half-populated head cannot masquerade as a real one.
+
+### C++ — the tap and the routing
+
+- `RwkvModel::forward` gained an optional `Tensor* hidden_out = nullptr`
+  (`src/core/rwkv.cpp`). It receives `xl3` — the same vector the text head
+  projects to logits. Taken *before* the vocab projection, never fed back into
+  the recurrence, and the tensor is reused across steps. `nullptr` is
+  bit-identical to the previous behaviour.
+- `agent_loop.cpp`: after the prompt prefill, `DecisionHead::decide(hidden)` runs
+  before any text exists. `confidence >= threshold` → the action is executed
+  immediately and System-2 is **never entered**; otherwise the turn falls
+  through to the unchanged generation path.
+- New `DecisionMode { Off, Hybrid, DecisionOnly }`. `Off` is the default in the
+  CLI, the server, and `AgentLoop::Config`, so the feature costs nothing when
+  unused and cannot silently change existing behaviour.
+- Prefix-cache edge case handled explicitly: when the prompt is not re-fed there
+  is no fresh hidden state, so the loop escalates rather than advancing the
+  recurrent state purely to manufacture one.
+
+### CLI + server
+
+- `omniseed ask|chat --mode off|hybrid|decision-only --decision-threshold F
+  --decision-head PATH`. An unknown `--mode` is refused (exit 2) rather than
+  silently defaulting. `chat` prints `[decision] {json}` per turn and marks the
+  turns System-1 answered alone.
+- `omniseed_server --decision-mode|--decision-threshold|--decision-head`, with
+  `OMNISEED_DECISION_MODE` / `OMNISEED_DECISION_HEAD` env fallbacks. `/health`
+  reports the mode and the head's provenance; `/ask` adds `"decision"` and
+  `"fast_path"` when the head was consulted.
+- Drive-by fix: `/ask` reply strings are now JSON-escaped — a reply containing a
+  quote previously produced a malformed response body.
+
+### Verification
+
+- `tests/test_decision_head.cpp` (new, ctest `omniseed_decision_head`) —
+  **149 checks, 0 failures**, fully offline (no model, no GGUF, no network).
+- Speed claim measured with the same clock and the same scalar fp32 inner loop
+  on both sides, against the **most charitable possible** System-2 baseline (a
+  bare output-head matvec per token, no attention/FFN/channel-mix — so the ratio
+  is a *lower bound*): tiny E=64/V=256 → **3,419–5,040x**; mid E=256/V=8192 →
+  **246,349–252,057x**. The mandated bar is 100x.
+- Full local board `ctest -C Release`: **10/10 passed**.
+- `omniseed_server` builds clean with `-DOMNISEED_BUILD_SERVER=ON`.
+- No new Python dependency in the decision path; the <400 MB budget and the 2%
+  risk-limit logic in C++ are untouched.
+
+### Honest limits (carried in the doc, not buried)
+
+- The shipped head is **untrained**: `init()` seeds a deterministic placeholder
+  projection that is structurally valid and semantically meaningless.
+  `trained()` / `provenance()` report it, and both the CLI and the server log a
+  warning when the mode is on and the head is not fitted.
+- Confidence is a **raw softmax, not calibrated**. Jev's RLCD calibration is not
+  reproduced; 0.85 is a tuned operating point, not a probability of success.
+- Fitting the projection offline is **not implemented** — `set_action()` /
+  `save()` / `load()` are the interface for it. This is the next honest step,
+  not a finished feature.

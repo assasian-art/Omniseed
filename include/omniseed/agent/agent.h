@@ -17,6 +17,7 @@
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tokenizer.h"
 #include "omniseed/core/uncertainty.h"
+#include "omniseed/decision_head.h"
 #include "omniseed/memory/memory.h"
 #include "omniseed/memory/prefix_cache.h"
 
@@ -187,6 +188,28 @@ private:
 extern const char* const kAssistantStopDefaults[3];
 
 // ===========================================================================
+// DecisionMode — how much of a turn the System-1 decision head is allowed to
+// answer by itself ("two heads, one brain"; see decision_head.h).
+//
+//   Off          — System-2 only. The default everywhere, and bit-identical
+//                  to the pre-decision-head behaviour. A head is never even
+//                  allocated, so the cost of this feature when unused is zero.
+//   Hybrid       — consult the head first. If it self-routes, answer from it;
+//                  otherwise fall through to the full text path unchanged.
+//   DecisionOnly — never enter the token loop. If the head will not
+//                  self-route, return its (ABSTAIN/EXPLAIN) decision instead
+//                  of quietly generating text: a mode named "decision-only"
+//                  that silently generates would be lying about what it does.
+// ===========================================================================
+enum class DecisionMode : int32_t {
+    Off = 0,
+    Hybrid,
+    DecisionOnly
+};
+
+const char* decision_mode_name(DecisionMode m);
+
+// ===========================================================================
 // AgentLoop — the perceive/think/act cycle
 // ===========================================================================
 class AgentLoop {
@@ -249,6 +272,20 @@ public:
         // State fingerprint: print the introspective self-marker (who/what/
         // purpose + active goals) at the top of each reply, Mythos-style.
         bool     state_fingerprint = false;
+        // ---------------------------------------------------------------
+        // System-1 decision head ("two heads, one brain"):
+        // ---------------------------------------------------------------
+        // Off (default) keeps the loop bit-identical to before. Hybrid and
+        // DecisionOnly additionally run the head on the prompt's hidden state
+        // before any text is generated. See DecisionMode above.
+        DecisionMode decision_mode      = DecisionMode::Off;
+        // Self-routing bar: at or above this softmax confidence the head acts
+        // without System-2. 0.85 matches the sniper regime gate.
+        float    decision_threshold     = 0.85f;
+        // Optional fitted projection blob (see DecisionHead::load). Empty =
+        // use the deterministic seeded placeholder, which is UNTRAINED and
+        // therefore meaningless — see the honesty note in decision_head.h.
+        std::string decision_head_path;
     };
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,
@@ -273,6 +310,14 @@ public:
         bool     abstained = false;                  // hedge was applied
         uint64_t prefix_hits  = 0;                   // snapshot reuse count
         int32_t  rss_zone     = 0;                   // 0 ok / 1 soft / 2 hard
+        // ---- System-1 additions ------------------------------------------
+        // What the decision head said this turn. `decision_checked`
+        // distinguishes "the head was never consulted" (DecisionMode::Off, or
+        // no fresh hidden state) from a genuine ABSTAIN verdict — both leave
+        // action_type == ABSTAIN, and only the flag tells them apart.
+        DecisionResult decision;
+        bool     decision_checked    = false;  // head actually ran on h[E]
+        bool     decision_fast_path  = false;  // System-2 was never entered
     };
 
     // One user turn -> final reply (executing any tool calls en route).
@@ -309,6 +354,16 @@ public:
     // --- Working memory scratchpad (Phase-Omega) ---------------------------
     WorkingMemory& working_memory() { return scratch_; }
 
+    // --- System-1 decision head (two heads, one brain) ---------------------
+    // Lazily sized from the loaded model on first use; safe to inspect before
+    // run(). Exposed so the CLI/server can report provenance (trained vs
+    // seeded placeholder) instead of silently trusting an untrained head.
+    DecisionHead&       decision_head()       { return decision_head_; }
+    const DecisionHead& decision_head() const { return decision_head_; }
+    // Allocate (and, if configured, load) the head. No-op when the mode is
+    // Off. Returns true when the head is ready to decide.
+    bool ensure_decision_head();
+
 private:
     // Prompt assembly: memory crystals + tool schemas + user turn.
     std::vector<int32_t> build_prompt(const std::string& user_input,
@@ -330,6 +385,10 @@ private:
     Uncertainty::Config ucfg_;
     UncertaintyReport   last_uncertainty_;   // set by generate()
     RwkvState           last_state_;         // reference for snapshot_prefix()
+
+    // System-1 decision head. Empty (E_ == 0, no buffers) until
+    // ensure_decision_head() sizes it, so DecisionMode::Off costs nothing.
+    DecisionHead        decision_head_;
 };
 
 } // namespace omniseed

@@ -46,6 +46,10 @@ endif()
 
 # ----------------------------- Core static library ---------------------------
 set(OMNISEED_CORE_SOURCES
+    # System-1 decision head ("two heads, one brain"): hidden state -> action
+    # distribution in one matvec. Sits above core/ because it is a decision
+    # layer that both the agent loop and the trading runtime consume.
+    src/decision_head.cpp
     src/core/platform.cpp
     src/core/tensor.cpp
     src/core/bitlinear.cpp
@@ -420,6 +424,26 @@ if(OMNISEED_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_paper_reports PROPERTIES TIMEOUT 300)
     endif()
+
+    # System-1 decision head ("two heads, one brain"): action space + labels,
+    # the one-matvec contract, softmax/argmax, fail-closed routing (ABSTAIN and
+    # EXPLAIN never self-route), confidence/margin gates, determinism, input
+    # immutability, persistence round-trip + rejection paths, and the >=100x
+    # speed claim against the cheapest possible System-2 token step.
+    # Fully offline: no model, no GGUF, no network.
+    add_executable(omniseed_decision_head tests/test_decision_head.cpp)
+    target_include_directories(omniseed_decision_head PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_decision_head PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_decision_head PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_decision_head PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_decision_head COMMAND omniseed_decision_head
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_decision_head PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

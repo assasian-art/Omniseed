@@ -1,0 +1,185 @@
+// =============================================================================
+//  OmniSeed — decision_head.h
+//
+//  "TWO HEADS, ONE BRAIN" — the System-1 decision head.
+//
+//  The RWKV-7 backbone is the one brain: a single forward pass turns the
+//  prompt into a hidden state h[E] (the post-ln_out residual, already
+//  layernormed into xl3 inside RwkvModel::forward). That hidden state is the
+//  model's entire opinion about the situation it just read.
+//
+//  Classically we would now decode that opinion into TEXT and then parse the
+//  text back into a decision — an autoregressive token loop whose cost scales
+//  with max_new_tokens, and whose output is a string we have to re-parse.
+//  The decision head short-circuits that: it projects h directly onto a small
+//  ACTION space and reads the decision off the resulting distribution.
+//
+//    System-1 (this file)      one matvec  [A, E] x [E]  -> softmax -> argmax
+//    System-2 (agent_loop)     max_new_tokens x (full RWKV forward + head)
+//
+//  Both heads read the SAME h. Neither replaces the other:
+//    * high confidence  -> System-1 acts immediately (self-routing)
+//    * low  confidence  -> escalate to System-2 for real reasoning / wording
+//
+//  COST. System-1 is A*E multiply-accumulates and one softmax over A. With
+//  the shipped action space (7 actions) and a 0.1B-class E this is a few
+//  hundred ns — sub-millisecond by three orders of magnitude. It performs no
+//  token loop, allocates nothing after the first call, and does not touch the
+//  recurrent state, so it cannot perturb a conversation.
+//
+//  HONESTY NOTE (read before trusting an output).
+//  A freshly constructed head has NO trained projection. `init()` seeds it
+//  deterministically so tests and CI are reproducible, and `provenance()` /
+//  `trained()` report that fact. A seeded head produces well-formed but
+//  MEANINGLESS actions — it is a documented placeholder for an offline-fitted
+//  projection, exactly like the other not-yet-trained components in this
+//  tree. Never present a `trained() == false` head's routing as a judgement.
+//  `DecisionMode::Off` is the default everywhere precisely so that an
+//  untrained head cannot silently change existing behaviour.
+// =============================================================================
+#pragma once
+
+#include "omniseed/core/rwkv.h"
+#include "omniseed/core/tensor.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace omniseed {
+
+// ---------------------------------------------------------------------------
+// The System-1 action space.
+//
+// Deliberately tiny: every extra action costs E more floats of projection and
+// dilutes the softmax. ABSTAIN and EXPLAIN are the two "this is not mine"
+// escapes — ABSTAIN means "no opinion, say nothing", EXPLAIN means "I have an
+// opinion but expressing it needs language, hand me to System-2". Both keep
+// the head fail-closed: an uncertain head escalates rather than guessing.
+// ---------------------------------------------------------------------------
+enum class DecisionAction : int32_t {
+    ABSTAIN = 0,   // no opinion — emit nothing
+    HOLD,          // stay put, no new exposure
+    BUY,           // open / add long
+    SELL,          // open / add short
+    CLOSE,         // flatten an existing position
+    HEDGE,         // reduce net exposure without flattening
+    EXPLAIN,       // needs language -> route to System-2
+    COUNT          // sentinel: number of actions
+};
+
+// Stable lowercase-free label used in JSON and logs.
+const char* decision_action_name(DecisionAction a);
+
+// ---------------------------------------------------------------------------
+// One System-1 decision.
+// ---------------------------------------------------------------------------
+struct DecisionResult {
+    // --- the three fields the integration contract names ---------------------
+    DecisionAction action_type      = DecisionAction::ABSTAIN;
+    float          confidence_score = 0.0f;   // softmax prob of the argmax
+    std::string    target_asset;              // "" unless mapped via set_action_asset
+
+    // --- diagnostics ---------------------------------------------------------
+    float       margin    = 0.0f;   // p(top) - p(second): how close the call was
+    std::string routing   = "abstain";  // "self" | "system2" | "abstain" | "error"
+    bool        fast_path = false;  // true <=> routing == "self"
+    int32_t     matvecs   = 0;      // 1 for a real decision; the whole point
+    double      ms        = 0.0;    // wall time of the matvec+softmax
+
+    std::string to_json() const;
+};
+
+// ---------------------------------------------------------------------------
+// The head itself. Cheap to construct, stateless across calls, const-decide.
+// ---------------------------------------------------------------------------
+class DecisionHead {
+public:
+    struct Config {
+        // Self-routing threshold. At or above this the head is trusted to act
+        // without System-2. 0.85 matches the sniper engine's regime gate so
+        // the two layers cannot disagree about what "confident" means.
+        float threshold = 0.85f;
+        // Optional floor on p(top) - p(second). A 0.90/0.88 split clears the
+        // confidence bar but is nearly a coin flip; set > 0 to demand a clear
+        // winner. 0 = disabled (confidence alone decides).
+        float margin_floor = 0.0f;
+    };
+
+    DecisionHead() = default;
+    // Convenience: size the head from the loaded model's embedding width.
+    explicit DecisionHead(const RwkvConfig& cfg, uint32_t seed = 1234u);
+
+    // Allocate [COUNT, E] projection + bias. Deterministic in `seed`; marks
+    // the head untrained (see the honesty note at the top of this file).
+    bool init(const RwkvConfig& cfg, uint32_t seed = 1234u);
+    bool init(int32_t n_embd, uint32_t seed = 1234u);
+
+    bool ready() const { return ready_; }
+    const std::string& error() const { return error_; }
+
+    int32_t hidden_size()  const { return E_; }
+    int32_t action_count() const { return A_; }
+
+    const Config& config() const { return cfg_; }
+    void  set_threshold(float t) { cfg_.threshold = t; }
+    float threshold() const { return cfg_.threshold; }
+    // Optional floor on p(top) - p(second); 0 disables the check.
+    void  set_margin_floor(float m) { cfg_.margin_floor = m; }
+    float margin_floor() const { return cfg_.margin_floor; }
+
+    // ---- the hot path -------------------------------------------------------
+    // ONE matvec + softmax + argmax over the hidden state. No token loop, no
+    // allocation after the first call, no mutation of `hidden` or the state.
+    // Not thread-safe against itself (the logits scratch is reused); AgentLoop
+    // is documented single-threaded per instance, same contract as
+    // Uncertainty / EntropyMonitor.
+    DecisionResult decide(const float* hidden) const;
+    DecisionResult decide(const Tensor& hidden) const;
+
+    // ---- offline fitting hooks ---------------------------------------------
+    // Overwrite one action's projection row (E floats) and bias. Counts as one
+    // fitted action; trained() only becomes true once EVERY action is fitted,
+    // so a half-populated head cannot masquerade as a real one.
+    void set_action(DecisionAction a, const float* row, float bias);
+    // Attach a default asset label for an action (fills target_asset).
+    void set_action_asset(DecisionAction a, const std::string& asset);
+
+    // ---- persistence --------------------------------------------------------
+    // Self-describing little-endian blob: magic, version, E, A, action names,
+    // asset labels, projection, bias. Returns false + error() on mismatch.
+    bool save(const std::string& path) const;
+    bool load(const std::string& path);
+
+    // ---- provenance ---------------------------------------------------------
+    // trained() == every action row came from set_action()/load(), i.e. the
+    // projection is fitted rather than seeded. Anything else is a placeholder.
+    bool trained() const { return A_ > 0 && fitted_actions_ == A_; }
+    int32_t fitted_actions() const { return fitted_actions_; }
+    const std::string& provenance() const { return provenance_; }
+    // Wall time (ns) of the most recent decide(); for benchmarks/dashboards.
+    double last_ns() const { return last_ns_; }
+
+private:
+    void seed_weights(uint32_t seed);
+
+    Config      cfg_;
+    int32_t     E_ = 0;             // hidden width
+    int32_t     A_ = 0;             // action count
+    std::vector<float>       proj_;  // [A_, E_] row-major, one row per action
+    std::vector<float>       bias_;  // [A_]
+    std::vector<std::string> asset_; // [A_] default target_asset per action
+    std::vector<std::string> name_;  // [A_] action labels (persisted)
+
+    bool        ready_          = false;
+    int32_t     fitted_actions_ = 0;   // rows supplied by set_action()/load()
+    std::vector<uint8_t> fitted_;      // [A_] per-action "row came from fitting"
+    std::string provenance_ = "uninitialised";
+    std::string error_;
+
+    // Reused scratch — mutable so decide() can stay const and allocation-free.
+    mutable std::vector<float> logits_;
+    mutable double             last_ns_ = 0.0;
+};
+
+} // namespace omniseed
