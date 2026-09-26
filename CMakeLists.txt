@@ -83,6 +83,8 @@ set(OMNISEED_CORE_SOURCES
     src/trading/broker_alpaca.cpp
     src/trading/walkforward.cpp
     src/trading/paper_daemon.cpp
+    src/trading/market_perception.cpp
+    src/trading/risk_gate.cpp
     src/runtime/introspection.cpp
     src/runtime/cloud_bridge.cpp
     src/agent/sub_agents.cpp
@@ -338,6 +340,24 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_trading_edge PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # Market perception + risk gates (M1/M4): feed-health staleness/error
+    # thresholds, the ABSTAIN gate, composite daily/weekly drawdown governors,
+    # asset-class-aware risk budgets (meme research-only), correlation cap, and
+    # the code-enforced autonomy ladder (L0/L1/L2 unlock lines).
+    add_executable(omniseed_market_perception tests/test_market_perception.cpp)
+    target_include_directories(omniseed_market_perception PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_market_perception PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_market_perception PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_market_perception PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_market_perception COMMAND omniseed_market_perception
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_market_perception PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Market-data fetcher integrity: fully offline characterization of
     # tools/fetch_market_data.py — provenance column, explicit provider
     # failure (exit 2, no file), --years trim on every source, no implicit
@@ -350,6 +370,17 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_market_data.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_market_data PROPERTIES TIMEOUT 300)
+
+        # Market-feed adapters (M1): rate limiting, TTL cache, HTTP retry,
+        # symbol normalisation, per-asset bar/ticker adapters, provenance-CSV
+        # reuse, and the meme research-only refusal. Fully offline.
+        add_test(NAME omniseed_market_feeds
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_market_feeds.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_market_feeds PROPERTIES TIMEOUT 300)
     endif()
 endif()
 

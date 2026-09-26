@@ -463,6 +463,103 @@ RiskManager::Sizing RiskManager::size_by_risk(double equity, double price,
     return s;
 }
 
+double RiskManager::effective_risk_pct(AssetClass ac, const RiskLimits& lim) {
+    if (ac == AssetClass::Meme) {
+        if (lim.meme_research_only) return 0.0;      // no trades at all
+        return std::min(lim.risk_per_trade_pct, lim.meme_max_risk_pct);
+    }
+    // Everything else still obeys the 1..2% band.
+    double r = lim.risk_per_trade_pct;
+    if (r < kMinRiskPerTradePct) r = kMinRiskPerTradePct;
+    if (r > kMaxRiskPerTradePct) r = kMaxRiskPerTradePct;
+    return r;
+}
+
+RiskManager::Sizing RiskManager::size_by_risk(double equity, double price,
+                                              AssetClass ac,
+                                              const RiskLimits& lim) {
+    if (ac != AssetClass::Meme) return size_by_risk(equity, price, lim);
+
+    // Meme gets its own path: the 1% floor of the generic clamp would DEFEAT
+    // the meme cap, so it is deliberately not applied here.
+    Sizing s;
+    if (lim.meme_research_only) {
+        s.reason = "meme class is research-only (meme_research_only)";
+        s.allowed = false;
+        return s;
+    }
+    if (equity <= 0.0 || price <= 0.0) {
+        s.reason = "bad equity/price";
+        s.allowed = false;
+        return s;
+    }
+    if (lim.stop_loss_pct <= 0.0) {
+        s.reason = "stop_loss_pct <= 0 -> risk budget undefined";
+        s.allowed = false;
+        return s;
+    }
+    const double risk = std::min(lim.risk_per_trade_pct, lim.meme_max_risk_pct);
+    if (risk <= 0.0) {
+        s.reason = "meme risk cap is 0";
+        s.allowed = false;
+        return s;
+    }
+    const double per_share_risk = price * lim.stop_loss_pct;
+    double qty = std::floor(equity * risk / per_share_risk);
+    const double max_qty = std::floor(equity * lim.max_position_pct / price);
+    const bool capped = qty > max_qty;
+    if (capped) qty = max_qty;
+    if (qty < 0.0) qty = 0.0;
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "meme risk %.3f%% of equity / stop %.2f%% -> %s",
+                  risk * 100.0, lim.stop_loss_pct * 100.0,
+                  capped ? "position-cap" : "risk-budget");
+    s.reason = buf;
+    s.qty = qty;
+    s.allowed = qty > 0.0;
+    if (!s.allowed) s.reason += " (qty floors to 0)";
+    return s;
+}
+
+double RiskManager::correlation(const std::vector<double>& a,
+                                const std::vector<double>& b) {
+    if (a.size() < 2 || a.size() != b.size()) return 0.0;
+    const double n = static_cast<double>(a.size());
+    double ma = 0.0, mb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) { ma += a[i]; mb += b[i]; }
+    ma /= n; mb /= n;
+    double cov = 0.0, va = 0.0, vb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double da = a[i] - ma, db = b[i] - mb;
+        cov += da * db;
+        va  += da * da;
+        vb  += db * db;
+    }
+    if (va <= 0.0 || vb <= 0.0) return 0.0;   // undefined: flat series
+    return cov / std::sqrt(va * vb);
+}
+
+bool RiskManager::correlation_ok(const std::vector<std::vector<double>>& book,
+                                 const std::vector<double>& candidate,
+                                 const RiskLimits& lim, double& worst,
+                                 std::string& why_not) {
+    worst = 0.0;
+    for (const std::vector<double>& series : book) {
+        const double r = std::fabs(correlation(series, candidate));
+        if (r > worst) worst = r;
+        if (r >= lim.max_correlation) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "correlation %.2f >= cap %.2f",
+                          r, lim.max_correlation);
+            why_not = buf;
+            return false;
+        }
+    }
+    return true;
+}
+
 Action RiskManager::check_exit(const Position& pos, double price,
                                const RiskLimits& lim) {
     if (pos.qty <= 0.0 || pos.avg_price <= 0.0) return Action::Hold;

@@ -1596,3 +1596,78 @@ exists to separate the strategy from the tuning. Three new pieces:
   1581 records, second run resumed (0 bars processed).
 - `docs/TRADING_GUIDE.md` §1/§3/§4 + new §5b document all of the above.
 
+## 20. T7+ M1 + M4 — MARKET PERCEPTION + RISK GATES (2026-09-26)
+
+The first two milestones of the T7+ autonomy mandate: a unified multi-asset
+perception layer that **refuses to act on untrustworthy data**, and the
+code-enforced risk/autonomy gates. New evidence table in
+`docs/TRADING_LAB.md`; operational summary in `docs/TRADING_GUIDE.md` §5c.
+
+### M1 — Market feeds (`tools/market_feeds.py`, new)
+
+- Keyless multi-asset adapters behind **one** HTTP path (`HttpClient`) so cache,
+  rate limiting and retries live in exactly one place:
+  - `equity` → Yahoo (`query1.finance.yahoo.com`), bars + ticker
+  - `crypto` → Binance then CoinGecko (`api.binance.com`, `api.coingecko.com`)
+  - `fx` → Frankfurter (`api.frankfurter.app`)
+  - `meme` → DexScreener (`api.dexscreener.com`) — **ticker only**
+- **Provenance single-sourced:** imports `fetch_market_data.emit_csv` via
+  `importlib`, so the T6 `time,open,high,low,close,volume,source` contract has
+  one definition. Provider failures are explicit (exit 2, no file).
+- **Rate limiting** = token bucket (`--rate-per-min`); **cache** = sha1-keyed
+  TTL JSON (`--cache-dir/--cache-ttl`).
+- **Meme bars mode is refused** (exit 2) because no free OHLCV exists —
+  matching `RiskLimits::meme_research_only`.
+- `normalize()` fix: a quote suffix only counts when something precedes it, so
+  bare `BTC` → `BTCUSDT` while `ETHBTC` keeps its explicit quote.
+
+### M1 — Perception + ABSTAIN (`src/trading/market_perception.{h,cpp}`, new)
+
+- `Ticker` — one normalized cross-asset snapshot carrying its provider
+  (provenance), mirroring the T6 `source` column.
+- `FeedHealthMonitor` — `Ok → Degraded (300 s) → Dead (900 s)`, or dead after
+  `dead_after_failures` (3) consecutive errors; unobserved → `Missing`, **never**
+  an implicit `Ok`.
+- `PerceptionGate::check()` → `AbstainDecision` (`missing-data`/`invalid-ticker`/
+  `stale-feed`/`dead-feed`/`low-liquidity`). A default-constructed `FeedHealth`
+  (no symbol) falls back to the ticker's own ts; a health that names the symbol
+  but carries no data is `missing-data` — so an explicit "monitor says missing"
+  can never be mistaken for "fresh".
+
+### M4/M6 — Risk gates (`src/trading/risk_gate.{h,cpp}`, new; `trading_engine.{h,cpp}`)
+
+- `RiskGovernorSet` — two independent `DailyRiskGovernor`s (daily + weekly);
+  entries refused while **either** is halted, each re-arms on its own boundary.
+- `RiskLimits` gained `max_weekly_loss_pct` (6%), `meme_max_risk_pct` (0.25%),
+  `meme_research_only` (true), `max_correlation` (0.80).
+- `RiskManager::size_by_risk(equity, stop, AssetClass, limits)` — 1–2% band for
+  equity/crypto/fx; memes use `min(risk_per_trade, meme_max_risk_pct)` with **no
+  1% floor** (never clamped *up*). `effective_risk_pct` exposes the decision.
+- `RiskManager::correlation` / `correlation_ok` — Pearson; a candidate whose
+  worst pairwise correlation exceeds the cap is refused.
+- `AutonomyGate` — L0 paper-only (default, live refused outright); L1
+  micro-live (≤$100 total, ≤1%/trade, ≥30 paper days); L2 scaled (≥90 live
+  days). Unlock = an **exact, own-line** `UNLOCK L1 MICRO-LIVE` /
+  `UNLOCK L2 SCALE-UP` in this file; near-misses (TODO, quoted, different case)
+  unlock nothing. `allows_live()` re-checks level + duration + caps per order.
+
+### Verification
+
+- `tests/test_market_perception.cpp` (new, ctest `omniseed_market_perception`) —
+  **107 checks, 0 failures**: feed health staleness/failures/recovery/unknown;
+  ABSTAIN for fresh/invalid/stale/dead/missing/liquidity + stable reason
+  strings; governor daily-only/weekly-only/OR semantics; asset-class 1–2% band,
+  meme research-only + 0.25% cap + no-up-clamp + equity-equals-untyped; Pearson
+  perfect/inverse/degenerate + cap refuse/pass/empty-book; autonomy resolve
+  exact/near-miss + L0/L1/L2 caps and durations.
+- `tests/test_market_feeds.py` (new, ctest `omniseed_market_feeds`, venv-gated) —
+  **56 checks, 0 failures**: cache hit/miss, token bucket, HTTP retry +
+  ProviderError naming the host, symbol normalisation, every bar/ticker adapter
+  offline, provenance-CSV reuse, meme bars refusal, explicit failure exit 2 +
+  no file, `--years 0` rejection, probe mode.
+- `CMakeLists.txt` — `market_perception.cpp` + `risk_gate.cpp` added to
+  `OMNISEED_CORE_SOURCES`; both test targets registered.
+- `omniseed_trading` (2129 checks) unchanged green — the `RiskManager` additions
+  are additive and do not alter existing sizing on valid inputs.
+
+

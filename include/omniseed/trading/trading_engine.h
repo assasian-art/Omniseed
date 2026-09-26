@@ -179,6 +179,21 @@ private:
 };
 
 // ===========================================================================
+// Asset class — perception/risk classification (M1/M4)
+// ===========================================================================
+enum class AssetClass : int8_t { Equity = 0, Crypto, Fx, Meme, Unknown };
+
+inline const char* to_string(AssetClass ac) {
+    switch (ac) {
+        case AssetClass::Equity:  return "equity";
+        case AssetClass::Crypto:  return "crypto";
+        case AssetClass::Fx:      return "fx";
+        case AssetClass::Meme:    return "meme";
+        default:                  return "unknown";
+    }
+}
+
+// ===========================================================================
 // RiskManager — Kelly sizing, stops, drawdown + exposure limits
 // ===========================================================================
 struct RiskLimits {
@@ -199,6 +214,15 @@ struct RiskLimits {
     // day's start equity, NEW entries are refused until the next UTC day.
     // Exits/stops are never blocked (the switch only gates new risk).
     double  max_daily_loss_pct = 0.03;
+    // --- M4 multi-asset risk engine --------------------------------------
+    // Weekly kill-switch, measured from the week's high-water mark.
+    double  max_weekly_loss_pct = 0.06;
+    // Meme assets are capped far harder until they have a proven record, and
+    // are RESEARCH-ONLY by default (no paper/live entries at all).
+    double  meme_max_risk_pct  = 0.0025;   // 0.25% of equity
+    bool    meme_research_only = true;
+    // Pairwise correlation cap across book holdings (|Pearson r|).
+    double  max_correlation    = 0.80;
 };
 
 // The per-trade risk budget is clamped into this band (see
@@ -230,6 +254,28 @@ public:
     // whenever it fires, so an over-large config is visible, not silent.
     static Sizing size_by_risk(double equity, double price,
                                const RiskLimits& lim);
+
+    // Per-trade risk budget for an asset class. Meme is capped by
+    // meme_max_risk_pct; returns 0.0 when the class may not be traded at all
+    // (meme_research_only). Non-meme classes use risk_per_trade_pct.
+    static double effective_risk_pct(AssetClass ac, const RiskLimits& lim);
+
+    // size_by_risk with the asset-class override applied. Refuses
+    // (allowed=false, qty=0) for a research-only class.
+    static Sizing size_by_risk(double equity, double price, AssetClass ac,
+                               const RiskLimits& lim);
+
+    // Pearson correlation of two equal-length series. 0 when undefined
+    // (length < 2, mismatched lengths, or zero variance in either series).
+    static double correlation(const std::vector<double>& a,
+                              const std::vector<double>& b);
+
+    // True when `candidate` keeps |correlation| below lim.max_correlation
+    // against every series in `book`. `worst` reports the largest |r| seen.
+    static bool correlation_ok(const std::vector<std::vector<double>>& book,
+                               const std::vector<double>& candidate,
+                               const RiskLimits& lim, double& worst,
+                               std::string& why_not);
 
     // Stop/take-profit check for an open position.
     static Action check_exit(const Position& pos, double price,

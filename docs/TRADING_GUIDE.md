@@ -191,6 +191,77 @@ kind ∈ {start, equity, fill, halt}
 * **Kill-switch events are journaled** as `halt` records with the reason.
 * No threads, no network, no real orders — paper money only.
 
+## 5c. Multi-asset perception, risk gates & the autonomy ladder
+
+The full evidence table lives in **[`TRADING_LAB.md`](TRADING_LAB.md)**; this is
+the operational summary.
+
+### Market feeds (`tools/market_feeds.py`)
+
+Keyless, multi-asset bars/tickers with one HTTP path (cache + rate limit +
+retry):
+
+```bash
+# Crypto daily bars -> provenance CSV (reuses the T6 schema):
+python tools/market_feeds.py --asset crypto --symbol BTCUSDT --years 2
+
+# FX:
+python tools/market_feeds.py --asset fx --symbol EURUSD --years 1 \
+    --out models/market/EURUSD_1d.csv
+
+# Health probe — prints the feed state and the ABSTAIN verdict:
+python tools/market_feeds.py --probe --asset equity --symbol AAPL
+```
+
+| Asset  | Provider(s)            | Bars | Ticker |
+|--------|------------------------|:----:|:------:|
+| equity | Yahoo                  |  ✓   |   ✓    |
+| crypto | Binance → CoinGecko    |  ✓   |   ✓    |
+| fx     | Frankfurter            |  ✓   |   ✓    |
+| meme   | DexScreener            |  ✗   |   ✓    |
+
+Meme is **research-only** (no free OHLCV exists) — bars mode is refused with
+exit 2, mirroring `RiskLimits::meme_research_only`. A provider failure is
+explicit: non-zero exit, no file, nothing silently substituted.
+
+### The ABSTAIN gate (M1)
+
+`FeedHealthMonitor` classifies every symbol `Ok → Degraded (300 s) → Dead
+(900 s)` (or dead after 3 consecutive provider errors); an unobserved symbol is
+`Missing`, **never** an implicit `Ok`. `PerceptionGate::check()` then returns an
+`AbstainDecision` — stale, dead, missing or invalid input **refuses to produce
+a trade**. Deterministic, no network, unit-tested.
+
+### Risk gates (M4)
+
+| Control                    | Value                                          |
+|----------------------------|------------------------------------------------|
+| Risk per trade             | clamped to **1–2 %** of equity                 |
+| Daily kill-switch          | **3 %** drawdown from the day's high-water     |
+| Weekly kill-switch         | **6 %** drawdown from the week's high-water    |
+| Meme per-trade risk        | **≤ 0.25 %** (or 0 while research-only)        |
+| Pairwise correlation cap   | **0.80** — a redundant holding is refused      |
+
+Entries are refused while **either** drawdown window is halted; each re-arms on
+its own boundary. Sizing is asset-class aware: the 1–2 % band applies to
+equity/crypto/fx, but memes use `min(risk_per_trade, 0.25 %)` with **no 1 %
+floor**, so a meme is never clamped *up*.
+
+### Autonomy ladder (M6) — the only thing you must do by hand
+
+Live money is gated in **code**. The unlock is a line you write, alone, in
+`PROJECT_STATE.md`:
+
+```
+UNLOCK L1 MICRO-LIVE      # total <= $100, <= 1%/trade, >= 30 paper days
+UNLOCK L2 SCALE-UP        # >= 90 live days within the drawdown caps
+```
+
+L0 (paper-only) is the default and refuses live orders outright. Matching is
+line-exact after trimming — a `TODO:`, a quoted example, or different case
+unlocks **nothing**. Every order re-checks the level, the duration minimum and
+the caps, and logs *why* it refused.
+
 ## 6. Cloud reasoning (optional) — the TLS story, plainly
 
 The zero-dependency runtime has **no TLS stack**. Consequences:
@@ -228,3 +299,17 @@ no-look-ahead, CSV round-trips, position accounting, Kelly/stops/drawdown
 math, metrics, backtest invariants, RSS/sentiment/entity parsing, agent
 consensus, broker accounting, introspection persistence + calibration,
 finance (NPV/IRR/put-call parity), sandbox refusals, mock Alpaca lifecycle.
+
+The T7+/M-series suites (also ctest):
+
+* `omniseed_trading_edge` — walk-forward no-look-ahead + OOS determinism,
+  risk-budget sizing clamp, daily kill-switch, paper journal append/resume.
+* `omniseed_market_perception` — feed-health staleness/failures, the ABSTAIN
+  gate, daily+weekly governor set, asset-class risk budgets, correlation cap,
+  autonomy ladder.
+* `omniseed_market_feeds` — feed adapters, cache, rate limiter, symbol
+  normalisation, provenance reuse, meme research-only refusal, explicit
+  failure. (Python, venv-gated.)
+* `omniseed_market_data` — T6 fetcher integrity: provenance column, exit-2 on
+  provider failure, `--years` trim, no implicit synthetic substitution.
+  (Python, venv-gated.)
