@@ -95,6 +95,15 @@ bool send_all(Socket_t s, const char* data, size_t len) {
     return true;
 }
 
+// Windows has closesocket(); POSIX sockets are file descriptors, so close().
+void close_socket(Socket_t s) {
+#ifdef _WIN32
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+}
+
 void respond(Socket_t client, const std::string& body,
              const char* content_type = "application/json") {
     std::string hdr =
@@ -529,7 +538,7 @@ int main(int argc, char** argv) {
         // `body` string as before.
         std::string req_headers, body;
         if (!read_request(client, req_headers, body)) {
-            ::closesocket(client);
+            close_socket(client);
             continue;
         }
         const std::string& req = req_headers;
@@ -609,7 +618,7 @@ int main(int argc, char** argv) {
                     if (!base64_decode(json_field(body, "wav_b64"), wav)) {
                         respond(client,
                                 "{\"error\":\"invalid base64 payload\"}");
-                        ::closesocket(client);
+                        close_socket(client);
                         continue;
                     }
                 } else {
@@ -652,7 +661,7 @@ int main(int argc, char** argv) {
             respond(client, "{\"error\":\"not found\"}");
         }
 
-        ::closesocket(client);
+        close_socket(client);
     }
 
 #ifdef _WIN32
