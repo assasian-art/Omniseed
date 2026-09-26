@@ -12,8 +12,11 @@
 | Technical indicators (SMA, EMA, RSI-Wilder, MACD, Bollinger, ATR) | real | `src/trading/trading_engine.cpp` |
 | Rule-based signals + weighted multi-agent consensus | real | `src/agent/sub_agents.cpp` |
 | Risk math: fractional Kelly, stops, drawdown halt, exposure caps | real | `src/trading/trading_engine.cpp` |
+| Per-trade risk budget (1–2%) + daily drawdown kill-switch | real | `src/trading/trading_engine.cpp` |
 | Backtester (next-bar-open fills, slippage + fees, no look-ahead) | real | `src/trading/trading_engine.cpp` |
+| Walk-forward validation (select on train, replay out-of-sample) | real | `src/trading/walkforward.cpp` |
 | Paper broker (slippage + fee fills, live marking) | real | `src/trading/simulate.cpp` |
+| Paper daemon + append-only, resumable journal | real | `src/trading/paper_daemon.cpp` |
 | News RSS ingest + lexicon sentiment + breaking alerts | real | `src/trading/news_feed.cpp` |
 | Market data fetcher (Yahoo/Stooq/synthetic) | real | `tools/fetch_market_data.py` |
 | News fetcher (RSS + offline sample) | real | `tools/fetch_news.py` |
@@ -82,6 +85,12 @@ build/bin/omniseed_agent2.exe trading-watch --tickers AAPL,MSFT,TSLA --interval 
 
 # Paper simulation of a strategy over the full history
 build/bin/omniseed_agent2.exe trading-simulate --ticker AAPL --strategy momentum
+
+# Out-of-sample validation (select on train, replay untouched on test)
+build/bin/omniseed_agent2.exe trading-walkforward --ticker AAPL --timeframe 1d
+
+# Paper daemon: replay bars and append every action to a journal
+build/bin/omniseed_agent2.exe trading-paper --ticker AAPL --timeframe 1d
 ```
 Strategies: `balanced` (default), `momentum` (tighter stops), `mean-reversion`
 (wider stops + take-profit).
@@ -97,6 +106,18 @@ build/bin/omniseed_agent2.exe metacognition   # calibration + knowledge gaps
 * **Position sizing** — quarter-Kelly from realized win statistics. Before
   enough trades exist, sizing falls back to a fixed **2% probe position**.
   A negative Kelly edge refuses to trade at all.
+* **Per-trade risk budget** (`RiskLimits::risk_per_trade_pct`) — the edge lab
+  sizes each entry so that a stop-out loses a fixed fraction of equity:
+  `qty = equity × risk / (price × stop_loss_pct)`. The value is **clamped
+  into [1%, 2%]** — the engine will never risk more than 2% of equity on one
+  trade, whatever is configured, and the sizing trace says `(clamped)` when
+  it fires. The notional is then capped by the 20% concentration limit.
+* **Daily kill-switch** (`RiskLimits::max_daily_loss_pct`, default 3%) —
+  once the drawdown from a UTC day's **high-water mark** reaches the limit,
+  new entries are refused for the rest of that day. The switch re-arms at
+  the next UTC day boundary. Exits and stops are **never** blocked — the
+  switch only gates *new* risk. (On a once-per-day bar series every bar is
+  its own day, so the switch only has room to act on intraday bars.)
 * **Stop-loss** — 8% per position by default (`RiskLimits::stop_loss_pct`).
   Sell signals also exit positions (reason `signal` in trade logs).
 * **Drawdown halt** — new entries stop at a 20% portfolio drawdown from peak.
@@ -116,6 +137,59 @@ factor < 1.2, it is not ready for paper trading, let alone anything else.
   truncating the future never changes past equity (tested).
 * **Win rate** — share of closed trades with positive P&L; profit factor is
   gross profit over gross loss.
+
+## 5b. Edge lab — walk-forward + paper daemon
+
+A single backtest over the whole history is an *in-sample* number: tune long
+enough and it will always look good. The edge lab exists to separate the
+strategy from the tuning.
+
+### Walk-forward (`trading-walkforward`)
+
+The series is cut into consecutive **train / test** folds. Parameters are
+chosen on the train window only, then replayed **untouched** on the following
+test window. The stitched test windows form a genuine out-of-sample (OOS)
+curve.
+
+```bash
+build/bin/omniseed_agent2.exe trading-walkforward --ticker AAPL --timeframe 1d \
+    --train 252 --test 63 --step 63        # [--anchored]
+```
+
+* **Hard no-look-ahead** — `test_begin == train_end` for every fold, and
+  selection never sees a test bar. (Enforced by test.)
+* **`degradation_pct`** = mean in-sample return − out-of-sample return. A
+  large positive gap is the classic signature of overfitting; the CLI flags
+  it above +5%.
+* **`oos_hit_rate`** — fraction of folds that were profitable out of sample.
+* `--anchored` grows the train window from bar 0 instead of rolling it.
+* Honest scope: a positive OOS result is **evidence, not a promise**. Edges
+  decay.
+
+### Paper daemon (`trading-paper`)
+
+A deterministic bar-replay loop that drives signals → risk engine →
+`PaperBroker`, appending everything to an **append-only journal**.
+
+```bash
+build/bin/omniseed_agent2.exe trading-paper --ticker AAPL --timeframe 1d \
+    --journal state/paper_journal.csv
+```
+
+Journal schema (CSV, one record per line):
+
+```
+ts,kind,ticker,qty,price,pnl,equity,cash,exposure,reason
+kind ∈ {start, equity, fill, halt}
+```
+
+* **Crash-safe** — every record is flushed as it is written; the file is only
+  ever appended.
+* **Resumable** — a re-run reads the journal's last timestamp and skips bars
+  already recorded, so you can point it at a growing CSV and it picks up
+  where it left off. It never rewrites or duplicates history.
+* **Kill-switch events are journaled** as `halt` records with the reason.
+* No threads, no network, no real orders — paper money only.
 
 ## 6. Cloud reasoning (optional) — the TLS story, plainly
 

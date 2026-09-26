@@ -81,6 +81,8 @@ set(OMNISEED_CORE_SOURCES
     src/trading/finance.cpp
     src/trading/reasoning_tools.cpp
     src/trading/broker_alpaca.cpp
+    src/trading/walkforward.cpp
+    src/trading/paper_daemon.cpp
     src/runtime/introspection.cpp
     src/runtime/cloud_bridge.cpp
     src/agent/sub_agents.cpp
@@ -319,6 +321,22 @@ if(OMNISEED_BUILD_TESTS)
     endif()
     add_test(NAME omniseed_trading COMMAND omniseed_trading
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Trading edge lab (T7.1): risk-budget sizing clamp, daily kill-switch,
+    # walk-forward no-look-ahead + OOS determinism, paper journal append/resume.
+    add_executable(omniseed_trading_edge tests/test_trading_edge.cpp)
+    target_include_directories(omniseed_trading_edge PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_trading_edge PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_trading_edge PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_trading_edge PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_trading_edge COMMAND omniseed_trading_edge
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_trading_edge PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Market-data fetcher integrity: fully offline characterization of
     # tools/fetch_market_data.py — provenance column, explicit provider

@@ -392,7 +392,11 @@ RiskManager::Sizing RiskManager::size_position(double equity, double price,
                                                double avg_loss,
                                                const RiskLimits& lim) {
     Sizing s;
-    if (equity <= 0.0 || price <= 0.0) { s.reason = "bad equity/price"; return s; }
+    if (equity <= 0.0 || price <= 0.0) {
+        s.reason = "bad equity/price";
+        s.allowed = false;          // Sizing defaults to allowed=true
+        return s;
+    }
     if (win_prob <= 0.0 || win_prob >= 1.0 || avg_win <= 0.0 || avg_loss <= 0.0) {
         s.reason = "Kelly inputs out of range -> fixed 2% test position";
         s.qty = std::floor(equity * 0.02 / price);
@@ -413,6 +417,49 @@ RiskManager::Sizing RiskManager::size_position(double equity, double price,
                std::to_string(lim.kelly_fraction).substr(0, 4) +
                " -> " + std::to_string(frac * 100.0).substr(0, 4) + "% of equity";
     s.allowed = s.qty > 0.0;
+    return s;
+}
+
+RiskManager::Sizing RiskManager::size_by_risk(double equity, double price,
+                                              const RiskLimits& lim) {
+    Sizing s;
+    if (equity <= 0.0 || price <= 0.0) {
+        s.reason = "bad equity/price";
+        s.allowed = false;          // Sizing defaults to allowed=true
+        return s;
+    }
+    if (lim.stop_loss_pct <= 0.0) {
+        s.reason = "stop_loss_pct <= 0 -> risk budget undefined";
+        s.allowed = false;
+        return s;
+    }
+    // Enforce the 1..2% band. The engine never risks more than 2% of equity
+    // on one trade; a caller asking for more gets clamped, and the reason
+    // trace says so (an over-large config must be visible, never silent).
+    double risk = lim.risk_per_trade_pct;
+    bool clamped = false;
+    if (risk < kMinRiskPerTradePct) { risk = kMinRiskPerTradePct; clamped = true; }
+    if (risk > kMaxRiskPerTradePct) { risk = kMaxRiskPerTradePct; clamped = true; }
+
+    const double per_share_risk = price * lim.stop_loss_pct;
+    double qty = std::floor(equity * risk / per_share_risk);
+
+    // Notional cap: never more than max_position_pct of equity in one name.
+    const double max_qty = std::floor(equity * lim.max_position_pct / price);
+    const bool capped = qty > max_qty;
+    if (capped) qty = max_qty;
+    if (qty < 0.0) qty = 0.0;
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "risk %.2f%%%s of equity / stop %.2f%% -> %s",
+                  risk * 100.0, clamped ? " (clamped)" : "",
+                  lim.stop_loss_pct * 100.0,
+                  capped ? "position-cap" : "risk-budget");
+    s.reason = buf;
+    s.qty = qty;
+    s.allowed = qty > 0.0;
+    if (!s.allowed) s.reason += " (qty floors to 0)";
     return s;
 }
 
@@ -452,6 +499,48 @@ bool RiskManager::entries_allowed(const PortfolioState& ps, double equity_peak,
         return false;
     }
     return true;
+}
+
+// ===========================================================================
+// DailyRiskGovernor
+// ===========================================================================
+bool DailyRiskGovernor::allow(int64_t ts, double equity, std::string& why_not) {
+    const int64_t ds = cfg_.day_seconds > 0 ? cfg_.day_seconds : 86400;
+    const int64_t day = ts >= 0 ? ts / ds : 0;
+    if (!have_day_ || day != day_) {              // new UTC day -> re-arm
+        have_day_ = true;
+        day_ = day;
+        day_start_ = equity;
+        day_peak_ = equity;
+        halted_ = false;
+    }
+    if (equity > day_peak_) day_peak_ = equity;   // ratchet the day's peak
+    if (!halted_ && day_peak_ > 0.0) {
+        const double dd = (day_peak_ - equity) / day_peak_;
+        if (dd >= cfg_.max_daily_loss_pct) {
+            halted_ = true;
+            ++trips_;
+        }
+    }
+    if (halted_) {
+        const double dd = day_peak_ > 0.0 ? (day_peak_ - equity) / day_peak_ : 0.0;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "daily kill-switch: %.2f%% from day peak (limit %.2f%%)",
+                      dd * 100.0, cfg_.max_daily_loss_pct * 100.0);
+        why_not = buf;
+        return false;
+    }
+    return true;
+}
+
+void DailyRiskGovernor::reset() {
+    have_day_ = false;
+    day_ = 0;
+    day_start_ = 0.0;
+    day_peak_ = 0.0;
+    halted_ = false;
+    trips_ = 0;
 }
 
 // ===========================================================================

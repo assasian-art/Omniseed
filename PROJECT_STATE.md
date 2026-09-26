@@ -18,7 +18,13 @@ GLM-5.3-FLASH
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
   `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
-- **Last updated:** §18 MARKET-DATA INTEGRITY (2026-09-26): `fetch_market_data.py`
+- **Last updated:** §19 T7.1 TRADING EDGE LAB (2026-09-26): walk-forward
+  validation (select on train, replay out-of-sample, hard no-look-ahead),
+  per-trade risk budget clamped to 1–2% + a per-UTC-day drawdown kill-switch,
+  and a paper daemon with an append-only, resumable journal. New
+  `trading-walkforward` / `trading-paper` CLI; 115-check
+  `omniseed_trading_edge` suite.
+  Previous: §18 MARKET-DATA INTEGRITY (2026-09-26): `fetch_market_data.py`
   could silently substitute synthetic bars (provider failures swallowed, Stooq
   `--years` ignored, `--source synth` still hit the network). Now: explicit
   failure → exit 2 + no file, `--allow-synth` opt-in, `source` provenance
@@ -1520,4 +1526,73 @@ characterization suite.
   venv-gated like the LoRA suites) — passes in 13.9 s.
 - `docs/TRADING_GUIDE.md` §2 documents the integrity rules, exit codes, and
   the `--allow-synth` / `DEMO_<tf>.csv` behaviour.
+
+## 19. T7.1 — TRADING EDGE LAB: WALK-FORWARD + RISK ENGINE + PAPER DAEMON (2026-09-26)
+
+A single backtest over the whole history is an in-sample number; the edge lab
+exists to separate the strategy from the tuning. Three new pieces:
+
+### Risk engine (`src/trading/trading_engine.cpp`, `trading_engine.h`)
+
+- `RiskLimits::risk_per_trade_pct` (default 1.5%) + `RiskManager::size_by_risk`:
+  `qty = equity × risk / (price × stop_loss_pct)`. The value is **clamped into
+  [1%, 2%]** (`kMin/kMaxRiskPerTradePct`) — never more than 2% of equity risked
+  on one trade, and the sizing trace prints `(clamped)` when it fires. The
+  notional is then capped by `max_position_pct`.
+- `DailyRiskGovernor` + `RiskLimits::max_daily_loss_pct` (default 3%): once the
+  drawdown from a UTC day's **high-water mark** reaches the limit, new entries
+  are refused for the rest of that day; the switch re-arms at the next UTC day.
+  Exits/stops are never gated. (On a once-per-day bar series every bar is its
+  own day, so the switch only has room to act on intraday bars.)
+- **Latent bug fixed:** `RiskManager::Sizing` defaults `allowed = true`, so
+  both `size_position` and `size_by_risk` returned `allowed = true` on their
+  degenerate-input early returns. Both now set `allowed = false`.
+
+### Walk-forward (`src/trading/walkforward.{h,cpp}`)
+
+- `WalkForward::run` cuts the series into consecutive train/test folds, picks
+  parameters from a candidate grid on the **train** window only (score: Sharpe,
+  tie-break return), then replays them **untouched** on the following test
+  window; equity chains across folds and the test windows are stitched into an
+  out-of-sample curve.
+- **Hard no-look-ahead**: `test_begin == train_end` for every fold; selection
+  never sees a test bar. Rolling (`--anchored` off) or anchored train windows.
+- Report: per-fold IS/OOS, `oos_metrics`, `is_mean_return_pct`,
+  `degradation_pct` (IS − OOS; >5% flagged as likely overfit), `oos_hit_rate`,
+  `profitable_oos`. Default grid = 9 configs (fast MA × RSI entry).
+- `Backtester` reuse means fills are next-bar-open with the existing 5 bps fee
+  + 2 bps slippage model.
+
+### Paper daemon + journal (`src/trading/paper_daemon.{h,cpp}`)
+
+- `PaperJournal` — append-only CSV (`ts,kind,ticker,qty,price,pnl,equity,cash,
+  exposure,reason`, `kind ∈ {start,equity,fill,halt}`), flushed per record,
+  header written once. `scan_existing()` recovers `records()`/`last_ts()` so a
+  re-run **resumes**: the daemon skips bars with `ts <= last_ts()` and appends
+  only new history (never rewrites or duplicates). Free-text columns are
+  comma-sanitised so a reason cannot break the schema.
+- `PaperDaemon::run` — deterministic bar replay driving signals → risk engine →
+  `PaperBroker`, journaling an equity row per bar, every fill, and each
+  kill-switch trip. No threads, no network, no real orders.
+
+### CLI (`src/agent2/main.cpp`)
+
+- `trading-walkforward --ticker AAPL --timeframe 1d [--train N --test N
+  --step N] [--anchored]` — prints folds, IS/OOS, degradation, verdict.
+- `trading-paper --ticker AAPL --timeframe 1d [--journal PATH]` — prints
+  actions, equity, and records appended; a no-op resume says so explicitly.
+
+### Verification
+
+- `tests/test_trading_edge.cpp` (new, ctest `omniseed_trading_edge`) —
+  **115 checks, 0 failures**: risk-budget sizing + 1–2% clamp + position cap +
+  degenerate inputs; governor allow/trip/peak-based/re-arm/trip-count/reset;
+  walk-forward no-look-ahead, contiguity, grid membership, stitched-curve
+  length, degradation identity, determinism, anchored growth; journal header +
+  schema + scan_existing + comma safety; daemon replay/equity-row count/
+  determinism/resume-boundary/kill-switch-journaled.
+- CLI smoke on a 1512-bar synthetic series: walk-forward → 20 folds, every
+  `test_begin == train_end`; paper daemon → 34 entries / 34 exits, journal
+  1581 records, second run resumed (0 bars processed).
+- `docs/TRADING_GUIDE.md` §1/§3/§4 + new §5b document all of the above.
 

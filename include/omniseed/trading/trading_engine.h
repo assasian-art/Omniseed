@@ -190,7 +190,21 @@ struct RiskLimits {
     double  max_gross_exposure_pct = 1.0;  // <= 100% of equity
     double  fee_bps          = 5.0;    // round-trip cost model (per side)
     double  slippage_bps     = 2.0;
+    // --- Edge-lab additions (T7.1) ---------------------------------------
+    // Per-trade risk budget: a stop-out should lose this fraction of equity.
+    // The engine CLAMPS this into [1%, 2%] — it will never risk more than 2%
+    // of equity on a single trade, whatever the caller configures.
+    double  risk_per_trade_pct = 0.015;
+    // Daily kill-switch: once the day's loss reaches this fraction of the
+    // day's start equity, NEW entries are refused until the next UTC day.
+    // Exits/stops are never blocked (the switch only gates new risk).
+    double  max_daily_loss_pct = 0.03;
 };
+
+// The per-trade risk budget is clamped into this band (see
+// RiskManager::size_by_risk). Exposed so callers/tests can reason about it.
+constexpr double kMinRiskPerTradePct = 0.01;
+constexpr double kMaxRiskPerTradePct = 0.02;
 
 class RiskManager {
 public:
@@ -206,6 +220,17 @@ public:
                                 double win_prob, double avg_win,
                                 double avg_loss, const RiskLimits& lim);
 
+    // Risk-budget sizing (edge lab): qty such that a stop-out at
+    // lim.stop_loss_pct loses exactly `risk_per_trade_pct` of equity —
+    //   qty = equity * risk_pct / (price * stop_pct)
+    // risk_per_trade_pct is CLAMPED into [kMinRiskPerTradePct,
+    // kMaxRiskPerTradePct] (1%..2%), and the notional is then capped by
+    // max_position_pct of equity. Refuses (allowed=false) on bad inputs or
+    // when the resulting qty floors to 0. The reason trace names the clamp
+    // whenever it fires, so an over-large config is visible, not silent.
+    static Sizing size_by_risk(double equity, double price,
+                               const RiskLimits& lim);
+
     // Stop/take-profit check for an open position.
     static Action check_exit(const Position& pos, double price,
                              const RiskLimits& lim);
@@ -216,6 +241,49 @@ public:
     // Portfolio-level gate: true when new entries are permitted.
     static bool entries_allowed(const PortfolioState& ps, double equity_peak,
                                 const RiskLimits& lim, std::string& why_not);
+};
+
+// ===========================================================================
+// DailyRiskGovernor — per-UTC-day loss kill-switch (edge lab, T7.1)
+// ===========================================================================
+// Feed it once per bar, in chronological order, with the current mark-to-
+// market equity. It tracks each UTC day's high-water mark and, once the
+// drawdown from that peak reaches `max_daily_loss_pct`, refuses new entries
+// for the remainder of the day. The switch re-arms automatically at the next
+// day boundary. Exits and stops are never gated — only new risk is.
+//
+// Deterministic and allocation-free; the caller owns all state.
+class DailyRiskGovernor {
+public:
+    struct Config {
+        double  max_daily_loss_pct = 0.03;   // 3% of the day's opening equity
+        int64_t day_seconds        = 86400;  // UTC day bucket width
+    };
+
+    DailyRiskGovernor() : DailyRiskGovernor(Config{}) {}
+    explicit DailyRiskGovernor(const Config& cfg) : cfg_(cfg) {}
+
+    // Returns true when new entries are permitted for `ts`. `why_not` is set
+    // on the transition to halted. Must be called with non-decreasing ts.
+    bool allow(int64_t ts, double equity, std::string& why_not);
+
+    bool    halted() const { return halted_; }
+    int64_t day_index() const { return day_; }
+    double  day_start_equity() const { return day_start_; }
+    double  day_peak_equity() const { return day_peak_; }
+    // Number of times the switch has tripped (one per halted day).
+    int64_t trips() const { return trips_; }
+
+    void reset();
+
+private:
+    Config  cfg_;
+    bool    have_day_ = false;
+    int64_t day_ = 0;
+    double  day_start_ = 0.0;
+    double  day_peak_ = 0.0;
+    bool    halted_ = false;
+    int64_t trips_ = 0;
 };
 
 // ===========================================================================

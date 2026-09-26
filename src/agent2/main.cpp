@@ -9,6 +9,10 @@
 //                      [--csv-dir models/market] [--news-dir models/news]
 //    trading-simulate  --ticker AAPL --timeframe 1d --capital 100000
 //                      [--strategy momentum|mean-reversion|balanced]
+//    trading-walkforward --ticker AAPL --timeframe 1d [--train N --test N
+//                      --step N] [--anchored]   out-of-sample validation
+//    trading-paper     --ticker AAPL --timeframe 1d [--journal PATH]
+//                      paper daemon: bar replay + append-only journal
 //    introspect        self-model + goals + decision rationale + purpose
 //    metacognition     confidence calibration + knowledge gaps
 //    cloud             cloud-reasoning bridge (optional; Phase-3)
@@ -26,6 +30,8 @@
 #include "omniseed/trading/news_feed.h"
 #include "omniseed/trading/reasoning_tools.h"
 #include "omniseed/trading/simulate.h"
+#include "omniseed/trading/walkforward.h"
+#include "omniseed/trading/paper_daemon.h"
 
 #include <iostream>
 
@@ -64,6 +70,12 @@ void print_usage() {
         "                    [--csv-dir models/market] [--news-dir models/news]\n"
         "  trading-simulate  --ticker AAPL --timeframe 1d --capital 100000\n"
         "                    [--strategy momentum|mean-reversion|balanced]\n"
+        "  trading-walkforward --ticker AAPL --timeframe 1d\n"
+        "                    [--train 252 --test 63 --step 63] [--anchored]\n"
+        "                    out-of-sample validation (select on train only)\n"
+        "  trading-paper     --ticker AAPL --timeframe 1d\n"
+        "                    [--journal state/paper_journal.csv]\n"
+        "                    paper daemon: replay + append-only journal\n"
         "  introspect        self-model, goals, rationale, purpose\n"
         "  metacognition     confidence calibration + knowledge gaps\n"
         "  cloud             cloud-reasoning bridge status (optional key)\n"
@@ -92,6 +104,12 @@ struct Args {
     double capital = 100000.0;
     int32_t interval = 60;
     int32_t cycles = 1;             // 0 = infinite (watch)
+    // --- edge lab (T7.1) ---
+    int32_t train_bars = 252;       // walk-forward train window
+    int32_t test_bars  = 63;        // walk-forward test window
+    int32_t step_bars  = 63;        // fold stride
+    bool    anchored   = false;     // growing (true) vs rolling (false) train
+    std::string journal = "state/paper_journal.csv";   // paper daemon ledger
 };
 
 Args parse_args(int argc, char** argv, int start) {
@@ -116,6 +134,11 @@ Args parse_args(int argc, char** argv, int start) {
         else if (s == "--capital" && has_val) a.capital = std::atof(v.c_str());
         else if (s == "--interval" && has_val) a.interval = std::atoi(v.c_str());
         else if (s == "--cycles" && has_val) a.cycles = std::atoi(v.c_str());
+        else if (s == "--train" && has_val) a.train_bars = std::atoi(v.c_str());
+        else if (s == "--test" && has_val) a.test_bars = std::atoi(v.c_str());
+        else if (s == "--step" && has_val) a.step_bars = std::atoi(v.c_str());
+        else if (s == "--journal" && has_val) a.journal = v;
+        else if (s == "--anchored") { a.anchored = true; continue; }
         if (has_val && (s.rfind("--", 0) == 0)) ++i;
     }
     return a;
@@ -287,6 +310,114 @@ int cmd_trading_simulate(const Args& a) {
                     it->entry_price, it->exit_price,
                     (it->exit_price / it->entry_price - 1.0) * 100.0,
                     it->exit_reason.c_str());
+    std::printf("%s", kDisclaimer);
+    return 0;
+}
+
+// ===========================================================================
+// trading-walkforward — out-of-sample validation (the "edge lab")
+// ===========================================================================
+int cmd_trading_walkforward(const Args& a) {
+    const std::string csv = a.csv.empty() ? default_csv(a.ticker, a.timeframe)
+                                          : a.csv;
+    std::vector<Bar> bars;
+    std::string err;
+    if (!load_bars_csv(csv, bars, err)) {
+        std::printf("[walkforward] no market data: %s\n", err.c_str());
+        return 2;
+    }
+    WalkForward::Config cfg;
+    cfg.ticker = a.ticker;
+    cfg.risk = limits_for(a.strategy);
+    cfg.starting_cash = a.capital;
+    cfg.train_bars = static_cast<size_t>(std::max(1, a.train_bars));
+    cfg.test_bars  = static_cast<size_t>(std::max(1, a.test_bars));
+    cfg.step_bars  = static_cast<size_t>(std::max(1, a.step_bars));
+    cfg.anchored   = a.anchored;
+
+    const WalkForwardReport rep = WalkForward::run(bars, cfg);
+    if (!rep.error.empty()) {
+        std::printf("[walkforward] %s\n", rep.error.c_str());
+        return 2;
+    }
+    std::printf("[walkforward] %s %s — %lld folds (train %zu / test %zu, %s)\n",
+                a.ticker.c_str(), a.timeframe.c_str(),
+                static_cast<long long>(rep.folds_run),
+                cfg.train_bars, cfg.test_bars,
+                cfg.anchored ? "anchored" : "rolling");
+    std::printf("  in-sample  : mean %+.2f%%\n", rep.is_mean_return_pct);
+    std::printf("  out-sample : %+.2f%%  (sharpe %.2f, maxDD %.2f%%, hit %.0f%%)\n",
+                rep.oos_total_return_pct, rep.oos_metrics.sharpe,
+                rep.oos_metrics.max_drawdown_pct, rep.oos_hit_rate * 100.0);
+    std::printf("  degradation: %+.2f%%  %s\n", rep.degradation_pct,
+                rep.degradation_pct > 5.0 ? "(large gap — likely overfit)"
+                                          : "(within tolerance)");
+    std::printf("  verdict    : %s\n",
+                rep.profitable_oos ? "positive OOS — evidence, not a promise"
+                                   : "NO positive out-of-sample edge");
+    for (size_t i = 0; i < rep.folds.size(); ++i) {
+        const WalkForwardFold& f = rep.folds[i];
+        std::printf("    fold %zu: train[%zu,%zu) test[%zu,%zu) "
+                    "fast=%d rsi<%.0f  IS %+.2f%% -> OOS %+.2f%%\n",
+                    i + 1, f.train_begin, f.train_end, f.test_begin, f.test_end,
+                    f.chosen.sma_fast, f.chosen.rsi_buy_below,
+                    f.train_return_pct, f.test.total_return_pct);
+    }
+    std::printf("%s", kDisclaimer);
+    return 0;
+}
+
+// ===========================================================================
+// trading-paper — the paper daemon: replay bars, journal every action
+// ===========================================================================
+int cmd_trading_paper(const Args& a) {
+    const std::string csv = a.csv.empty() ? default_csv(a.ticker, a.timeframe)
+                                          : a.csv;
+    std::vector<Bar> bars;
+    std::string err;
+    if (!load_bars_csv(csv, bars, err)) {
+        std::printf("[paper] no market data: %s\n", err.c_str());
+        return 2;
+    }
+    PaperJournal journal(a.journal);
+    journal.scan_existing(err);              // seed last_ts for resume
+    if (!journal.open(err)) {
+        std::printf("[paper] %s\n", err.c_str());
+        return 2;
+    }
+    PaperDaemonConfig cfg;
+    cfg.ticker = a.ticker;
+    cfg.risk = limits_for(a.strategy);
+    cfg.broker.starting_cash = a.capital;
+
+    const PaperDaemonResult res = PaperDaemon::run(bars, cfg, journal);
+    journal.close();
+    if (!res.error.empty()) {
+        std::printf("[paper] %s\n", res.error.c_str());
+        return 2;
+    }
+    if (res.bars_processed == 0) {
+        std::printf("[paper] %s %s — journal %s already covers this history "
+                    "(%lld records); nothing to do\n",
+                    a.ticker.c_str(), a.timeframe.c_str(), a.journal.c_str(),
+                    static_cast<long long>(journal.records()));
+        std::printf("%s", kDisclaimer);
+        return 0;
+    }
+    std::printf("[paper] %s %s — journal %s\n", a.ticker.c_str(),
+                a.timeframe.c_str(), a.journal.c_str());
+    std::printf("  bars        : %lld processed (%lld skipped, already journalled)\n",
+                static_cast<long long>(res.bars_processed),
+                static_cast<long long>(bars.size()) - res.bars_processed);
+    std::printf("  actions     : %lld entries, %lld exits, %lld daily halts\n",
+                static_cast<long long>(res.entries),
+                static_cast<long long>(res.exits),
+                static_cast<long long>(res.halts));
+    std::printf("  equity      : %.2f (sharpe %.2f, maxDD %.2f%%)\n",
+                res.final_equity, res.metrics.sharpe,
+                res.metrics.max_drawdown_pct);
+    std::printf("  journal     : %lld records appended\n",
+                static_cast<long long>(journal.records()));
     std::printf("%s", kDisclaimer);
     return 0;
 }
@@ -650,6 +781,8 @@ int main(int argc, char** argv) {
 
     if (cmd == "trading-analyze")  return cmd_trading_analyze(a);
     if (cmd == "trading-simulate") return cmd_trading_simulate(a);
+    if (cmd == "trading-walkforward") return cmd_trading_walkforward(a);
+    if (cmd == "trading-paper")    return cmd_trading_paper(a);
     if (cmd == "trading-watch")    return cmd_trading_watch(a);
     if (cmd == "introspect")       return cmd_introspect();
     if (cmd == "metacognition")    return cmd_metacognition(a);
