@@ -229,6 +229,10 @@ ts,confidence,veto,regime,detail
 | module | role |
 |---|---|
 | `tools/monster/features.py` | no-look-ahead primitives (SMA/EMA/RSI/MACD/ATR, rolling VWAP, z-score, Pearson, Amihud illiquidity, Kyle-lambda proxy, swings, Fibonacci) |
+| `tools/monster/regime.py` | multi-axis causal regime engine (variance ratio, Hurst, ER, ADX, choppiness, R², ρ(1), MA consistency; Yang-Zhang vol; OU half-life; hysteresis) |
+| `tools/monster/strategies.py` | the zoo: momentum, mean-reversion, breakout, order-flow imbalance, vol-target |
+| `tools/monster/router.py` | regime-adaptive continuous allocation → conviction + agreement |
+| `tools/monster/funding.py` | perpetual funding-rate carry scanner (net-of-cost, risk-flagged) |
 | `tools/monster/sniper_engine.py` | the weighted 4-layer confidence score + hard vetoes |
 | `tools/monster/news_hunter.py` | keyword-weighted events x recency decay x volume anomaly |
 | `tools/monster/correlation_matrix.py` | lead-lag confirmation / invalidation |
@@ -241,6 +245,11 @@ ts,confidence,veto,regime,detail
 ```
 S = 0.25·M + 0.35·T + 0.25·R + 0.15·C            (all layers in [0,1])
 ```
+
+`S` is **unchanged** by the regime/ensemble work. The R layer's *source* changed
+(multi-axis ensemble by default, the old SMA200-slope rule behind
+`--regime-mode legacy`); its mapping did not. The strategy ensemble is a separate,
+strictly fail-closed gate — see below.
 
 * **M** microstructure — volume-anomaly z-score (logistic), or order-book
   imbalance when the provider publishes depth (the **stronger** of the two).
@@ -298,6 +307,28 @@ than simply off:
 The journal records `monster-block:<sym>:<veto|no-row|S=..<..>` events, and every
 `signal` row carries the distilled verdict, e.g. `monster[S=0.640 range]`.
 
+#### Legacy vs advanced regime, on the same real basket
+
+Same 420-bar AAPL / BTCUSDT / EURUSD data, `--min-confidence 0.85`:
+
+| mode | AAPL best S | BTCUSDT | EURUSD | AAPL regime mix |
+|---|---|---|---|---|
+| `--regime-mode legacy` | 0.765 (`trend_up`) | 0.675 (`range`) | 0.765 (`trend_up`) | 265 range / **136 trend_up** |
+| `--regime-mode advanced` | 0.640 (`range`) | 0.675 (`range`) | 0.640 (`range`) | 306 range / **77 trend_up** |
+| `+ --ensemble` | 0.640, **3** ensemble vetoes | 0.675 | 0.640 | unchanged |
+
+Three things to read out of that:
+
+* **The advanced engine is more conservative, and that is the point.** The
+  legacy SMA200-slope rule called 136/420 AAPL bars `trend_up` and **143/420**
+  EURUSD bars `trend_up`; the multi-axis ensemble calls 77 and **10**. FX majors
+  really are near a random walk, and the slope rule was not noticing.
+* **Zero proposals in every mode.** The gate is fail-closed and the demo basket
+  contains no sniper setup at 0.85. That is the correct outcome, not a failure.
+* **The ensemble barely fires** — 3 vetoes out of 420 AAPL bars, and mean
+  conviction ≈ 0 on all three symbols. The weight floor keeps a lone signal from
+  vetoing, and the zoo is balanced rather than systematically biased.
+
 ### Hard constraints
 
 The 2 % per-trade ceiling and the 3 % daily / 6 % weekly kill-switch are
@@ -305,18 +336,69 @@ The 2 % per-trade ceiling and the 3 % daily / 6 % weekly kill-switch are
 `[1%, 2%]` band the engine enforces, so a bug in the Python layer still cannot
 exceed 2 %. Nothing here claims an edge.
 
+### The regime engine and the strategy ensemble
+
+`--regime-mode advanced` (default) replaces the single SMA200-slope rule with
+eight independent statistics blended into a continuous `trend_score`, plus a
+Yang-Zhang volatility axis and an OU half-life. Thresholds are **calibrated
+against measured distributions**, not picked by eye; the table is in
+`docs/MONSTER_DESIGN.md` §5.2. `--regime-mode legacy` reproduces the old rule.
+
+The volatility axis needed one more fix than the other statistics, and it is
+worth knowing why: it originally ranked the *raw latest* Yang-Zhang estimate
+against its own history, which fires on every volatility-expansion bar — and an
+entry bar is a volatility-expansion bar by construction. Since a `high_vol` label
+caps `S` at `0.25·1 + 0.35·1 + 0.25·0.25 + 0.15·1 = 0.8125 < 0.85`, that made the
+sniper gate **unopenable**. It now ranks the **smoothed** estimate (mean of the
+last `vol_smooth = 5` readings) and additionally demands *absolute* stress
+(`ATR/close` above half the mandate's `atr_hi`), so `high_vol` means "this market
+is stressed", not "this bar was big". See `docs/MONSTER_DESIGN.md` §5.3.
+
+`--ensemble` routes the strategy zoo (momentum / mean-reversion / breakout /
+order-flow imbalance) by regime and adds one extra gate:
+
+```
+veto "ensemble-opposed"  ⇔  agreement ≥ 0.60 AND conviction ≤ −0.35
+                            AND total active weight ≥ 0.50
+```
+
+It **cannot** raise `S` — only block. The weight floor exists because
+`agreement` is a share, so one lonely low-confidence signal would otherwise
+score 1.00 and veto every long (observed live, now a regression test).
+
+`--monster-features` also accepts `--monster-min-conf`, and the ensemble summary
+appears in `state/monster/summary.json`.
+
+### Funding-rate carry
+
+`tools/monster/funding.py` is the one **non-directional** piece: delta-neutral
+long-spot / short-perp capturing the perpetual funding payment. It ranks on
+**net** APR after round-trip fees, spread and cost of capital — never gross.
+The test suite's worked example: a memecoin showing 21.90% gross is blocked
+(500 bps basis, 150 bps spot spread) and ranks *below* a clean 13.14% gross trade
+that nets 2.22%. Delta-neutral is not risk-free; the flags are listed in the
+design doc §7.
+
 ---
 
 ## 7. What is *not* here yet
 
 Tracked honestly so it is not mistaken for done:
 
-* Funding-rate scans, on-chain flows, event-calendar and social-volume signals
-  (M7 extras) — planned, not built. *(Order-book imbalance now has a path in
-  the Monster's `M` layer, but no live depth provider is wired.)*
+* On-chain flows (whale / exchange in-out), event-calendar and social-volume
+  signals (M7 extras) — planned, not built.
+* A **live depth provider** for the order-book path. The exact CKS OFI and the
+  `beta = c/depth^λ` impact coefficient are implemented and tested, but free
+  OHLCV feeds do not publish the book, so the shipped path is the signed-volume
+  proxy, which is labelled `NOT-cks` and discounted 30%.
 * The strategy factory with automatic promotion/retirement (M3) — planned.
+* Options-based volatility harvesting (selling implied vs realized). The
+  volatility work here is the *vol-managed exposure* form (Moreira-Muir), which
+  is evidence-backed and needs no options venue.
 * News is fetched by the caller (`tools/fetch_news.py`) and passed in; the
   Monster does not yet run its own background poller inside the loop.
+* Funding quotes are supplied by the caller (`funding.load_quotes_csv`); there is
+  no live exchange poller wired.
 
 ---
 
@@ -332,6 +414,9 @@ Tracked honestly so it is not mistaken for done:
 | `omniseed_paper_loop`        | watch parsing, CSV merge/dedup, feed health → ABSTAIN, engine invocation, status heartbeat |
 | `omniseed_paper_reports`     | journal parsing, book replay, day P&L, Markdown/HTML rendering, opt-in SMTP config |
 | `omniseed_monster_features`  | indicator correctness + the **no-look-ahead proof** (prefix invariance) |
+| `omniseed_monster_regime`    | **calibration against known ground truth** (trend / OU / random walk): VR, Hurst, ER, ADX, choppiness, ρ(1), MA consistency, Yang-Zhang, OU half-life recovery, the degenerate-vol guards, hysteresis, prefix invariance |
+| `omniseed_monster_strategies`| **exact CKS order-flow imbalance vs hand-computed values**, the OFI proxy labelled as a proxy, Donchian excludes the current bar, squeeze vs no-squeeze confidence, vol-target band, router continuity, **the veto weight floor (regression)**, prefix invariance |
+| `omniseed_monster_funding`   | funding-period arithmetic, the net-of-cost stack, direction on sign, every risk flag, history summary, **the memecoin trap**, CSV reader skipping malformed rows |
 | `omniseed_monster_sniper`    | layer arithmetic, every hard veto, **0.85 reachability**, `[1%,2%]` sizing band, cross-asset invalidation |
 | `omniseed_monster_news`      | keyword weights, recency decay, sentiment alignment, anomaly detection, event match requires BOTH halves, CSV round-trip, scan CLI |
 

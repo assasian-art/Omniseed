@@ -40,6 +40,11 @@ class StateVector:
     event_driven: bool = False
     detail: str = ""
     factors: list = field(default_factory=list)
+    # --- regime / ensemble context (carried in `detail`, not in S) --------
+    trend_score: float = float("nan")
+    half_life: float = float("nan")
+    conviction: float = 0.0
+    agreement: float = 0.0
 
     def propose(self, min_confidence=0.85):
         return (not self.veto) and self.confidence >= min_confidence
@@ -60,7 +65,11 @@ def build(symbol, verdict, atr_pct=None, sz_cfg=None):
         veto=verdict.veto, regime=verdict.regime, micro=verdict.micro,
         tech=verdict.tech, regime_score=verdict.regime_score,
         cross=verdict.cross, votes=verdict.votes, risk_pct=risk,
-        detail=detail, factors=list(verdict.factors))
+        detail=detail, factors=list(verdict.factors),
+        trend_score=getattr(verdict, "trend_score", float("nan")),
+        half_life=getattr(verdict, "half_life", float("nan")),
+        conviction=getattr(verdict, "conviction", 0.0),
+        agreement=getattr(verdict, "agreement", 0.0))
 
 
 def to_row(v):

@@ -242,7 +242,287 @@ as the existing quarter-Kelly fraction in `RiskLimits`; we never bet full Kelly.
 
 ---
 
-## 5. What this does **not** claim
+## 5. REGIME ENGINE — trend vs mean-reversion, measured not asserted
+
+The first cut of the R layer used **one** number: the slope of SMA200. That is a
+low-volatility filter wearing a trend filter's coat. On equities low vol and
+uptrends coincide, so a vol proxy *looks* like a trend detector — and then stops
+working the moment you move to FX, where the two are decoupled. §1.3 keeps that
+rule as `regime_mode="legacy"` for A/B, but the default is now an ensemble.
+
+`tools/monster/regime.py`. Two axes, deliberately separated.
+
+### 5.1 Directional axis — eight independent views, blended
+
+| statistic | trending when | mean-reverting when | source |
+|---|---|---|---|
+| variance ratio `VR(q)` | `VR > 1` | `VR < 1` | Lo & MacKinlay (1988) |
+| Hurst exponent `E[R/S]_n ∝ n^H` | `H > 0.5` | `H < 0.5` | Hurst (1951) |
+| efficiency ratio `ER = |P_t−P_{t−n}| / Σ|ΔP|` | high | low | Kaufman (1995) |
+| ADX | `> 25` | `< 20` | Wilder (1978) |
+| choppiness `100·log10(ΣTR/range)/log10(n)` | `< 38.2` | `> 61.8` | — |
+| linreg `R²` of close on time | high | low | — |
+| lag-1 autocorrelation `ρ(1)` | `> 0` | `< 0` | — |
+| MA-ribbon consistency | `→ 1` or `→ 0` | `≈ 0.5` | — |
+
+```
+VR(q) = Var(r^(q)) / (q · Var(r^(1)))          overlapping, heteroskedasticity-robust
+trend_score = Σ w_k · norm_k(stat_k) / Σ w_k    over whichever stats are finite
+```
+
+Each statistic is normalized so **0.5 means "random walk, no opinion"**. Weights
+are renormalized over the finite ones, so a missing statistic cannot silently
+drag the blend toward neutral.
+
+**Three findings from building this, each of which changed the code:**
+
+1. **Hurst must run on the INCREMENTS.** Feeding it the price level measures the
+   self-affinity of a non-stationary path and returns `H > 1` — not a number
+   Hurst can be. On returns the calibration is the textbook one (0.5 = random
+   walk). The test suite guards this directly.
+
+2. **ER is lookback-sensitive, so it is swept.** ER(20) on a market that pulled
+   back over the last 20 bars inside a 200-bar uptrend reads ~0.04, which flipped
+   the whole label to "range". ER is now computed at 10/20/40 and the *normalized*
+   readings are averaged. A short pause no longer erases a long trend.
+
+3. **`VR` and `ρ(1)` are structurally NEUTRAL on a drift trend.** A constant
+   drift leaves returns iid, so both correctly report "no autocorrelation" — and
+   a market that grinds up 49% over the window still only scores ~0.6. That is
+   not a defect in those statistics, it is what they measure. So a statistic that
+   *does* separate drift trends was added: **MA-ribbon consistency** (the
+   fraction of the window where SMA20 sits above SMA50; ~0.5 on a random walk,
+   ~1.0 on a sustained trend). Adding it moved the trend-series minimum from
+   0.542 to 0.602 and dropped the random-walk median from 0.566 to 0.525.
+
+### 5.2 Threshold calibration (measured, not guessed)
+
+Fraction of BARS whose raw `trend_score` clears each bar, 6 seeds × 400 bars per
+series type:
+
+| threshold | trending series | OU series | random walk |
+|---|---|---|---|
+| 0.60 | 0.896 | 0.008 | 0.211 |
+| 0.62 | 0.884 | 0.005 | 0.182 |
+| **0.65** | **0.860** | **0.003** | **0.126** |
+| 0.70 | 0.799 | 0.001 | 0.069 |
+
+`trend_hi = 0.65`: 86% of true trend bars, 12.6% of random-walk bars, and
+hysteresis (enter 0.66 / exit 0.55) cuts the churn further. The overlap is
+**real and irreducible** — the directional axis is the noisy one. This is exactly
+why the router consumes the *continuous* `trend_score` and the label is only a
+coarse summary.
+
+### 5.3 Volatility axis
+
+Yang-Zhang (2000), gap-aware and ~14× more efficient than close-to-close:
+
+```
+σ² = σ²_o + k·σ²_c + (1−k)·σ²_rs      k = 0.34 / (1.34 + (n+1)/(n−1))
+```
+
+Three failure modes were found and fixed — the third is the one that mattered
+most, and it was only visible once the axis was wired into the sniper:
+
+* **YZ is a variance, so it collapses.** On a series with constant returns it is
+  exactly 0 → NaN. But a market can have a 12% intraday range on an unchanged
+  close, which is unambiguously stressed. So `ATR/close` (a *level*, which cannot
+  collapse) is combined in with **max**, mirroring the M layer: either read being
+  stressed is enough.
+* **A flat history makes the percentile degenerate.** Ranking a value against a
+  history of identical values ties everywhere, `<=` holds for all of them, and
+  the percentile pins to **1.0** — reporting maximum stress for a dead-flat
+  series. A flat history carries no information, so it now reads **0.5**.
+* **The axis measured a BAR, not a REGIME.** Ranking the raw latest YZ against
+  its own history fires on *every* volatility-expansion bar — and an entry bar is
+  a volatility-expansion bar by nature. That is not a coincidence; it is the
+  definition of a breakout. The arithmetic is fatal:
+
+  ```
+  max S while labelled high_vol = .25·1 + .35·1 + .25·0.25 + .15·1 = 0.8125 < 0.85
+  ```
+
+  So `high_vol` vetoes exactly the bars the sniper exists to find, and the gate
+  can never open. Two changes fix it:
+
+  1. **The percentile is taken on the smoothed estimate** — the mean of the last
+     `vol_smooth = 5` YZ readings. Volatility clusters, so a regime is a
+     *persistent* elevation. One spike moves the smoothed value by 1/5; a genuine
+     regime shift moves all five. That is the difference between "this bar was
+     big" and "this market is stressed".
+  2. **`high_vol` additionally requires absolute stress** (`atr_stress > 0`, i.e.
+     `ATR/close` above half the mandate's `atr_hi`). A pure percentile threshold
+     at 0.90 marks ~10–15% of *all* bars high_vol by construction — it is a
+     relative rank, so a dead-calm market still has a stressed-looking decile.
+
+  The label now needs **both** reads, and `RegimeState.stressed` carries the
+  conjunction so the hysteresis tracker latches on the same condition the label
+  uses.
+
+### 5.4 Tradeability — is mean reversion actually harvestable?
+
+```
+ΔX_t = a + λ·X_{t−1} + ε        half_life = −ln(2)/λ        (λ < 0 required)
+```
+
+Recovered within 3× of theory on a simulated OU process (2.36 bars measured vs
+2.31 theoretical at θ = 0.30). But a half-life **alone is not evidence**: a pure
+random walk routinely yields a spuriously short one (~7 bars on synthetic GBM).
+So `mean_reversion_tradeable` requires a short half-life **AND** at least one
+independent statistic to agree this is not a random walk (`VR < 0.95` or
+`H < 0.45`). Without that corroboration the mean-reversion strategy would fade
+random walks all day.
+
+---
+
+### 5.5 The 0.85 ceiling is a REGIME question
+
+With `M = T = C = 1.0` — a maximal volume anomaly, all six factors agreeing, every
+peer confirming — the reachable maximum of `S` depends only on the R layer:
+
+| regime | R | ceiling on S | can host S ≥ 0.85? |
+|---|---|---|---|
+| `trend_up` | 1.00 | 1.0000 | **yes** |
+| `range` | 0.50 | 0.8750 | yes, barely |
+| `high_vol` | 0.25 | **0.8125** | **no — mathematically impossible** |
+| `trend_down` | 0.00 | 0.7500 | no (and vetoed) |
+
+So `S ≥ 0.85` is a statement about the *regime*, not about the score. A "0.85 is
+unreachable" bug therefore presents as a regime problem long before it presents
+as a score problem, and `test_monster_sniper.test_reachability` asserts this table
+directly rather than hoping a fixture happens to trip the bar.
+
+The measured maximum on a real constructed setup (pullback-and-reclaim inside an
+uptrend, on a volume burst) is **S = 0.890**, with `vwap-reclaim + macd-thrust +
+trend-align`, `R = 1.0`, `M = 1.00`. Getting there required the §5.3 fix.
+
+---
+
+## 6. STRATEGY ENSEMBLE + REGIME ROUTER
+
+Momentum and mean reversion need **opposite** conditions, so any single fixed
+strategy is wrong in half of all regimes. `tools/monster/strategies.py` holds the
+zoo; `tools/monster/router.py` decides who gets listened to.
+
+| strategy | regime fit | signal |
+|---|---|---|
+| `momentum` | trend | Donchian breakout of the **prior** n-bar range + MA ribbon |
+| `mean_reversion` | range | z-score fade, gated on OU half-life |
+| `breakout` | both | Bollinger-inside-Keltner squeeze → expansion |
+| `ofi` | both | order flow imbalance → expected move (§6.2) |
+| `vol_target` | — | inverse-variance exposure scaler (sizing overlay, not a direction) |
+
+### 6.1 Continuous allocation, never a binary switch
+
+```
+w_trend = sigmoid(k·(trend_score − 0.5))            k = 6
+weight_i = regime_weight(fit_i, w_trend) · confidence_i
+conviction = Σ weight_i·direction_i / Σ weight_i      ∈ [−1, 1]
+agreement  = Σ_{agreeing} weight_i / Σ weight_i       ∈ [ 0, 1]
+```
+
+The obvious implementation — "if trending use momentum else use mean reversion" —
+is the expensive one: every flip pays the full spread out and back, and regime
+transitions are exactly when the classifier is least sure. Near `trend_score=0.5`
+the router holds both engines at ~half size and degrades through the ambiguity.
+
+### 6.2 Order flow imbalance (Cont, Kukanov & Stoikov 2014)
+
+```
+OFI = Σ  [ 1{Pb_n ≥ Pb_n−1}·qb_n − 1{Pb_n ≤ Pb_n−1}·qb_n−1 ]
+       − [ 1{Pa_n ≤ Pa_n−1}·qa_n − 1{Pa_n ≥ Pa_n−1}·qa_n−1 ]
+ΔP_k = β·OFI_k + ε_k                    β = c / depth^λ     (λ = 1 stylized)
+```
+
+The paper reports a linear OFI→price-change relation with **R² of 35–79% across
+50 US stocks** (most names 65–70%) at 10-second intervals. Two caveats stated up
+front because they matter:
+
+1. That R² is **contemporaneous, not predictive**. OFI is not a crystal ball. The
+   tradable part is that OFI is autocorrelated and price impact is only partly
+   permanent, so the next interval's flow is partly knowable.
+2. It needs **depth**. Free OHLCV feeds do not publish the book. Without it we
+   fall back to a signed-volume proxy — a *different and weaker* object, since it
+   cannot see limit orders or cancellations, which is most of what OFI measures.
+   The signal's reason string says `NOT-cks` and its confidence is discounted 30%
+   rather than quietly pretending.
+
+### 6.3 The ensemble can only BLOCK, never promote
+
+`S` stays exactly the mandate's weighted sum. The ensemble adds one gate:
+
+```
+veto "ensemble-opposed"  ⇔  agreement ≥ 0.60  AND  conviction ≤ −0.35
+                            AND  total active weight ≥ 0.50
+```
+
+The weight floor is not decoration. `agreement` is a **share**, so a single
+active strategy always scores 1.00 — one lonely, low-confidence OFI proxy would
+otherwise veto every long in the book. (It did, in a live smoke test. The
+regression test is now in the suite.) An ensemble that can talk you *into* a
+trade is an ensemble that can talk you into a bad one, so this layer is
+structurally incapable of raising `S`.
+
+### 6.4 A structural finding about the six technical factors
+
+Measured over a 340-bar fixture, the factor counts were:
+
+```
+trend-align 140 | macd-thrust 43 | vwap-reclaim 6 | bb-oversold 1 | rsi-divergence 0
+```
+
+**The six "independent" factors are not independent.** They cluster into a
+*trend* group (`trend-align`, `macd-thrust`) that fires constantly in a trend, and
+a *pullback* group (`vwap-reclaim`, `bb-oversold`, `rsi-divergence`, `fib-support`)
+that is rare inside one. The consequence is that requiring `votes ≥ 3` effectively
+means **a pullback that reclaims inside an uptrend** — which is a coherent and
+demanding setup (arguably exactly what a sniper entry is), but it is much rarer
+than "three of six boxes ticked" suggests. On a *steady* uptrend the maximum
+reachable is 2 votes. This is why the M layer (a genuine volume anomaly) carries
+its own weight rather than being a tiebreaker.
+
+---
+
+## 7. FUNDING-RATE CARRY — the one non-directional edge
+
+`tools/monster/funding.py`. Everything else here tries to be right about where
+price goes. This does not care.
+
+Perpetuals have no expiry, so exchanges invented the funding rate to tether them
+to spot: when longs dominate, longs pay shorts. Hold spot long and perp short in
+equal notional and the price exposure cancels, leaving the funding payment as the
+only P&L. It is a **carry harvest, not a forecast**.
+
+```
+APR(gross) = rate_per_period × periods_per_year      (8h → 1095)
+net = gross − roundtrip_fees·(365/holding) − spread·(365/holding) − cost_of_capital
+```
+
+**The mistake this module exists to prevent:** ranking on the gross number. A
+worked example from the tests —
+
+| | gross APR | basis | spot spread | verdict |
+|---|---|---|---|---|
+| BTCUSDT 0.012%/8h | 13.14% | 2 bps | 1 bp | clean, but net only 2.22% at a 30-day hold |
+| MEME 0.020%/8h | **21.90%** | **500 bps** | **150 bps** | **blocked** — basis-shock + illiquid-spot |
+
+The memecoin's gross is 67% higher and it is uninvestable. It ranks *below* the
+clean trade.
+
+Risk flags, all blocking: `funding-unstable` (history mostly negative),
+`funding-flips` (sign churn), `rate-near-zero` (about to cross),
+`basis-shock` (> 300 bps), `illiquid-spot` (> 50 bps spread), `below-hurdle`
+(< 10% net).
+
+**Delta-neutral is not risk-free.** The funding rate can flip sign and make you
+the payer; the perp leg can be liquidated on a violent basis move and leave you
+naked long spot; the spot venue can freeze withdrawals; a stablecoin can de-peg
+and your "yield" is denominated in a depreciating asset. All four are flagged,
+none are assumed away.
+
+---
+
+## 8. What this does **not** claim
 
 * No guaranteed profit, no "win rate", no target return.
 * The confidence score is a *confluence filter*, not a probability of profit.
