@@ -26,10 +26,12 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Smoke — model-less CLI
+        # `bench` loads ./models/omniseed.gguf, which CI does not have; the
+        # model-free smoke is selftest + info + bare usage (exit 0).
         run: |
           ./build/bin/omniseed selftest
           ./build/bin/omniseed info
-          ./build/bin/omniseed bench
+          ./build/bin/omniseed
 
       - name: Smoke — server /health (no model attached)
         run: |
@@ -65,8 +67,10 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Smoke — model-less CLI
+        # `bench` loads ./models/omniseed.gguf, which CI does not have; the
+        # model-free smoke is selftest + info + bare usage (exit 0).
         run: |
           ./build/bin/omniseed selftest
           ./build/bin/omniseed info
-          ./build/bin/omniseed bench
+          ./build/bin/omniseed
         shell: bash

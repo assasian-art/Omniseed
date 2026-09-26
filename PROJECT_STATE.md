@@ -18,7 +18,11 @@ GLM-5.3-FLASH
 - **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
   `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
-- **Last updated:** PHASE-16 OMEGA PASS (2026-09-11): **Trading Expert Mode +
+- **Last updated:** §17 CI BASELINE FIX (2026-09-26): GitHub Actions had been
+  red 10+ commits; fixed the Linux/GCC build (nested-`Config` default
+  arguments + unguarded `::closesocket` in the server) and made the CI smoke
+  steps model-free. Full board 10/10 green locally.
+  Previous: PHASE-16 OMEGA PASS (2026-09-11): **Trading Expert Mode +
   self-awareness + hybrid cloud reasoning.** Multi-agent trading framework
   (signals/risk/backtester/paper broker/Alpaca-paper adapter, oracle-verified
   no-look-ahead), structured introspection (self-model, goals, decision
@@ -1363,3 +1367,96 @@ UI). Zero effect on token choice — a pure output-boundary guard.
   run showed the ASR wall-clock bound jittering under back-to-back suite
   load — clean run passes), omniseed_qat_ternary **8/8**,
   omniseed_trading **2129/0**.
+
+---
+
+## 17. CI BASELINE FIX — LINUX GCC + MODEL-FREE SMOKE (2026-09-26)
+
+GitHub Actions had been red for **10+ consecutive commits** on `main`. The
+breakage was three independent, stacked faults, none of them new to
+`8fcdd8e`. All three are fixed and verified on this box.
+
+### Root causes
+
+1. **GCC rejected nested-`Config` default arguments** (`ubuntu-latest` →
+   Build, exit 2). Every `explicit Foo(const Config& cfg = Config{})` where
+   `Config` is a **nested** struct with default member initializers (NSDMIs)
+   fails on GCC:
+   `error: default member initializer for 'Foo::Config::x' required before
+   the end of its enclosing class`.
+   This is a hard error (complete-class-context rule), so it fails with
+   `-Werror` **off** and is not version-specific (reproduced on GCC 13.2,
+   14.1, 14.4).
+   - `= {}` and `= Config{}` **both** fail; the earlier "`= {}` →
+     `= Config{}`" sweep (commit `4b78f6e`) only changed the diagnostic
+     text — it did not fix the build.
+   - Top-level config structs (`FocalCodecConfig`, `UniCompressConfig`,
+     `PaperBrokerConfig`) were never affected, which is why only nested
+     sites broke.
+2. **`src/server/main.cpp` called `::closesocket` unguarded.** The file
+   already abstracts `Socket_t` and guards `send`/`recv`, but all three
+   `closesocket` call sites were unconditional — so the `OMNISEED_HTTP`
+   build (CI passes `-DOMNISEED_BUILD_SERVER=ON`, which adds
+   `OMNISEED_HTTP`) failed on Linux with
+   `error: '::closesocket' has not been declared`. Fixed with a
+   `close_socket()` helper (`closesocket` on Win32, `close` on POSIX),
+   mirroring the existing `send_all` guard pattern.
+3. **CI smoke ran `omniseed bench`**, which calls `Session::load()` and
+   returns 1 when `./models/*.gguf` is absent — guaranteed to fail in CI.
+   Replaced with model-free commands on **both** jobs: `selftest`, `info`,
+   and bare `omniseed` (usage text; exits 0).
+
+### Fix applied
+
+- **27 nested-`Config` default-argument sites across 17 headers** replaced
+  with a delegating default constructor + explicit overload:
+  ```cpp
+  Foo() : Foo(Config{}) {}
+  explicit Foo(const Config& cfg) : cfg_(cfg) {}
+  ```
+  Headers: `agent/agent.h` (SelfImprovement, AgentLoop),
+  `agent/agent_intel.h`, `agent/flash_skills.h`, `agent/sub_agents.h` (×2),
+  `audio/audio_events.h` (×3), `core/uncertainty.h`, `memory/memory.h` (×2),
+  `memory/prefix_cache.h`, `runtime/cloud_bridge.h`, `runtime/emotional.h`,
+  `runtime/introspection.h`, `runtime/sensory.h`, `runtime/swarm.h` (×2),
+  `trading/broker_alpaca.h`, `trading/news_feed.h`,
+  `trading/trading_engine.h` (×3), `vision/vision_tasks.h` (×3).
+- 3 declaration-only constructors (`WakeWordDetector`, `CloudBridge`,
+  `UdpBeacon`) got an inline delegating no-arg ctor in the header.
+- 3 static member functions (`Uncertainty::should_abstain`,
+  `SignalGenerator::compute`, `SignalGenerator::evaluate`) gained a 1-arg
+  overload that forwards `Config{}` (`src/core/uncertainty.cpp` updated).
+- `AgentLoop` (6 required args + `Config`) and `AlpacaClient` (`Config` +
+  `Transport`) kept their extra parameters via a delegating overload.
+- Semantics unchanged: the no-arg path value-initializes the same `Config`,
+  and no `Config` lost aggregate status.
+- One call site updated: `tests/test_trading.cpp` constructed
+  `NewsFeed feed({})`, which becomes ambiguous once a no-arg ctor exists →
+  `NewsFeed feed;`.
+
+### Verification
+
+- **GCC (Linux — the exact CI target)**: all 41 core/CLI/server/agent2
+  translation units **plus** all 7 test TUs compile clean, both with and
+  without `OMNISEED_HTTP`, at `-fsyntax-only` and at full `-O2`, on GCC
+  **13.2 / 14.1 / 14.4**.
+- **MSVC (this box, VS 18 2026, `/W4`)**: clean Release build, all targets,
+  zero warnings.
+- **Full board green** — `ctest --test-dir build -C Release` → **10/10
+  passed**, 2975 s total: `omniseed_platform` 206, `omniseed_real_weights`
+  17, `omniseed_sides` 22, `omniseed_qat_ternary` 8, `omniseed_lora` 77,
+  `omniseed_lora_e2e` 21 (687 s), `omniseed_lora_gguf` 9 (407 s),
+  `omniseed_lora_chat` 14 (1387 s), `omniseed_lora_i8` 10 (397 s),
+  `omniseed_trading` 2129.
+- CI smoke commands verified locally to exit 0.
+
+### Notes / follow-ups
+
+- The heavy Python LoRA suites are **already self-gating** in CI: CMake
+  registers `omniseed_lora_e2e` / `_gguf` / `_chat` / `_i8` only when
+  `.venv` exists (`CMakeLists.txt:261-306`), so CI's ctest is ~2 s. No
+  gating change was needed.
+- `windows-latest` no longer ships VS 2022; the pinned
+  `-G "Visual Studio 17 2022"` was dropped in `4b78f6e` (this box runs VS 18
+  2026, so an unpinned generator is the portable choice).
+
