@@ -358,6 +358,23 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_market_perception PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # Multi-asset paper session (M5): merged-timeline replay over several
+    # streams sharing one cash account + one daily/weekly kill-switch, with
+    # per-asset sizing, feed ABSTAIN, and journal-based resume.
+    add_executable(omniseed_paper_session tests/test_paper_session.cpp)
+    target_include_directories(omniseed_paper_session PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_paper_session PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_paper_session PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_paper_session PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_paper_session COMMAND omniseed_paper_session
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_paper_session PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Market-data fetcher integrity: fully offline characterization of
     # tools/fetch_market_data.py — provenance column, explicit provider
     # failure (exit 2, no file), --years trim on every source, no implicit
@@ -381,6 +398,27 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_market_feeds.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_market_feeds PROPERTIES TIMEOUT 300)
+
+        # 24/7 paper loop (M5): watch parsing, provenance-CSV merge/dedup, feed
+        # health -> ABSTAIN, engine invocation, status heartbeat. Offline
+        # (probe/fetch/runner injected).
+        add_test(NAME omniseed_paper_loop
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_paper_loop.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_paper_loop PROPERTIES TIMEOUT 300)
+
+        # Nightly report + single-file dashboard (M5): journal parsing, book
+        # replay, day P&L, Markdown/HTML rendering, opt-in SMTP config.
+        add_test(NAME omniseed_paper_reports
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_paper_reports.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_paper_reports PROPERTIES TIMEOUT 300)
     endif()
 endif()
 

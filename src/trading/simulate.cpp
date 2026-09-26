@@ -73,6 +73,15 @@ void PaperBroker::reset() {
     peak_ = cfg_.starting_cash;
 }
 
+void PaperBroker::seed(double cash,
+                       const std::map<std::string, Position>& positions) {
+    pm_.restore(cash, positions);
+    state_ = pm_.mark(last_prices_);          // prices not yet known -> cost basis
+    curve_.clear();
+    fills_.clear();
+    peak_ = std::max(cash, state_.equity);    // no phantom drawdown on resume
+}
+
 // ===========================================================================
 // PortfolioTracker
 // ===========================================================================

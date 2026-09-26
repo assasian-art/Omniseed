@@ -1670,4 +1670,77 @@ code-enforced risk/autonomy gates. New evidence table in
 - `omniseed_trading` (2129 checks) unchanged green — the `RiskManager` additions
   are additive and do not alter existing sizing on valid inputs.
 
+## 21. T7+ M5 — 24/7 MULTI-ASSET PAPER DESK + REPORT + DASHBOARD (2026-09-26)
+
+The third T7+ milestone: a long-running multi-asset paper desk. The split is
+unchanged — **network in Python, engine never opens a socket**. New doc section
+`docs/TRADING_LAB.md` §5; operational summary `docs/TRADING_GUIDE.md` §5d.
+
+### C++ — multi-asset paper session (`paper_daemon.{h,cpp}`, `simulate`, `trading_engine`)
+
+- `PaperSession::run` — one cash account, N streams merged onto a single
+  chronological timeline (ties broken by symbol for determinism). At each
+  timestamp the whole book is marked, the composite `RiskGovernorSet`
+  (daily + weekly) is consulted once, then each stream with a bar there may
+  exit or enter. Exits are never gated; entries use the stream's next-bar open.
+- Per-asset sizing via `RiskManager::size_by_risk(equity, price, AssetClass,
+  limits)` — meme stays research-only (refused + journalled once per stream).
+- **Feed ABSTAIN** — `PaperStream::feed_ok=false` (set by the poller) skips new
+  risk for that symbol but still marks/exits its positions.
+- **Real resume** — the append-only journal is the source of truth.
+  `PaperJournal::scan_existing` now also recovers `last_equity`/`last_cash` and
+  replays the recorded fills into an open book; `PaperBroker::seed` +
+  `PositionManager::restore` re-hydrate cash + positions, so a restart does not
+  reset equity to the starting cash. A re-run appends only new timestamps.
+- **Journal everything** — `kind ∈ {start, equity, signal, fill, halt, event}`.
+  New `PaperJournal::signal` records every non-Hold signal (strength in the qty
+  column, rule trace in the reason), so the journal is a full decision log, not
+  just a trade log. `--no-signal-journal` opts out.
+- `agent2 trading-paper-session --streams "SYM,ASSET,CSV[;...]" [--skip SYM,...]
+  [--no-signal-journal]`.
+
+### Python — the loop, report, dashboard (`tools/`)
+
+- `tools/paper_loop.py` — the 24/7 poller. Each cycle: probe every watch item →
+  derive feed state (mirrors `FeedHealthMonitor`, including "never-succeeded ⇒
+  missing") → refresh the symbol's provenance CSV only while OK (dedup by ts) →
+  invoke the engine → write `state/paper_status.json` (heartbeat + feed health +
+  last session). Rate limiting + TTL cache inherited from `market_feeds`.
+- `tools/paper_report.py` — shared, read-only analysis (journal parse, book
+  replay, equity curve, day P&L, per-symbol contribution, halts/abstains/
+  refusals, feed rows) so the report and dashboard can never disagree.
+- `tools/nightly_report.py` — Markdown summary; **email is opt-in and never
+  faked** (sends only when every `OMNISEED_SMTP_*` var is set, else says so and
+  still writes the file).
+- `tools/paper_dashboard.py` — one **self-contained** HTML document (inline CSS,
+  inline SVG equity curve, plain tables; no CDN, no external assets, no script):
+  equity curve, open positions, today's P&L, feed health, recent fills, risk
+  counters.
+
+### Verification
+
+- `tests/test_paper_session.cpp` (new, ctest `omniseed_paper_session`) —
+  **47 checks, 0 failures**: merged timeline + per-stream fills, shared-book
+  cap, meme research-only refusal + journal, non-meme still enters, feed
+  ABSTAIN, composite kill-switch + journal, resume (book rebuilt, nothing
+  appended when caught up, only the new tail when extended), determinism,
+  no-streams error, missing-CSV reported per stream, signal journaling on/off.
+- `tests/test_paper_loop.py` (new, ctest `omniseed_paper_loop`) — **53 checks,
+  0 failures**: watch parsing, CSV merge/dedup/header/provenance, healthy cycle
+  (CSV + status + engine args), failure → dead → skip, never-succeeded ⇒
+  missing, recovery-then-dead, stale ⇒ abstain + session skipped, dry-run,
+  driver sleep cadence.
+- `tests/test_paper_reports.py` (new, ctest `omniseed_paper_reports`) —
+  **59 checks, 0 failures**: journal parse + junk skip, book replay, multi-day
+  day-P&L (measured from the carried-in equity), signal counting, Markdown
+  sections, HTML self-containment (no script / no remote refs), opt-in SMTP
+  config, CLI end-to-end.
+- Live smoke: the loop ran once against real providers (1/3 feeds OK — on a
+  weekend the daily equity/FX feeds are stale ⇒ **ABSTAIN**, 24/7 crypto `ok`);
+  the engine refused a BTC entry that exceeded the 20 % per-name cap rather than
+  over-sizing; report + dashboard rendered from the real journal.
+- `omniseed_trading_edge` (115) and `omniseed_trading` (2129) unchanged green —
+  the `PaperBroker`/`PositionManager` additions are additive.
+
+
 

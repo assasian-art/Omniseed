@@ -367,6 +367,15 @@ bool PositionManager::sell(const std::string& ticker, double qty, double price,
     return true;
 }
 
+void PositionManager::restore(
+        double cash, const std::map<std::string, Position>& positions) {
+    cash_ = cash;
+    pos_.clear();
+    for (const auto& kv : positions) {
+        if (kv.second.qty > 1e-9) pos_[kv.first] = kv.second;
+    }
+}
+
 PortfolioState PositionManager::mark(
         const std::map<std::string, double>& prices) const {
     PortfolioState ps;

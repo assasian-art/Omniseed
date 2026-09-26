@@ -134,7 +134,84 @@ hand in `PROJECT_STATE.md`. (`include/omniseed/trading/risk_gate.h`.)
 
 ---
 
-## 5. What is *not* here yet
+## 5. The 24/7 paper loop (M5)
+
+A long-running, multi-asset **paper** desk. Three pieces, split along the
+"network lives in Python, the engine never opens a socket" line:
+
+### `tools/paper_loop.py` — the poller
+
+One cycle: **probe** every watch item (`ASSET:SYMBOL`) for a live ticker →
+derive the feed state → **refresh** that symbol's provenance CSV (dedup by
+timestamp) *only while the feed is OK* → invoke the C++ engine → write
+`state/paper_status.json` (heartbeat + feed health + last session).
+
+* A feed that is not OK is **ABSTAINed**: no new data, no new risk. Its open
+  positions are still marked and can still exit.
+* Health is tracked across cycles (consecutive failures, last success), exactly
+  mirroring `FeedHealthMonitor` — including the precedence that a feed which has
+  **never** succeeded reports `missing` even after repeated failures.
+* Rate limiting + TTL caching are inherited from `market_feeds.HttpClient`, so
+  a fast poll interval does not hammer the providers.
+
+```bash
+python tools/paper_loop.py --once                       # one cycle (cron)
+python tools/paper_loop.py --interval 300               # poll forever
+python tools/paper_loop.py --watch equity:AAPL,crypto:BTCUSDT,fx:EURUSD
+```
+
+### `omniseed_agent2 trading-paper-session` — the engine
+
+One cash account, many streams. Bars from every stream are merged into a single
+chronological timeline; at each timestamp the whole book is marked, the
+composite daily+weekly kill-switch is consulted **once**, and then each stream
+with a bar at that timestamp may exit or enter. Entries are sized per asset
+class (meme stays research-only) and use the stream's *next* bar open (no
+look-ahead).
+
+* **Resume is real.** The append-only journal is the source of truth: a restart
+  rebuilds cash and open positions from it (`PaperJournal::scan_existing` →
+  `PaperBroker::seed`), so equity does not jump back to the starting cash. A
+  re-run appends only genuinely new timestamps.
+* Every bar mark, **every non-Hold signal**, every fill, kill-switch trip,
+  ABSTAIN and risk refusal is journalled with the same schema as the
+  single-asset daemon
+  (`ts,kind,ticker,qty,price,pnl,equity,cash,exposure,reason`,
+  `kind ∈ {start, equity, signal, fill, halt, event}`). The `signal` rows are
+  the decision log — a non-Hold signal is recorded with its strength and rule
+  trace whether or not it becomes a fill (`--no-signal-journal` opts out).
+
+### `tools/nightly_report.py` + `tools/paper_dashboard.py` — the outputs
+
+* **Nightly report** — Markdown summary (equity, today's P&L, open positions,
+  today's fills, per-symbol contribution, kill-switch trips, feed health).
+  **Email is opt-in and never faked**: it sends only when every
+  `OMNISEED_SMTP_*` variable is present, otherwise it says so plainly and still
+  writes the file.
+* **Single-file dashboard** — one self-contained HTML document (inline CSS,
+  inline SVG equity curve, plain tables; **no CDN, no external assets, no
+  script**) showing the equity curve, open positions, today's P&L, feed health,
+  recent fills and risk counters. Both tools share `tools/paper_report.py`, so
+  the two can never disagree.
+
+```bash
+python tools/nightly_report.py --out state/nightly_report.md \
+    --html state/nightly_report.html
+python tools/paper_dashboard.py --out state/dashboard.html
+```
+
+### What a live run looks like on a Saturday
+
+Running the loop against real providers on a weekend is instructive: the
+daily equity (Yahoo) and FX (ECB reference) feeds are **stale**, so they
+ABSTAIN — no new risk — while 24/7 crypto stays `ok`. And a BTC position that
+would cost more than the 20 % per-name cap floors to zero shares, so the engine
+**refuses** it rather than over-sizing. Both are the system working as intended,
+not failures.
+
+---
+
+## 6. What is *not* here yet
 
 Tracked honestly so it is not mistaken for done:
 
@@ -142,12 +219,10 @@ Tracked honestly so it is not mistaken for done:
   social-volume signals (M7) — planned, not built.
 * News/sentiment rationale per signal and a regime detector (M2) — planned.
 * The strategy factory with automatic promotion/retirement (M3) — planned.
-* A 24/7 multi-asset paper daemon with a nightly report and web dashboard (M5)
-  — the single-asset journal daemon exists; the multi-asset loop does not.
 
 ---
 
-## 6. Test evidence
+## 7. Test evidence
 
 | Suite                        | What it pins down                                             |
 |------------------------------|--------------------------------------------------------------|
@@ -155,5 +230,9 @@ Tracked honestly so it is not mistaken for done:
 | `omniseed_market_feeds`      | adapters, cache, limiter, normalisation, provenance reuse, meme refusal, explicit failure |
 | `omniseed_market_data`       | T6 fetcher integrity (provenance, exit-2, no silent synth)    |
 | `omniseed_trading_edge`      | walk-forward no-look-ahead, risk clamp, daily kill-switch, journal append/resume |
+| `omniseed_paper_session`     | multi-asset merged timeline, per-asset gates, ABSTAIN, composite kill-switch, journal-based resume, determinism |
+| `omniseed_paper_loop`        | watch parsing, CSV merge/dedup, feed health → ABSTAIN, engine invocation, status heartbeat |
+| `omniseed_paper_reports`     | journal parsing, book replay, day P&L, Markdown/HTML rendering, opt-in SMTP config |
 
 Run the board with `ctest --test-dir build -C Release`.
+

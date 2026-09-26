@@ -180,8 +180,14 @@ Journal schema (CSV, one record per line):
 
 ```
 ts,kind,ticker,qty,price,pnl,equity,cash,exposure,reason
-kind ∈ {start, equity, fill, halt}
+kind ∈ {start, equity, signal, fill, halt, event}
 ```
+
+* **`signal` rows are the decision log** — every non-Hold signal is recorded
+  with its strength (in the `qty` column) and rule trace, whether or not it
+  becomes a fill. Disable with `--no-signal-journal`.
+* `event` rows carry kill-switch trips (`daily:`/`weekly:`), feed ABSTAINs
+  (`abstain:<sym>:<reason>`) and risk-gate refusals (`refused:<sym>:<reason>`).
 
 * **Crash-safe** — every record is flushed as it is written; the file is only
   ever appended.
@@ -262,6 +268,60 @@ line-exact after trimming — a `TODO:`, a quoted example, or different case
 unlocks **nothing**. Every order re-checks the level, the duration minimum and
 the caps, and logs *why* it refused.
 
+## 5d. The 24/7 paper loop (M5)
+
+Three pieces, split so the network lives in Python and the engine never opens a
+socket. Details and the evidence table are in
+**[`TRADING_LAB.md`](TRADING_LAB.md)** §5.
+
+### The poller — `tools/paper_loop.py`
+
+Probes every watch item, tracks feed health, refreshes each symbol's provenance
+CSV **only while the feed is OK**, runs the engine, and writes
+`state/paper_status.json` (heartbeat + feed health + last session).
+
+```bash
+python tools/paper_loop.py --once                 # one cycle (cron-friendly)
+python tools/paper_loop.py --interval 300         # poll every 5 min, forever
+python tools/paper_loop.py --watch equity:AAPL,crypto:BTCUSDT,fx:EURUSD
+python tools/paper_loop.py --dry-run --once       # poll only, skip the engine
+```
+
+A feed that is not OK is **ABSTAINed** — no new data, no new risk (open
+positions are still marked and can still exit).
+
+### The engine — `trading-paper-session`
+
+One cash account, many streams merged onto a single timeline, one composite
+daily+weekly kill-switch, per-asset-class sizing, and a **real resume**: the
+append-only journal is the source of truth, so a restart rebuilds cash and
+positions instead of resetting to the starting cash.
+
+```bash
+build/bin/omniseed_agent2.exe trading-paper-session \
+    --streams "AAPL,equity,models/market/AAPL_1d.csv;\
+BTCUSDT,crypto,models/market/BTCUSDT_1d.csv" \
+    --skip BTCUSDT --journal state/paper_journal.csv
+```
+
+`--skip SYM,...` marks a symbol's feed as not-OK (the poller passes this when a
+feed is stale/dead). Journal schema is unchanged from §5b.
+
+### The outputs
+
+```bash
+python tools/nightly_report.py --out state/nightly_report.md \
+    --html state/nightly_report.html      # email only if OMNISEED_SMTP_* set
+python tools/paper_dashboard.py --out state/dashboard.html
+```
+
+* The **nightly report** is Markdown: equity, today's P&L, open positions,
+  today's fills, per-symbol contribution, kill-switch trips, feed health.
+  Email is **opt-in and never faked** — without `OMNISEED_SMTP_HOST/USER/PASS`
+  and `OMNISEED_REPORT_TO` it says so and still writes the file.
+* The **dashboard** is one self-contained HTML file — inline CSS, an inline SVG
+  equity curve, and plain tables. No CDN, no external assets, no JavaScript.
+
 ## 6. Cloud reasoning (optional) — the TLS story, plainly
 
 The zero-dependency runtime has **no TLS stack**. Consequences:
@@ -313,3 +373,9 @@ The T7+/M-series suites (also ctest):
 * `omniseed_market_data` — T6 fetcher integrity: provenance column, exit-2 on
   provider failure, `--years` trim, no implicit synthetic substitution.
   (Python, venv-gated.)
+* `omniseed_paper_session` — multi-asset merged timeline, per-asset gates,
+  feed ABSTAIN, composite kill-switch, journal-based resume, determinism.
+* `omniseed_paper_loop` — watch parsing, provenance-CSV merge/dedup, feed
+  health → ABSTAIN, engine invocation, status heartbeat. (Python, venv-gated.)
+* `omniseed_paper_reports` — journal parsing, book replay, day P&L,
+  Markdown/HTML rendering, opt-in SMTP config. (Python, venv-gated.)

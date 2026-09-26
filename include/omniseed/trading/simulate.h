@@ -62,6 +62,12 @@ public:
     // Marks to market and records an equity snapshot (call once per cycle).
     void mark(const std::map<std::string, double>& prices, int64_t ts);
 
+    // Restore a persisted book (resume, M5): cash + open positions. The equity
+    // curve and peak are re-seeded from the restored cash so a restart does
+    // not register a phantom drawdown. Fills history restarts (the journal is
+    // the source of truth for history).
+    void seed(double cash, const std::map<std::string, Position>& positions);
+
     const PortfolioState& state() const { return state_; }
     double cash() const { return state_.cash; }
     const std::vector<double>& equity_curve() const { return curve_; }

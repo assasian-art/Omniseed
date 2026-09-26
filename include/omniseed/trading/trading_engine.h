@@ -168,6 +168,11 @@ public:
     // Marks positions to `prices` and recomputes equity/exposure.
     PortfolioState mark(const std::map<std::string, double>& prices) const;
 
+    // Restore a persisted book (resume, M5). Positions with qty <= 0 are
+    // dropped. The realized-P&L counter is left untouched (history lives in
+    // the append-only journal, not here).
+    void restore(double cash, const std::map<std::string, Position>& positions);
+
     double cash() const { return cash_; }
     double realized_pnl() const { return realized_; }
     const std::map<std::string, Position>& positions() const { return pos_; }

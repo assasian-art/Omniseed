@@ -76,6 +76,11 @@ void print_usage() {
         "  trading-paper     --ticker AAPL --timeframe 1d\n"
         "                    [--journal state/paper_journal.csv]\n"
         "                    paper daemon: replay + append-only journal\n"
+        "  trading-paper-session --streams \"AAPL,equity,models/market/AAPL_1d.csv;\n"
+        "                    BTCUSDT,crypto,models/market/BTCUSDT_1d.csv\"\n"
+        "                    [--skip SYM,...] [--journal state/paper_journal.csv]\n"
+        "                    [--no-signal-journal]\n"
+        "                    multi-asset paper trading over a merged timeline\n"
         "  introspect        self-model, goals, rationale, purpose\n"
         "  metacognition     confidence calibration + knowledge gaps\n"
         "  cloud             cloud-reasoning bridge status (optional key)\n"
@@ -110,6 +115,10 @@ struct Args {
     int32_t step_bars  = 63;        // fold stride
     bool    anchored   = false;     // growing (true) vs rolling (false) train
     std::string journal = "state/paper_journal.csv";   // paper daemon ledger
+    // --- multi-asset paper session (M5) ---
+    std::string streams;            // "SYM,ASSET,CSV[;SYM,ASSET,CSV...]"
+    std::string skip;               // comma list of symbols whose feed is not OK
+    bool    signal_journal = true;  // journal every non-Hold signal
 };
 
 Args parse_args(int argc, char** argv, int start) {
@@ -138,6 +147,9 @@ Args parse_args(int argc, char** argv, int start) {
         else if (s == "--test" && has_val) a.test_bars = std::atoi(v.c_str());
         else if (s == "--step" && has_val) a.step_bars = std::atoi(v.c_str());
         else if (s == "--journal" && has_val) a.journal = v;
+        else if (s == "--streams" && has_val) a.streams = v;
+        else if (s == "--skip" && has_val) a.skip = v;
+        else if (s == "--no-signal-journal") { a.signal_journal = false; continue; }
         else if (s == "--anchored") { a.anchored = true; continue; }
         if (has_val && (s.rfind("--", 0) == 0)) ++i;
     }
@@ -417,6 +429,107 @@ int cmd_trading_paper(const Args& a) {
                 res.final_equity, res.metrics.sharpe,
                 res.metrics.max_drawdown_pct);
     std::printf("  journal     : %lld records appended\n",
+                static_cast<long long>(journal.records()));
+    std::printf("%s", kDisclaimer);
+    return 0;
+}
+
+// ===========================================================================
+// trading-paper-session — multi-asset paper trading over a merged timeline
+// ===========================================================================
+AssetClass asset_from_string(const std::string& s) {
+    if (s == "equity" || s == "stock" || s == "stocks") return AssetClass::Equity;
+    if (s == "crypto")  return AssetClass::Crypto;
+    if (s == "fx" || s == "forex") return AssetClass::Fx;
+    if (s == "meme")    return AssetClass::Meme;
+    return AssetClass::Unknown;
+}
+
+std::vector<std::string> split_any(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string t;
+    while (std::getline(ss, t, sep))
+        if (!t.empty()) out.push_back(t);
+    return out;
+}
+
+int cmd_trading_paper_session(const Args& a) {
+    if (a.streams.empty()) {
+        std::printf("[session] --streams required, e.g. --streams "
+                    "\"AAPL,equity,models/market/AAPL_1d.csv;"
+                    "BTCUSDT,crypto,models/market/BTCUSDT_1d.csv\"\n");
+        return 1;
+    }
+    std::vector<PaperStream> streams;
+    for (const std::string& item : split_any(a.streams, ';')) {
+        const std::vector<std::string> parts = split_any(item, ',');
+        if (parts.size() < 3) {
+            std::printf("[session] bad stream '%s' (want SYM,ASSET,CSV[,TF])\n",
+                        item.c_str());
+            return 1;
+        }
+        PaperStream s;
+        s.symbol = parts[0];
+        s.asset  = asset_from_string(parts[1]);
+        s.csv    = parts[2];
+        if (parts.size() >= 4) s.timeframe = parts[3];
+        streams.push_back(s);
+    }
+    // Symbols whose feed is not OK are ABSTAINed (no new risk), but their open
+    // positions are still marked and can still exit.
+    for (const std::string& sym : split_any(a.skip, ','))
+        for (PaperStream& s : streams)
+            if (s.symbol == sym) { s.feed_ok = false; s.feed_reason = "stale-feed"; }
+
+    PaperJournal journal(a.journal);
+    std::string err;
+    journal.scan_existing(err);
+    if (!journal.open(err)) {
+        std::printf("[session] %s\n", err.c_str());
+        return 2;
+    }
+    PaperSessionConfig cfg;
+    cfg.risk = limits_for(a.strategy);
+    cfg.broker.starting_cash = a.capital;
+    cfg.streams = streams;
+    cfg.journal_signals = a.signal_journal;
+
+    const PaperSessionResult res = PaperSession::run(cfg, journal);
+    journal.close();
+    if (!res.error.empty()) {
+        std::printf("[session] %s\n", res.error.c_str());
+        return 2;
+    }
+    for (const std::string& e : res.stream_errors)
+        std::printf("[session] WARN stream: %s\n", e.c_str());
+
+    if (res.timestamps == 0) {
+        std::printf("[session] %zu streams — journal %s already covers this "
+                    "history (%lld records); nothing to do\n",
+                    streams.size(), a.journal.c_str(),
+                    static_cast<long long>(journal.records()));
+        std::printf("%s", kDisclaimer);
+        return 0;
+    }
+    std::printf("[session] %zu streams — journal %s\n", streams.size(),
+                a.journal.c_str());
+    std::printf("  timeline    : %lld timestamps, %lld stream-bars\n",
+                static_cast<long long>(res.timestamps),
+                static_cast<long long>(res.bars_processed));
+    std::printf("  signals     : %lld journalled (non-Hold)\n",
+                static_cast<long long>(res.signals));
+    std::printf("  actions     : %lld entries, %lld exits, %lld halts, "
+                "%lld abstains, %lld refused\n",
+                static_cast<long long>(res.entries),
+                static_cast<long long>(res.exits),
+                static_cast<long long>(res.halts),
+                static_cast<long long>(res.abstains),
+                static_cast<long long>(res.refused));
+    std::printf("  equity      : %.2f (sharpe %.2f, maxDD %.2f%%)\n",
+                res.final_equity, res.metrics.sharpe,
+                res.metrics.max_drawdown_pct);
+    std::printf("  journal     : %lld records\n",
                 static_cast<long long>(journal.records()));
     std::printf("%s", kDisclaimer);
     return 0;
@@ -783,6 +896,7 @@ int main(int argc, char** argv) {
     if (cmd == "trading-simulate") return cmd_trading_simulate(a);
     if (cmd == "trading-walkforward") return cmd_trading_walkforward(a);
     if (cmd == "trading-paper")    return cmd_trading_paper(a);
+    if (cmd == "trading-paper-session") return cmd_trading_paper_session(a);
     if (cmd == "trading-watch")    return cmd_trading_watch(a);
     if (cmd == "introspect")       return cmd_introspect();
     if (cmd == "metacognition")    return cmd_metacognition(a);
