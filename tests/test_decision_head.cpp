@@ -411,6 +411,7 @@ int main() {
             h.set_action(static_cast<DecisionAction>(a), zero.data(), 0.0f);
         h.set_action(DecisionAction::CLOSE, filled(8, 5.0f).data(), 0.0f);
         h.set_action_asset(DecisionAction::CLOSE, "BTCUSDT");
+        h.set_action_invalidation(DecisionAction::CLOSE, 42123.5f);
 
         const std::string js = h.decide(filled(8, 1.0f).data()).to_json();
         CHECK(js.front() == '{');
@@ -418,6 +419,7 @@ int main() {
         CHECK(js.find("\"action\":\"CLOSE\"") != std::string::npos);
         CHECK(js.find("\"confidence\":") != std::string::npos);
         CHECK(js.find("\"target_asset\":\"BTCUSDT\"") != std::string::npos);
+        CHECK(js.find("\"invalidation\":42123.5000") != std::string::npos);
         CHECK(js.find("\"routing\":\"self\"") != std::string::npos);
         CHECK(js.find("\"fast_path\":true") != std::string::npos);
         CHECK(js.find("\"matvecs\":1") != std::string::npos);
@@ -447,6 +449,67 @@ int main() {
         h.set_action(DecisionAction::BUY, zero.data(), 0.0f);
         CHECK(h.fitted_actions() == kActionCount);
         CHECK(h.trained());
+    }
+
+    TEST("invalidation: carried through, persisted, and zero means unknown");
+    {
+        const std::vector<float> zero = filled(8, 0.0f);
+        DecisionHead h;
+        CHECK(h.init(8, 71u));
+        for (int32_t a = 0; a < kActionCount; ++a)
+            h.set_action(static_cast<DecisionAction>(a), zero.data(), 0.0f);
+
+        // Default is 0.0f == "not specified". It must NOT be read as a real
+        // price level, so the raw value stays 0 and the caller decides.
+        const DecisionResult unset = h.decide(filled(8, 1.0f).data());
+        CHECK(unset.invalidation == 0.0f);
+
+        // A BUY with a per-action default stop level.
+        h.set_action(DecisionAction::BUY, filled(8, 4.0f).data(), 0.0f);
+        h.set_action_invalidation(DecisionAction::BUY, 182.25f);
+        const DecisionResult d = h.decide(filled(8, 1.0f).data());
+        CHECK(d.action_type == DecisionAction::BUY);
+        CHECK(d.invalidation == 182.25f);
+
+        // The level is per-action: an action that is not selected does not
+        // leak its own level into the result.
+        h.set_action_invalidation(DecisionAction::SELL, 999.0f);
+        CHECK(h.decide(filled(8, 1.0f).data()).invalidation == 182.25f);
+
+        // Out-of-range handles are ignored, not a crash.
+        h.set_action_invalidation(DecisionAction::COUNT, 1.0f);
+        h.set_action_invalidation(static_cast<DecisionAction>(-1), 1.0f);
+        CHECK(h.decide(filled(8, 1.0f).data()).invalidation == 182.25f);
+
+        // It survives a save/load round-trip.
+        const std::string path = temp_path("omniseed_dh_inval.bin");
+        CHECK(h.save(path));
+        DecisionHead r;
+        CHECK(r.load(path));
+        CHECK(r.decide(filled(8, 1.0f).data()).invalidation == 182.25f);
+        std::remove(path.c_str());
+    }
+
+    TEST("persistence rejects a v1 blob rather than defaulting invalidation");
+    {
+        // A v1 header (version 1) must be refused: it carries no invalidation
+        // levels, and silently reading them as 0.0 would turn "unknown" into
+        // "no stop", which is the dangerous direction.
+        const std::string path = temp_path("omniseed_dh_v1.bin");
+        std::vector<uint8_t> bytes;
+        const char magic[8] = {'O', 'M', 'N', 'I', 'S', 'D', 'H', '1'};
+        bytes.insert(bytes.end(), magic, magic + 8);
+        const int32_t ver = 1, E = 8, A = kActionCount, fit = 0;
+        for (const int32_t v : {ver, E, A, fit}) {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+            bytes.insert(bytes.end(), p, p + sizeof(int32_t));
+        }
+        CHECK(write_bytes(path, bytes));
+
+        DecisionHead h;
+        CHECK(!h.load(path));
+        CHECK(!h.error().empty());
+        std::remove(path.c_str());
     }
 
     TEST("persistence round-trip (fitted head)");

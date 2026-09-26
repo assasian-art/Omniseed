@@ -73,12 +73,28 @@ const char* decision_action_name(DecisionAction a);
 
 // ---------------------------------------------------------------------------
 // One System-1 decision.
+//
+// Field naming: the integration contract names these {action, confidence,
+// asset, invalidation}; they are spelled out here as action_type /
+// confidence_score / target_asset / invalidation so that "confidence" cannot
+// be confused with a calibration claim and "asset" cannot be confused with a
+// held position. The four semantics are exactly the contract's.
 // ---------------------------------------------------------------------------
 struct DecisionResult {
-    // --- the three fields the integration contract names ---------------------
+    // --- the four fields the integration contract names ----------------------
     DecisionAction action_type      = DecisionAction::ABSTAIN;
     float          confidence_score = 0.0f;   // softmax prob of the argmax
     std::string    target_asset;              // "" unless mapped via set_action_asset
+    // The level at which this decision is VOID — for a trading action the price
+    // at which the thesis is wrong and the position must be abandoned. 0 means
+    // "not specified" and must be treated as *unknown*, never as "no stop".
+    //
+    // The head does not invent this number: a price level is market context,
+    // not something recoverable from a hidden state. It is filled from the
+    // per-action default (set_action_invalidation) and is expected to be
+    // OVERRIDDEN by the caller from the risk engine, which is the only
+    // component that knows the entry price and the stop distance.
+    float          invalidation     = 0.0f;
 
     // --- diagnostics ---------------------------------------------------------
     float       margin    = 0.0f;   // p(top) - p(second): how close the call was
@@ -144,6 +160,10 @@ public:
     void set_action(DecisionAction a, const float* row, float bias);
     // Attach a default asset label for an action (fills target_asset).
     void set_action_asset(DecisionAction a, const std::string& asset);
+    // Attach a default invalidation level for an action (fills invalidation).
+    // This is a fallback, not a substitute for the risk engine: a real price
+    // level depends on the entry, which only the caller knows.
+    void set_action_invalidation(DecisionAction a, float level);
 
     // ---- persistence --------------------------------------------------------
     // Self-describing little-endian blob: magic, version, E, A, action names,
@@ -169,6 +189,7 @@ private:
     std::vector<float>       proj_;  // [A_, E_] row-major, one row per action
     std::vector<float>       bias_;  // [A_]
     std::vector<std::string> asset_; // [A_] default target_asset per action
+    std::vector<float>       inval_; // [A_] default invalidation level per action
     std::vector<std::string> name_;  // [A_] action labels (persisted)
 
     bool        ready_          = false;

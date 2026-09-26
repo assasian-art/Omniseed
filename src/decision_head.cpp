@@ -73,7 +73,10 @@ std::string json_escape(const std::string& s) {
 }
 
 constexpr char kMagic[8] = {'O', 'M', 'N', 'I', 'S', 'D', 'H', '1'};
-constexpr int32_t kFormatVersion = 1;
+// v2 added the per-action invalidation levels. A v1 blob is rejected rather
+// than defaulted, because "no invalidation recorded" and "invalidation is
+// zero" are different claims and only one of them is true.
+constexpr int32_t kFormatVersion = 2;
 constexpr int32_t kMaxDim  = 1 << 20;
 constexpr int32_t kMaxStr  = 1 << 12;
 
@@ -108,14 +111,16 @@ bool rd_str(FILE* f, std::string& s) {
 // DecisionResult
 // ---------------------------------------------------------------------------
 std::string DecisionResult::to_json() const {
-    char buf[384];
+    char buf[448];
     std::snprintf(buf, sizeof(buf),
                   "{\"action\":\"%s\",\"confidence\":%.4f,"
-                  "\"target_asset\":\"%s\",\"routing\":\"%s\","
-                  "\"fast_path\":%s,\"margin\":%.4f,\"matvecs\":%d}",
+                  "\"target_asset\":\"%s\",\"invalidation\":%.4f,"
+                  "\"routing\":\"%s\",\"fast_path\":%s,\"margin\":%.4f,"
+                  "\"matvecs\":%d}",
                   decision_action_name(action_type),
                   static_cast<double>(confidence_score),
                   json_escape(target_asset).c_str(),
+                  static_cast<double>(invalidation),
                   json_escape(routing).c_str(),
                   fast_path ? "true" : "false",
                   static_cast<double>(margin), matvecs);
@@ -158,6 +163,7 @@ bool DecisionHead::init(int32_t n_embd, uint32_t seed) {
 
     proj_.assign(static_cast<size_t>(A_) * static_cast<size_t>(E_), 0.0f);
     bias_.assign(static_cast<size_t>(A_), 0.0f);
+    inval_.assign(static_cast<size_t>(A_), 0.0f);
     logits_.assign(static_cast<size_t>(A_), 0.0f);
     fitted_.assign(static_cast<size_t>(A_), 0u);
 
@@ -235,6 +241,7 @@ DecisionResult DecisionHead::decide(const float* hidden) const {
     r.margin           = best_p - second_p;
     r.matvecs          = 1;
     r.target_asset     = asset_[static_cast<size_t>(best)];
+    r.invalidation     = inval_[static_cast<size_t>(best)];
 
     // ---- 4) self-routing ---------------------------------------------------
     // Fail-closed by construction: ABSTAIN means "say nothing", EXPLAIN means
@@ -295,6 +302,12 @@ void DecisionHead::set_action_asset(DecisionAction a, const std::string& asset) 
     asset_[static_cast<size_t>(idx)] = asset;
 }
 
+void DecisionHead::set_action_invalidation(DecisionAction a, float level) {
+    const int32_t idx = static_cast<int32_t>(a);
+    if (!ready_ || idx < 0 || idx >= A_) return;
+    inval_[static_cast<size_t>(idx)] = level;
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -310,6 +323,8 @@ bool DecisionHead::save(const std::string& path) const {
     ok = ok && wr(f, static_cast<int32_t>(trained() ? 1 : 0));
     for (int32_t a = 0; ok && a < A_; ++a) ok = wr_str(f, name_[static_cast<size_t>(a)]);
     for (int32_t a = 0; ok && a < A_; ++a) ok = wr_str(f, asset_[static_cast<size_t>(a)]);
+    if (ok && !inval_.empty())
+        ok = std::fwrite(inval_.data(), sizeof(float), inval_.size(), f) == inval_.size();
     if (ok && !proj_.empty())
         ok = std::fwrite(proj_.data(), sizeof(float), proj_.size(), f) == proj_.size();
     if (ok && !bias_.empty())
@@ -359,6 +374,8 @@ bool DecisionHead::load(const std::string& path) {
     std::vector<std::string> assets(static_cast<size_t>(A));
     for (int32_t a = 0; ok && a < A; ++a) ok = rd_str(f, names[static_cast<size_t>(a)]);
     for (int32_t a = 0; ok && a < A; ++a) ok = rd_str(f, assets[static_cast<size_t>(a)]);
+    if (ok)
+        ok = std::fread(inval_.data(), sizeof(float), inval_.size(), f) == inval_.size();
     if (ok)
         ok = std::fread(proj_.data(), sizeof(float), proj_.size(), f) == proj_.size();
     if (ok)
