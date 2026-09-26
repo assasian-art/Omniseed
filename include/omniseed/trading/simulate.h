@@ -37,7 +37,7 @@ struct PaperBrokerConfig {
 // ===========================================================================
 class PaperBroker {
 public:
-    explicit PaperBroker(const PaperBrokerConfig& cfg = {})
+    explicit PaperBroker(const PaperBrokerConfig& cfg = PaperBrokerConfig{}/*gcc-safe*/)
         : cfg_(cfg), pm_(cfg.starting_cash) {
         state_.cash = cfg.starting_cash;   // live before the first mark()
         peak_ = cfg.starting_cash;

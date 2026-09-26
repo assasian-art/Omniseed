@@ -142,7 +142,7 @@ struct FocalCodecConfig {
 
 class FocalCodec {
 public:
-    explicit FocalCodec(const FocalCodecConfig& cfg = {}) : cfg_(cfg) {}
+    explicit FocalCodec(const FocalCodecConfig& cfg = FocalCodecConfig{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Encodes PCM into discrete semantic codes (one per frame).
     // Weights come from "focal.*" GGUF tensors; without them a deterministic

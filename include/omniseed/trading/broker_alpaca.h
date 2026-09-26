@@ -44,7 +44,7 @@ public:
                                          int& /*status*/,
                                          std::string& /*response*/)>;
 
-    explicit AlpacaClient(const Config& cfg = {}, Transport transport = nullptr);
+    explicit AlpacaClient(const Config& cfg = Config{}/*gcc-safe*/, Transport transport = nullptr);
 
     bool valid() const { return !key_id_.empty() && !secret_key_.empty(); }
     bool is_paper() const { return cfg_.endpoint == Endpoint::Paper; }

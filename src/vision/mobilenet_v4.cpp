@@ -47,55 +47,10 @@ Image Image::resize(const Image& src, int32_t w, int32_t h) {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Quantized conv primitives (used by the backbone once weights are present)
-// ---------------------------------------------------------------------------
+// NOTE: the quantized conv primitives (depthwise3x3/pointwise1x1) were
+// removed as dead code — the full MobileNetV4 backbone never landed (see
+// PROJECT_STATE); the patch-feature placeholder below is the live path.
 namespace {
-
-inline int8_t clamp_i8(int v) {
-    return static_cast<int8_t>(std::max(-128, std::min(127, v)));
-}
-
-// 3x3 depthwise conv, stride 1, zero padding, per-channel requantization.
-void depthwise3x3(const int8_t* src, int32_t side, const int8_t* w,
-                  int32_t w_side, const float* scale, int32_t z,
-                  int8_t* dst) {
-    const int32_t half = w_side / 2;
-    for (int32_t y = 0; y < side; ++y) {
-        for (int32_t x = 0; x < side; ++x) {
-            int32_t acc = 0;
-            for (int32_t ky = 0; ky < w_side; ++ky) {
-                const int32_t iy = y + ky - half;
-                if (iy < 0 || iy >= side) continue;
-                for (int32_t kx = 0; kx < w_side; ++kx) {
-                    const int32_t ix = x + kx - half;
-                    if (ix < 0 || ix >= side) continue;
-                    acc += static_cast<int32_t>(src[iy * side + ix]) *
-                           static_cast<int32_t>(w[ky * w_side + kx]);
-                }
-            }
-            dst[y * side + x] = clamp_i8(
-                static_cast<int32_t>(std::lround(acc * scale[z])));
-        }
-    }
-}
-
-// 1x1 pointwise conv across channels (int8 in, int8 out).
-void pointwise1x1(const int8_t* src, int32_t side, int32_t cin,
-                  const int8_t* w, int32_t cout, const float* scale,
-                  int8_t* dst) {
-    for (int32_t yx = 0; yx < side * side; ++yx) {
-        for (int32_t o = 0; o < cout; ++o) {
-            int32_t acc = 0;
-            for (int32_t i = 0; i < cin; ++i) {
-                acc += static_cast<int32_t>(src[yx * cin + i]) *
-                       static_cast<int32_t>(w[o * cin + i]);
-            }
-            dst[yx * cout + o] =
-                clamp_i8(static_cast<int32_t>(std::lround(acc * scale[o])));
-        }
-    }
-}
 
 // Deterministic placeholder patch embedding until converted weights arrive:
 // per-patch RGB mean/std -> feature vector via fixed random-free hashing.

@@ -90,7 +90,7 @@ public:
         std::string store_path = "./state/skills.bin";
     };
 
-    explicit FlashSkillPool(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit FlashSkillPool(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Registers a skill (copies). Returns false when the pool is full or
     // the skill is invalid (no name / no steps / oversized).

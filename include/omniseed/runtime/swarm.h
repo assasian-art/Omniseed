@@ -112,7 +112,7 @@ public:
         uint16_t port        = 47470;  // swarm default port
         uint32_t ttl_seconds = 30;     // peer expiry
     };
-    explicit UdpBeacon(const Config& cfg = {});
+    explicit UdpBeacon(const Config& cfg = Config{}/*gcc-safe*/);
     ~UdpBeacon() override;
 
     bool start();                      // binds the socket; false if unavailable
@@ -159,7 +159,7 @@ public:
     using TaskExecutor = std::function<bool(const std::string& task,
                                             std::string& result)>;
 
-    explicit SwarmCoordinator(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit SwarmCoordinator(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     const std::string& id() const { return cfg_.node_id; }
 

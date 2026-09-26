@@ -41,7 +41,7 @@ public:
         int32_t max_tokens = 512;
     };
 
-    explicit CloudBridge(const Config& cfg = {});
+    explicit CloudBridge(const Config& cfg = Config{}/*gcc-safe*/);
 
     // True when a key is configured (bridge usable).
     bool available() const { return !api_key_.empty(); }

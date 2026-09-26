@@ -75,13 +75,13 @@ MappedFile::~MappedFile() { close(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
     : data_(other.data_), size_(other.size_), path_(std::move(other.path_)),
-      last_error_(std::move(other.last_error_)),
-      fallback_buf_(std::move(other.fallback_buf_))
+      last_error_(std::move(other.last_error_))
 #if OMNISEED_PLATFORM_WINDOWS
       , file_handle_(other.file_handle_), mapping_handle_(other.mapping_handle_)
 #else
       , fd_(other.fd_)
 #endif
+      , fallback_buf_(std::move(other.fallback_buf_))   // member order (GCC -Wreorder)
 {
 #if OMNISEED_PLATFORM_WINDOWS
     other.file_handle_    = nullptr;

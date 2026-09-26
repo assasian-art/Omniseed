@@ -215,7 +215,7 @@ public:
     struct Config {
         size_t max_triples = 512;          // ~100 KB ceiling
     };
-    explicit KnowledgeGraph(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit KnowledgeGraph(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Mines triples from plain text with pattern rules:
     //   "X is Y", "X has Y", "X likes Y", "my X is Y", "X at Y".

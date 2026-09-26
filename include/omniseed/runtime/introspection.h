@@ -111,7 +111,7 @@ struct RationaleEntry {
 class ActionRationale {
 public:
     struct Config { size_t max_entries = 256; };
-    explicit ActionRationale(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit ActionRationale(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     void log(const std::string& actor, const std::string& action,
              const std::string& because, double confidence);

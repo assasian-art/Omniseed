@@ -61,7 +61,7 @@ public:
         std::string ticker;
     };
 
-    explicit MarketDataFeed(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit MarketDataFeed(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Load the full history (CSV path) — bars are then replayed by index.
     bool load(std::string& err);
@@ -114,7 +114,7 @@ public:
 
     // Computes every indicator series over `bars` (size == bars.size()).
     static Indicators compute(const std::vector<Bar>& bars,
-                              const Config& cfg = {});
+                              const Config& cfg = Config{}/*gcc-safe*/);
 
     // Rules at index i (uses only data <= i; no look-ahead):
     //   +1 mean-reversion : close < lower BB and RSI < buy threshold
@@ -122,7 +122,7 @@ public:
     //   -1 exit           : close > upper BB, or RSI > sell threshold,
     //                       or sma_fast < sma_slow
     static Signal evaluate(const Indicators& ind, const std::vector<Bar>& bars,
-                           size_t i, const Config& cfg = {});
+                           size_t i, const Config& cfg = Config{}/*gcc-safe*/);
 };
 
 // ===========================================================================

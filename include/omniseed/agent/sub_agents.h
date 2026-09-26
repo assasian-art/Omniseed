@@ -56,7 +56,7 @@ public:
         double strong_signal   = 0.6;    // strength treated as "high conviction"
     };
 
-    explicit MarketAnalystAgent(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit MarketAnalystAgent(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Pure technical verdict from indicator state at index i.
     AgentVerdict analyze_technical(const std::string& ticker,
@@ -118,7 +118,7 @@ public:
         double volatility_warn_atr_pct = 0.05;  // ATR/close sanity ceiling
     };
 
-    explicit RiskManagerAgent(const Config& cfg = {}) : cfg_(cfg) {}
+    explicit RiskManagerAgent(const Config& cfg = Config{}/*gcc-safe*/) : cfg_(cfg) {}
 
     // Returns alert lines (empty = healthy). Checks: concentration,
     // gross exposure, drawdown halt, per-position stop breaches.
