@@ -63,18 +63,51 @@ def trend(n, rate, start=100.0, vol=0.0, seed=1):
     return prices
 
 
-# The canonical "textbook sniper" fixture: an alternating regime with bursty
-# volume every 11 bars. Verified to reach S=0.865 (>= 0.85) on a bar with three
-# agreeing factors in a confirmed uptrend.
-def sniper_fixture(n=340, seed=12, period=11, off=1, mult=15.0):
+# The canonical "textbook sniper" fixture: a PULLBACK THAT RECLAIMS inside an
+# uptrend, on a volume burst. Verified to reach S=0.890 on a bar with three
+# agreeing factors (vwap-reclaim + macd-thrust + trend-align) in a confirmed
+# uptrend.
+#
+# Why it looks like this, and not like a steady trend:
+#
+#   * The six technical factors CLUSTER. `trend-align` and `macd-thrust` fire
+#     constantly in a trend; `vwap-reclaim` only fires on a recovery bar. So
+#     `votes >= 3` in practice means "a pullback that reclaims", which is a
+#     coherent sniper setup — and the only one that reaches 3 votes at all.
+#   * S >= 0.85 is a REGIME question, not a score question. With M=T=C maximal
+#     the ceiling is 0.8125 in high_vol and 0.875 in range, so an entry needs a
+#     confirmed uptrend. See test_reachability().
+#   * The dip must therefore be gentle enough not to trip the volatility
+#     regime. The regime engine requires volatility to be elevated BOTH
+#     relatively (percentile) and absolutely (ATR/close above half the
+#     mandate's 5%), which is what lets a reclaim bar still read trend_up.
+#   * ONE burst bar, not three: three raise the rolling volume mean and suppress
+#     the z-score, which caps the M layer at 0.82 and leaves S at 0.844.
+def sniper_fixture(n=340, seed=2, pre=0.0030, sig=0.0020, dip_len=5,
+                   dip=-0.018, slow_len=8, slow=0.0030, pop=0.025,
+                   burst=50000.0, base_vol=1000.0, spread=0.01):
     rnd = random.Random(seed)
     prices, p = [], 100.0
+    tail = dip_len + slow_len + 1
     for i in range(n):
-        drift = 0.0022 if (i // 50) % 2 == 0 else -0.0012
-        p *= math.exp(drift + rnd.gauss(0, 0.009))
+        if i >= n - tail:
+            j = i - (n - tail)
+            if j < dip_len:
+                d = dip                       # the pullback
+            elif j < dip_len + slow_len:
+                d = slow                      # grinding back up
+            else:
+                d = pop                       # the reclaim bar
+        else:
+            d = pre                           # the uptrend
+        p *= math.exp(d + rnd.gauss(0, sig))
         prices.append(p)
-    vm = [mult if (i - off) % period == 0 else 1.0 for i in range(n)]
-    return bars_from(prices, vm)
+
+    vols = [base_vol * (1.0 + 0.20 * rnd.random()) for _ in range(n)]
+    vols[n - 1] = burst                       # the volume anomaly, on the reclaim
+    return [(1600000000 + i * 86400, prices[i] * (1 - spread / 2),
+             prices[i] * (1 + spread), prices[i] * (1 - spread), prices[i],
+             vols[i]) for i in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -199,20 +232,66 @@ def test_score_arithmetic():
 def test_reachability():
     print("\n-- the 0.85 bar is reachable --")
     cfg = SN.SniperConfig()
+
+    # ---- 1. THE ARITHMETIC CEILING, PER REGIME -------------------------
+    #
+    # S >= 0.85 is a REGIME question, and this is the crisp form of it. With
+    # M=T=C=1.0 (a maximal volume anomaly, all six factors, every peer
+    # confirming) the reachable maximum depends only on the R layer:
+    #
+    #   trend_up   .25+.35+.25*1.00+.15 = 1.0000   <- can host 0.85
+    #   range      .25+.35+.25*0.50+.15 = 0.8750   <- can, barely
+    #   high_vol   .25+.35+.25*0.25+.15 = 0.8125   <- CANNOT, ever
+    #   trend_down .25+.35+.25*0.00+.15 = 0.7500   <- cannot (and is vetoed)
+    #
+    # That is why this test also pins the regime: a sniper entry needs an
+    # uptrend, and the "0.85 is unreachable" failure mode shows up as a regime
+    # problem long before it shows up as a score problem.
+    ceil = {r: (cfg.w_micro + cfg.w_tech + cfg.w_cross
+                + cfg.w_regime * sc)
+            for r, sc in SN.REGIME_SCORE.items()}
+    print("       ceiling by regime: "
+          + "  ".join("%s=%.4f" % (k, v) for k, v in sorted(ceil.items())))
+    check("reachable: a trend_up bar can clear 0.85", ceil["trend_up"] >= 0.85,
+          f"{ceil['trend_up']:.4f}")
+    check("reachable: a range bar can clear 0.85 (barely)",
+          ceil["range"] >= 0.85, f"{ceil['range']:.4f}")
+    check("reachable: a high_vol bar can NEVER clear 0.85",
+          ceil["high_vol"] < 0.85, f"{ceil['high_vol']:.4f}")
+    check("reachable: a trend_down bar can never clear 0.85",
+          ceil["trend_down"] < 0.85, f"{ceil['trend_down']:.4f}")
+
+    # ---- 2. A REAL BAR WITH FEASIBLE LAYER VALUES ----------------------
+    # M=0.90 (a genuine volume spike), T=0.90 (three agreeing factors),
+    # R=1.0 (confirmed uptrend), C=0.50 (no peers active -> neutral).
+    v = SN.SniperVerdict(ts=0, micro=0.90, tech=0.90, regime_score=1.0,
+                         cross=0.50, votes=3, regime="trend_up")
+    v.score = (cfg.w_micro * v.micro + cfg.w_tech * v.tech
+               + cfg.w_regime * v.regime_score + cfg.w_cross * v.cross)
+    print(f"       constructed bar: S={v.score:.4f}")
+    check("reachable: feasible layer values clear 0.85", v.score >= 0.85,
+          f"S={v.score:.4f}")
+    check("reachable: and propose() says yes when it is not vetoed",
+          v.propose(cfg))
+
+    # ---- 3. THE REAL FIXTURE -------------------------------------------
     bars = sniper_fixture()
     vs = SN.scan(bars, cfg=cfg)
     props = [v for v in vs if v.propose(cfg)]
+    best = max(vs, key=lambda v: v.score)
+    print(f"       fixture: {len(props)} proposals, best S={best.score:.4f} "
+          f"({best.regime}, {best.votes} votes)")
     check("reachable: a textbook setup produces at least one proposal",
           len(props) >= 1, f"got {len(props)}")
     if props:
-        best = max(props, key=lambda v: v.score)
-        check("reachable: the proposal clears 0.85", best.score >= 0.85,
-              f"S={best.score:.3f}")
+        top = max(props, key=lambda v: v.score)
+        check("reachable: the proposal clears 0.85", top.score >= 0.85,
+              f"S={top.score:.3f}")
         check("reachable: it has >=3 agreeing factors",
-              best.votes >= cfg.min_factors)
+              top.votes >= cfg.min_factors)
         check("reachable: it is in a confirmed uptrend",
-              best.regime == "trend_up")
-        check("reachable: it is not vetoed", not best.veto)
+              top.regime == "trend_up")
+        check("reachable: it is not vetoed", not top.veto)
     check("reachable: proposals are RARE (a sniper, not a machine gun)",
           len(props) < len(vs) * 0.1)
 

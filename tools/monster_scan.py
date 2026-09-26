@@ -134,6 +134,7 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
     matrix = matrix or CM.CorrelationMatrix()
 
     summary = {"symbols": {}, "min_confidence": cfg.min_confidence,
+               "regime_mode": cfg.regime_mode, "ensemble": bool(cfg.ensemble),
                "news_events": len(hunter.events) if hunter else 0}
     for item in watch:
         sym = item["symbol"]
@@ -147,11 +148,20 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
         props = [v for v in vectors if v.propose(cfg.min_confidence)]
         veteos = sum(1 for v in vectors if v.veto)
         best = max(vectors, key=lambda v: v.confidence) if vectors else None
+        regimes = {}
+        for v in vectors:
+            regimes[v.regime] = regimes.get(v.regime, 0) + 1
+        ens_vetoes = sum(1 for v in vectors if v.detail.find("VETO=ensemble") >= 0)
         summary["symbols"][sym] = {
             "bars": len(vectors),
             "proposed": len(props),
             "vetoed": veteos,
+            "ensemble_vetoed": ens_vetoes,
             "event_driven": sum(1 for v in vectors if v.event_driven),
+            "regimes": regimes,
+            "mean_conviction": round(
+                sum(v.conviction for v in vectors) / len(vectors), 4)
+            if vectors else 0.0,
             "best_confidence": round(best.confidence, 4) if best else 0.0,
             "best_regime": best.regime if best else "",
             "csv": path,
@@ -175,6 +185,11 @@ def main():
     ap.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
     ap.add_argument("--news", default="", help="JSON list of news items")
     ap.add_argument("--min-confidence", type=float, default=0.85)
+    ap.add_argument("--regime-mode", default="advanced",
+                    choices=("advanced", "legacy"),
+                    help="advanced = multi-axis regime ensemble (default)")
+    ap.add_argument("--ensemble", action="store_true",
+                    help="route the strategy zoo into a fail-closed veto")
     ap.add_argument("--summary", default="", help="summary json path override")
     a = ap.parse_args()
 
@@ -184,7 +199,9 @@ def main():
         print("[monster] %s" % e, file=sys.stderr)
         return 2
 
-    cfg = SN.SniperConfig(min_confidence=a.min_confidence)
+    cfg = SN.SniperConfig(min_confidence=a.min_confidence,
+                          regime_mode=a.regime_mode,
+                          ensemble=a.ensemble)
     summary = run_scan(watch, csv_dir=a.csv_dir, out_dir=a.out_dir,
                        timeframe=a.timeframe, cfg=cfg,
                        news_items=load_news(a.news))
@@ -195,14 +212,19 @@ def main():
         json.dump(summary, f, indent=2, sort_keys=True)
     os.replace(tmp, out)
 
+    print("[monster] regime=%s ensemble=%s"
+          % (summary["regime_mode"], summary["ensemble"]))
     for sym, s in summary["symbols"].items():
         if s.get("error"):
             print("[monster] %-10s %s" % (sym, s["error"]))
         else:
-            print("[monster] %-10s %4d bars | %3d proposed | %3d vetoed | "
-                  "best S=%.3f (%s)"
+            print("[monster] %-10s %4d bars | %3d proposed | %3d vetoed "
+                  "(%d ensemble) | best S=%.3f (%s)"
                   % (sym, s["bars"], s["proposed"], s["vetoed"],
-                     s["best_confidence"], s["best_regime"]))
+                     s.get("ensemble_vetoed", 0), s["best_confidence"],
+                     s["best_regime"]))
+            print("[monster] %-10s regimes %s  mean_conviction=%+.3f"
+                  % ("", s.get("regimes", {}), s.get("mean_conviction", 0.0)))
     print("[monster] wrote %s" % out)
     return 0
 

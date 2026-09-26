@@ -447,6 +447,38 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_news.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_monster_news PROPERTIES TIMEOUT 300)
+
+        # Monster regime engine: calibration of every statistic against series
+        # with KNOWN ground truth (trend / OU / random walk), plus the
+        # no-look-ahead prefix-invariance proof.
+        add_test(NAME omniseed_monster_regime
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_regime.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_regime PROPERTIES TIMEOUT 300)
+
+        # Monster strategy zoo + regime router: the exact CKS order flow
+        # imbalance against hand-computed values, and the ensemble veto weight
+        # floor (a lone weak signal must never veto).
+        add_test(NAME omniseed_monster_strategies
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_strategies.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_strategies PROPERTIES TIMEOUT 300)
+
+        # Monster funding carry: annualization arithmetic, the net-of-cost
+        # stack, and the memecoin trap (high gross APR must NOT rank first).
+        add_test(NAME omniseed_monster_funding
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_funding.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_funding PROPERTIES TIMEOUT 300)
     endif()
 endif()
 

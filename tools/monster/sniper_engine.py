@@ -22,6 +22,9 @@ import math
 from dataclasses import dataclass, field
 
 from . import features as F
+from . import regime as RG
+from . import router as RT
+from . import strategies as ST
 
 
 @dataclass
@@ -51,11 +54,28 @@ class SniperConfig:
     fib_tol: float = 0.015          # +/- 1.5% of price around a level
     div_max_gap: int = 60
     # --- regime -----------------------------------------------------------
+    #
+    # regime_mode:
+    #   "advanced" (default) — the multi-axis ensemble in regime.py: variance
+    #       ratio, Hurst, efficiency ratio, ADX, choppiness, R², rho(1) and
+    #       MA-ribbon consistency, with Yang-Zhang volatility and an OU
+    #       half-life, plus hysteresis.
+    #   "legacy" — the original single-statistic SMA200-slope rule, kept so the
+    #       behaviour can be reproduced and A/B compared.
+    regime_mode: str = "advanced"
     sma_regime: int = 200
     regime_slope_n: int = 20
     regime_slope_s: float = 0.01    # 1% SMA200 move over n bars
     atr_period: int = 14
     atr_hi: float = 0.05            # 5% ATR/close = high-volatility regime
+    # --- strategy ensemble (opt-in; the advanced regime engine is required) ---
+    #
+    # The ensemble can only ever BLOCK, never promote. It never raises S: an
+    # ensemble that can talk you into a trade can talk you into a bad one.
+    ensemble: bool = False
+    ensemble_veto: float = 0.35
+    ensemble_agreement: float = 0.60
+    ensemble_min_weight: float = 0.50
     # --- cross-asset ------------------------------------------------------
     invalidate_veto: int = 2
 
@@ -68,6 +88,11 @@ class EvalContext:
     cross_invalidate: int = 0
     cross_active: int = 0
     event_driven: bool = False
+
+
+def _fin(x):
+    """True only for a real, finite number. None-safe on purpose."""
+    return isinstance(x, (int, float)) and math.isfinite(x)
 
 
 @dataclass
@@ -83,6 +108,11 @@ class SniperVerdict:
     veto: bool = False
     veto_reason: str = ""
     factors: list = field(default_factory=list)
+    # --- ensemble / regime detail (never part of S) -----------------------
+    trend_score: float = float("nan")
+    half_life: float = float("nan")
+    conviction: float = 0.0
+    agreement: float = 0.0
 
     def propose(self, cfg):
         return (not self.veto) and self.score >= cfg.min_confidence
@@ -101,6 +131,12 @@ class SniperVerdict:
             parts.append("VETO=%s" % (self.veto_reason or "gate"))
         if self.factors:
             parts.append("factors=%s" % "+".join(self.factors))
+        if _fin(self.trend_score):
+            parts.append("trend=%.3f" % self.trend_score)
+        if _fin(self.half_life):
+            parts.append("hl=%.0f" % self.half_life)
+        if self.conviction or self.agreement:
+            parts.append("ens=%+.2f/%.2f" % (self.conviction, self.agreement))
         return " ".join(parts)
 
 
@@ -132,6 +168,18 @@ class Prepared:
                                         cfg.swing_right, "low")
         self.swings_high = F.find_swings(self.high, cfg.swing_left,
                                          cfg.swing_right, "high")
+        # --- advanced regime + strategy ensemble (optional, causal) ---------
+        self.regimes = None
+        self.ensemble = None
+        if cfg.regime_mode == "advanced":
+            self.regimes = RG.scan(bars)
+        if cfg.ensemble and self.regimes is not None:
+            self.series = ST.prepare(bars)
+            self.ensemble = RT.scan(
+                self.series, self.regimes,
+                RT.RouterConfig(ensemble_veto=cfg.ensemble_veto,
+                                agreement_veto=cfg.ensemble_agreement,
+                                veto_min_weight=cfg.ensemble_min_weight))
 
 
 def prepare(bars, cfg=None):
@@ -208,8 +256,14 @@ def _technical(p, i, cfg):
     return t, votes, names
 
 
-def _regime(p, i, cfg):
-    """-> (name, score). Names: trend_up / trend_down / high_vol / range."""
+# The label -> layer-score map is the mandate's: a with-trend entry gets the
+# full 1.0, a counter-trend one gets 0.0 and is vetoed below. Only the SOURCE of
+# the label changed, never the mapping.
+REGIME_SCORE = {"trend_up": 1.0, "range": 0.5, "high_vol": 0.25, "trend_down": 0.0}
+
+
+def _regime_legacy(p, i, cfg):
+    """The original single-statistic rule: SMA200 slope + ATR%. Kept for A/B."""
     if i < cfg.regime_slope_n or not math.isfinite(p.sma_regime[i]):
         return "range", 0.5
     prev = p.sma_regime[i - cfg.regime_slope_n]
@@ -226,6 +280,21 @@ def _regime(p, i, cfg):
     if math.isfinite(ap) and ap > cfg.atr_hi:
         return "high_vol", 0.25
     return "range", 0.5
+
+
+def _regime(p, i, cfg):
+    """-> (name, score). Names: trend_up / trend_down / high_vol / range.
+
+    Default path is the advanced multi-axis engine. It is strictly better
+    informed than a single SMA200 slope: a slope rule is a low-volatility
+    filter in disguise on equities (where low vol and uptrends coincide) and
+    stops working the moment you move to FX.
+    """
+    if cfg.regime_mode == "legacy" or p.regimes is None:
+        return _regime_legacy(p, i, cfg)
+    st = p.regimes[i]
+    label = st.label if st.label in REGIME_SCORE else "range"
+    return label, REGIME_SCORE[label]
 
 
 def _cross(ctx, cfg):
@@ -274,6 +343,25 @@ def evaluate(p, i, ctx=None, cfg=None):
     need = cfg.min_factors_event if (ctx and ctx.event_driven) else cfg.min_factors
     if not v.veto and v.votes < need:
         v.veto, v.veto_reason = True, "insufficient-confluence"
+
+    # --- strategy ensemble: BLOCK only, never promote --------------------
+    #
+    # This is deliberately the last gate and it can only ever say no. An
+    # ensemble that can talk you into a trade can talk you into a bad one, and
+    # S must stay exactly the mandate's weighted sum.
+    if p.ensemble is not None:
+        ev = p.ensemble[i]
+        v.conviction, v.agreement = ev.conviction, ev.agreement
+        if not v.veto and RT.should_veto_long(
+                ev, RT.RouterConfig(ensemble_veto=cfg.ensemble_veto,
+                                    agreement_veto=cfg.ensemble_agreement,
+                                    veto_min_weight=cfg.ensemble_min_weight)):
+            v.veto, v.veto_reason = True, "ensemble-opposed"
+
+    if p.regimes is not None:
+        st = p.regimes[i]
+        v.trend_score = st.trend_score
+        v.half_life = st.half_life
 
     return v
 

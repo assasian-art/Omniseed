@@ -1835,5 +1835,139 @@ RWKV-7 0.1B edge brain untouched and well under 400 MB (the Monster is Python).
 The **2 % per-trade ceiling** and the **3 % daily / 6 % weekly kill-switch** are
 unchanged and still enforced in C++. No guaranteed-profit claim anywhere.
 
+---
+
+## 23. MONSTER M8 — REGIME ENGINE + STRATEGY ENSEMBLE + FUNDING CARRY (2026-09-26)
+
+The second Monster milestone. Adds the *adaptive* half: knowing **what kind of
+market this is** and switching engines accordingly, plus the one non-directional
+edge in the book.
+
+### New modules (`tools/monster/`)
+
+| module | lines | role |
+|---|---|---|
+| `regime.py` | ~700 | multi-axis causal regime engine |
+| `strategies.py` | ~520 | the strategy zoo + vol-target overlay |
+| `router.py` | ~190 | regime-adaptive continuous allocation |
+| `funding.py` | ~330 | perpetual funding-rate carry scanner |
+
+### What the regime engine does
+
+Eight independent directional statistics (variance ratio, Hurst, efficiency
+ratio, ADX, choppiness, linreg R², ρ(1), MA-ribbon consistency) blended into a
+continuous `trend_score`, plus a Yang-Zhang volatility axis and an OU half-life
+for tradeability. Hysteresis on the label. Replaces the single SMA200-slope rule
+as the R layer's source (that rule is kept behind `--regime-mode legacy`); the
+label→score mapping is unchanged, so **`S` is untouched**.
+
+Thresholds are **calibrated against measured distributions**: at `trend_hi=0.65`
+the detector keeps 86% of true trend bars and only 12.6% of random-walk bars.
+The full table is in `docs/MONSTER_DESIGN.md` §5.2.
+
+### Five bugs the tests and smoke runs caught
+
+1. **Hurst on price levels** returned `H > 1` — not a number Hurst can be. It
+   must run on the increments.
+2. **ER horizon mismatch.** ER(20) read 0.04 on a market that pulled back for 20
+   bars inside a 200-bar uptrend, flipping the label to "range". ER is now swept
+   over 10/20/40 and the normalized readings averaged.
+3. **Yang-Zhang collapses.** It is a *variance*, so on constant returns it is
+   exactly 0 → NaN, even when the intraday range is 12%. `ATR/close` (a level,
+   which cannot collapse) is combined in with max. Separately, ranking against a
+   **flat history** made the percentile pin to 1.0 — maximum stress for a dead
+   series. A flat history now reads 0.5.
+4. **The volatility axis measured a BAR, not a REGIME.** This is the one that
+   blocked the milestone, and it only became visible once the engine was wired
+   into the sniper. Ranking the raw latest Yang-Zhang estimate against its own
+   history fires on *every* volatility-expansion bar — and an entry bar is a
+   volatility-expansion bar by construction. The arithmetic is fatal:
+   `max S while labelled high_vol = .25·1 + .35·1 + .25·0.25 + .15·1 = 0.8125`,
+   below the 0.85 bar, so the gate could never open. Fixed by (a) ranking the
+   **smoothed** estimate (mean of the last `vol_smooth = 5` readings) — a regime
+   is a *persistent* elevation, so one spike moves it by 1/5 while a real regime
+   shift moves all five — and (b) additionally requiring **absolute** stress
+   (`atr_stress > 0`), because a pure 90th-percentile rank marks ~10–15% of all
+   bars stressed by construction. `RegimeState.stressed` now carries the
+   conjunction so the hysteresis tracker latches on what the label uses.
+5. **The ensemble veto fired on a lone signal.** `agreement` is a *share*, so one
+   low-confidence OFI proxy scored 1.00 and vetoed every long in a live smoke
+   test. A weight floor (≥ 0.50) was added; the regression test is in
+   `test_monster_strategies.py`.
+
+Also fixed: `RegimeState` numeric slots now default to NaN rather than `None`
+(a `None` propagated into `math.isfinite()` and raised `TypeError` far from the
+cause), and `SniperVerdict.detail()` is None-safe.
+
+### A structural finding about the technical layer
+
+Measured factor counts over a 340-bar fixture:
+`trend-align 140 | macd-thrust 43 | vwap-reclaim 6 | bb-oversold 1`.
+
+The six "independent" factors are **not** independent — they cluster into a
+*trend* group and a *pullback* group. So `votes ≥ 3` effectively means "a
+pullback that reclaims inside an uptrend": coherent and demanding, but far rarer
+than "three of six boxes ticked" suggests. On a steady uptrend the maximum
+reachable is 2 votes. Documented in `docs/MONSTER_DESIGN.md` §6.4.
+
+**Consequence for the old sniper fixture:** it alternated drift every 50 bars,
+i.e. it was a *chop*. The legacy SMA200-slope rule called it `trend_up`, which
+supplied R=1.0 on exactly the bars that had 3 votes — so the old "0.85 is
+reachable" test was passing for the wrong reason. The advanced engine correctly
+reads it as `range`, and the fixture was rebuilt around a genuine pullback-and-
+reclaim inside an uptrend.
+
+### The strategy ensemble
+
+`momentum` (Donchian breakout + ribbon) · `mean_reversion` (z-score fade, gated
+on the OU half-life) · `breakout` (Bollinger-inside-Keltner squeeze) · `ofi`
+(Cont-Kukanov-Stoikov order flow imbalance) · `vol_target` (Moreira-Muir
+inverse-variance exposure). The router blends them by regime fit:
+
+```
+w_trend = sigmoid(6·(trend_score − 0.5))
+conviction = Σ w·dir / Σ w        agreement = Σ_{agreeing} w / Σ w
+```
+
+Continuous by design — a binary switch maximizes whipsaw cost exactly when the
+classifier is least sure. The ensemble adds one **fail-closed** gate
+(`ensemble-opposed`) and is structurally incapable of raising `S`.
+
+The exact CKS OFI and `β = c/depth^λ` are implemented and unit-tested against
+hand-computed values. Free OHLCV has no book, so the shipped path is a
+signed-volume proxy, labelled `NOT-cks` and discounted 30%.
+
+### Funding-rate carry
+
+The one non-directional strategy. Delta-neutral long-spot / short-perp capturing
+the funding payment. `APR = rate × periods_per_year` (8h → 1095). Ranked on
+**net** APR after round-trip fees, spread and cost of capital — never gross.
+Worked test example: a memecoin at **21.90% gross** is blocked (500 bps basis,
+150 bps spot spread) and ranks *below* a clean 13.14% gross trade netting 2.22%.
+Six blocking risk flags. Delta-neutral ≠ risk-free, stated in the module docstring
+itself (a test asserts it).
+
+### Test evidence
+
+| suite | checks | result |
+|---|---|---|
+| `omniseed_monster_regime` | 45 | 45/45 |
+| `omniseed_monster_strategies` | 66 | 66/66 |
+| `omniseed_monster_funding` | 47 | 47/47 |
+| `omniseed_monster_features` | 51 | 51/51 (unchanged) |
+| `omniseed_monster_news` | 51 | 51/51 (unchanged) |
+| `omniseed_monster_sniper` | 45 | see below |
+
+Every new module carries a **prefix-invariance** (no-look-ahead) proof, and the
+regime suite is built on series whose ground truth is known by construction
+(trend / OU / random walk) rather than on whatever the code happens to output.
+
+### Constraints honoured
+
+RWKV-7 0.1B edge brain untouched, well under 400 MB. The **2 % per-trade
+ceiling** and the **3 % daily / 6 % weekly kill-switch** are unchanged and still
+enforced in C++. The engine-facing CSV schema is still 5 columns, so the C++
+side needed **no** change. No guaranteed-profit claim anywhere.
+
 
 
