@@ -1742,5 +1742,98 @@ unchanged — **network in Python, engine never opens a socket**. New doc sectio
 - `omniseed_trading_edge` (115) and `omniseed_trading` (2129) unchanged green —
   the `PaperBroker`/`PositionManager` additions are additive.
 
+---
+
+## 22. MONSTER TRADING MODEL — SNIPER ENTRY + NEWS HUNTER + CROSS-ASSET (2026-09-26)
+
+**Branch** `feature/monster-trading-model`. Design doc: `docs/MONSTER_DESIGN.md`.
+
+### What it is
+
+A four-layer **sniper confidence score** plus an event-driven news hunter and a
+cross-asset confirmation filter, all in Python, feeding the C++ paper engine a
+single distilled row per bar.
+
+```
+S = 0.25·M (microstructure) + 0.35·T (technical) + 0.25·R (regime) + 0.15·C (cross)
+entry  <=>  no hard veto  AND  S >= 0.85  AND  the engine's own signal says Buy
+```
+
+### Files
+
+| file | role |
+|---|---|
+| `docs/MONSTER_DESIGN.md` | the math, the citations, the honest-scope notes |
+| `tools/monster/features.py` | no-look-ahead primitives (SMA/EMA/RSI/MACD/ATR, VWAP, z-score, Pearson, Amihud, Kyle-λ proxy, swings, Fibonacci) |
+| `tools/monster/sniper_engine.py` | 4-layer weighted score + hard vetoes |
+| `tools/monster/news_hunter.py` | keyword weight × exp(−Δt/τ) × sentiment alignment, crossed with a volume anomaly |
+| `tools/monster/correlation_matrix.py` | rolling matrix + lead-lag confirm/invalidate |
+| `tools/monster/sizing.py` | ATR + confidence scaled risk, clamped to `[1%,2%]` |
+| `tools/monster/state_vector.py` | the distilled vector + the engine-facing CSV |
+| `tools/monster_scan.py` | CLI: provenance CSVs → `state/monster/*.csv` |
+| `include/omniseed/trading/paper_daemon.h` / `src/trading/paper_daemon.cpp` | `MonsterPoint`, `load_monster_csv`, the **fail-closed** gate |
+| `src/agent2/main.cpp` | `--monster-features`, `--monster-min-conf` |
+| `tools/paper_loop.py` | `--monster-features`: refresh features each cycle before the session |
+
+### Design decisions worth recording
+
+- **Path deviation.** The mandate asked for `omniseed/trading/*.py`; in this repo
+  that directory is C++17. The Python orchestration layer lives in `tools/`, so
+  the modules live in `tools/monster/`. Documented at the top of the design doc.
+- **The engine gains ONE seam.** Heavy logic stays in Python; C++ reads
+  `ts,confidence,veto,regime,detail`. The gate is **fail-closed**: no row, a
+  veto, or a low score all block. It never touches exits.
+- **A gate that can never open is a bug.** The first cut used `T = votes/6`,
+  capping the reachable total at ≈0.81 — the mandated 0.85 bar was
+  mathematically unreachable. `T` now pays 0.90 for meeting the mandated
+  three-factor confluence and 0.10 per extra factor. A textbook setup reaches
+  **S = 0.865**; 420 bars of real daily data produce nothing at 0.85.
+- **`M` takes the max, not a blend, of order-book imbalance and volume z.** A
+  blend lets a quiet book dilute a real volume spike, which is backwards.
+- **Cross-asset needs TWO checks.** Coherence (the follower moved as the assumed
+  sign predicts) *and* alignment (the target is moving our way). A perfectly
+  coherent complex dragging the target against us confirms the OPPOSITE trade.
+  A *flat* follower is no information and must never count as an invalidation.
+- **Sizing shares the engine's band.** `sizing.py` clamps to the same
+  `[kMinRiskPerTradePct, kMaxRiskPerTradePct] = [1%, 2%]` the C++ engine
+  enforces, so the Python plan and the engine can never disagree.
+
+### Test evidence
+
+- `tests/test_monster_features.py` (ctest `omniseed_monster_features`) —
+  **51 checks, 0 failures**: indicator correctness plus the **no-look-ahead
+  proof** (every primitive's value at index `i` is byte-identical whether or not
+  later bars exist; a swing is invisible until `idx + right`).
+- `tests/test_monster_sniper.py` (ctest `omniseed_monster_sniper`) —
+  **49 checks, 0 failures**: regime classification, all four hard vetoes,
+  event-driven relaxation, score arithmetic, **0.85 reachability**, the sizing
+  band never leaving `[1%,2%]` under adversarial inputs, cross-asset
+  confirm/invalidate including the short and responder cases.
+- `tests/test_monster_news.py` (ctest `omniseed_monster_news`) —
+  **51 checks, 0 failures**: keyword weights, exponential decay, alignment,
+  anomaly detection, match-requires-both-halves, state-vector CSV round-trip,
+  scan CLI end-to-end (including a symbol with no CSV and the news path).
+- `omniseed_paper_session` — **69 checks, 0 failures** (was 47; +22 for the
+  Monster gate: pass-through, low confidence, veto, missing file ⇒ fail closed,
+  signal-log annotation).
+
+### Live integration smoke
+
+Real 420-bar basket (AAPL / BTCUSDT / EURUSD), fresh journal:
+
+```
+--monster-min-conf 0.85  ->  0 entries, 166 blocked   (fail-closed)
+--monster-min-conf 0.70  ->  1 entry,   160 blocked   (the gate really gates)
+```
+
+The journal records `monster-block:<sym>:veto:range` and every `signal` row
+carries the verdict, e.g. `monster[S=0.640 range]`.
+
+### Constraints honoured
+
+RWKV-7 0.1B edge brain untouched and well under 400 MB (the Monster is Python).
+The **2 % per-trade ceiling** and the **3 % daily / 6 % weekly kill-switch** are
+unchanged and still enforced in C++. No guaranteed-profit claim anywhere.
+
 
 

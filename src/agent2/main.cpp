@@ -80,7 +80,10 @@ void print_usage() {
         "                    BTCUSDT,crypto,models/market/BTCUSDT_1d.csv\"\n"
         "                    [--skip SYM,...] [--journal state/paper_journal.csv]\n"
         "                    [--no-signal-journal]\n"
+        "                    [--monster-features state/monster]\n"
+        "                    [--monster-min-conf 0.85]\n"
         "                    multi-asset paper trading over a merged timeline\n"
+        "                    (--monster-features adds the sniper confidence gate)\n"
         "  introspect        self-model, goals, rationale, purpose\n"
         "  metacognition     confidence calibration + knowledge gaps\n"
         "  cloud             cloud-reasoning bridge status (optional key)\n"
@@ -119,6 +122,9 @@ struct Args {
     std::string streams;            // "SYM,ASSET,CSV[;SYM,ASSET,CSV...]"
     std::string skip;               // comma list of symbols whose feed is not OK
     bool    signal_journal = true;  // journal every non-Hold signal
+    // --- Monster gate (tools/monster) ---
+    std::string monster_dir;        // dir of <SYMBOL>.csv feature files
+    double  monster_min_conf = 0.85;// sniper confidence bar for an entry
 };
 
 Args parse_args(int argc, char** argv, int start) {
@@ -150,6 +156,9 @@ Args parse_args(int argc, char** argv, int start) {
         else if (s == "--streams" && has_val) a.streams = v;
         else if (s == "--skip" && has_val) a.skip = v;
         else if (s == "--no-signal-journal") { a.signal_journal = false; continue; }
+        else if (s == "--monster-features" && has_val) a.monster_dir = v;
+        else if (s == "--monster-min-conf" && has_val)
+            a.monster_min_conf = std::atof(v.c_str());
         else if (s == "--anchored") { a.anchored = true; continue; }
         if (has_val && (s.rfind("--", 0) == 0)) ++i;
     }
@@ -494,6 +503,8 @@ int cmd_trading_paper_session(const Args& a) {
     cfg.broker.starting_cash = a.capital;
     cfg.streams = streams;
     cfg.journal_signals = a.signal_journal;
+    cfg.monster_dir = a.monster_dir;
+    cfg.monster_min_conf = a.monster_min_conf;
 
     const PaperSessionResult res = PaperSession::run(cfg, journal);
     journal.close();
@@ -526,6 +537,12 @@ int cmd_trading_paper_session(const Args& a) {
                 static_cast<long long>(res.halts),
                 static_cast<long long>(res.abstains),
                 static_cast<long long>(res.refused));
+    if (!a.monster_dir.empty() || res.monster_blocked > 0) {
+        std::printf("  monster     : %lld blocked (gate: %s, S>=%.2f)\n",
+                    static_cast<long long>(res.monster_blocked),
+                    a.monster_dir.empty() ? "inline" : a.monster_dir.c_str(),
+                    a.monster_min_conf);
+    }
     std::printf("  equity      : %.2f (sharpe %.2f, maxDD %.2f%%)\n",
                 res.final_equity, res.metrics.sharpe,
                 res.metrics.max_drawdown_pct);

@@ -322,6 +322,40 @@ python tools/paper_dashboard.py --out state/dashboard.html
 * The **dashboard** is one self-contained HTML file — inline CSS, an inline SVG
   equity curve, and plain tables. No CDN, no external assets, no JavaScript.
 
+## 5e. The Monster layer — sniper entry + news hunter + cross-asset
+
+The full math lives in **`docs/MONSTER_DESIGN.md`**; the operational summary is
+in `docs/TRADING_LAB.md` §6. The short version:
+
+```bash
+# 1. Turn provenance CSVs into per-symbol sniper feature CSVs.
+python tools/monster_scan.py --watch equity:AAPL,crypto:BTCUSDT,fx:EURUSD \
+    --csv-dir models/market/paper --out-dir state/monster
+
+# 2. Gate paper entries on the distilled confidence (fails closed).
+omniseed_agent2 trading-paper-session \
+    --streams "AAPL,equity,models/market/paper/AAPL_1d.csv" \
+    --monster-features state/monster --monster-min-conf 0.85
+
+# 3. Or let the loop do both every cycle.
+python tools/paper_loop.py --monster-features state/monster
+```
+
+The score is `S = 0.25·M + 0.35·T + 0.25·R + 0.15·C` — microstructure, technical
+confluence (≥3 of 6 independent factors), regime, and cross-asset confirmation.
+An entry needs **no hard veto AND `S ≥ 0.85`**, *and* the engine's own signal
+generator must also say Buy.
+
+Three things worth knowing:
+
+* **It fails closed.** No Monster row for that bar ⇒ no entry. A missing feature
+  file is a refusal, not an error.
+* **It only gates entries.** Stops and exits are never blocked, so a position
+  can always be closed.
+* **The 2 % ceiling is unchanged.** `sizing.py` clamps to the same `[1%, 2%]`
+  band the C++ engine enforces, so the Python layer cannot exceed it even if it
+  were wrong.
+
 ## 6. Cloud reasoning (optional) — the TLS story, plainly
 
 The zero-dependency runtime has **no TLS stack**. Consequences:
@@ -379,3 +413,13 @@ The T7+/M-series suites (also ctest):
   health → ABSTAIN, engine invocation, status heartbeat. (Python, venv-gated.)
 * `omniseed_paper_reports` — journal parsing, book replay, day P&L,
   Markdown/HTML rendering, opt-in SMTP config. (Python, venv-gated.)
+* `omniseed_monster_features` — indicator correctness and the **no-look-ahead
+  proof**: every primitive's value at index `i` is unchanged by later bars.
+  (Python, venv-gated.)
+* `omniseed_monster_sniper` — layer arithmetic, every hard veto, the
+  **reachability of the 0.85 bar**, the `[1%,2%]` adaptive sizing band, and
+  cross-asset confirmation/invalidation. (Python, venv-gated.)
+* `omniseed_monster_news` — keyword weights, exponential recency decay,
+  sentiment alignment, volume-anomaly detection, the rule that an event-driven
+  match requires BOTH halves, the engine-facing CSV round-trip, and the scan
+  CLI. (Python, venv-gated.)

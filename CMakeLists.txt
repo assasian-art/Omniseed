@@ -419,6 +419,34 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_paper_reports.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_paper_reports PROPERTIES TIMEOUT 300)
+
+        # Monster layer (tools/monster): no-look-ahead feature primitives.
+        add_test(NAME omniseed_monster_features
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_features.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_features PROPERTIES TIMEOUT 300)
+
+        # Monster sniper engine: layer arithmetic, hard vetoes, the reachable
+        # 0.85 bar, the [1%,2%] adaptive sizing band, cross-asset invalidation.
+        add_test(NAME omniseed_monster_sniper
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_sniper.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_sniper PROPERTIES TIMEOUT 300)
+
+        # Monster news hunter + state vector + scan CLI (offline).
+        add_test(NAME omniseed_monster_news
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_news.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_news PROPERTIES TIMEOUT 300)
     endif()
 endif()
 

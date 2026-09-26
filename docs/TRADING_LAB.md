@@ -211,18 +211,116 @@ not failures.
 
 ---
 
-## 6. What is *not* here yet
+## 6. The Monster layer (sniper entry + news hunter + cross-asset)
 
-Tracked honestly so it is not mistaken for done:
+Full math and honest-scope notes: **`docs/MONSTER_DESIGN.md`**. This section is
+the operational summary.
 
-* Order-book imbalance, funding-rate scans, on-chain flows, event-calendar and
-  social-volume signals (M7) — planned, not built.
-* News/sentiment rationale per signal and a regime detector (M2) — planned.
-* The strategy factory with automatic promotion/retirement (M3) — planned.
+### Where it runs
+
+Heavy logic is Python (`tools/monster/`); the C++ engine gains exactly one
+seam. The engine never computes an indicator for the Monster — it reads a
+**distilled** row per bar:
+
+```
+ts,confidence,veto,regime,detail
+```
+
+| module | role |
+|---|---|
+| `tools/monster/features.py` | no-look-ahead primitives (SMA/EMA/RSI/MACD/ATR, rolling VWAP, z-score, Pearson, Amihud illiquidity, Kyle-lambda proxy, swings, Fibonacci) |
+| `tools/monster/sniper_engine.py` | the weighted 4-layer confidence score + hard vetoes |
+| `tools/monster/news_hunter.py` | keyword-weighted events x recency decay x volume anomaly |
+| `tools/monster/correlation_matrix.py` | lead-lag confirmation / invalidation |
+| `tools/monster/sizing.py` | ATR- and confidence-scaled risk, clamped to `[1%, 2%]` |
+| `tools/monster/state_vector.py` | the distilled vector + the engine-facing CSV |
+| `tools/monster_scan.py` | CLI: provenance CSVs → `state/monster/*.csv` |
+
+### The score
+
+```
+S = 0.25·M + 0.35·T + 0.25·R + 0.15·C            (all layers in [0,1])
+```
+
+* **M** microstructure — volume-anomaly z-score (logistic), or order-book
+  imbalance when the provider publishes depth (the **stronger** of the two).
+* **T** technical — six independent bullish factors (VWAP reclaim, RSI
+  divergence, Fibonacci support, MACD thrust, Bollinger oversold, trend
+  alignment). **At least 3 must agree.**
+* **R** regime — `trend_up` / `trend_down` / `high_vol` / `range`. A long in a
+  macro downtrend is **vetoed** unless a verified mean-reversion setup is
+  present (oversold *and* below the lower band *and* bullish divergence).
+* **C** cross-asset — lead-lag confirmation / invalidation from the rolling
+  correlation matrix.
+
+An entry needs **no veto AND `S >= 0.85`**. The engine's own signal generator
+must *also* say Buy, so the two layers have to line up.
+
+> **A gate that can never open is a bug, not discipline.** The first cut scored
+> `T = votes/6`, which caps the reachable total at ≈0.81 — the 0.85 bar was
+> mathematically unreachable. `T` now pays 0.90 for meeting the mandated
+> three-factor confluence and 0.10 per extra factor. A textbook setup reaches
+> **S = 0.865**; on 420 bars of real daily data nothing clears 0.85, which is
+> the intended behaviour for a sniper.
+
+### The gate in the engine
+
+```bash
+omniseed_agent2 trading-paper-session \
+    --streams "AAPL,equity,models/market/paper/AAPL_1d.csv" \
+    --monster-features state/monster --monster-min-conf 0.85
+```
+
+**It fails closed.** No row for that bar, `veto=1`, or `confidence <` the bar
+all block the entry. A missing feature file is not an error — it is a refusal.
+The gate only ever blocks *entries*: stops and exits are never touched.
+
+`tools/paper_loop.py --monster-features state/monster` refreshes the feature
+CSVs before every session, so the whole loop is wired end to end.
+
+### What a live run looks like
+
+Against the real 420-bar demo basket (AAPL / BTCUSDT / EURUSD):
+
+```
+  actions     : 0 entries, 0 exits, 0 halts, 0 abstains, 0 refused
+  monster     : 166 blocked (gate: state/monster, S>=0.85)
+```
+
+and with the bar lowered to 0.70, to prove the gate is actually gating rather
+than simply off:
+
+```
+  actions     : 1 entries, 1 exits, 0 halts, 0 abstains, 0 refused
+  monster     : 160 blocked (gate: state/monster, S>=0.70)
+```
+
+The journal records `monster-block:<sym>:<veto|no-row|S=..<..>` events, and every
+`signal` row carries the distilled verdict, e.g. `monster[S=0.640 range]`.
+
+### Hard constraints
+
+The 2 % per-trade ceiling and the 3 % daily / 6 % weekly kill-switch are
+**unchanged and enforced in C++**. The Monster's `sizing.py` clamps to the same
+`[1%, 2%]` band the engine enforces, so a bug in the Python layer still cannot
+exceed 2 %. Nothing here claims an edge.
 
 ---
 
-## 7. Test evidence
+## 7. What is *not* here yet
+
+Tracked honestly so it is not mistaken for done:
+
+* Funding-rate scans, on-chain flows, event-calendar and social-volume signals
+  (M7 extras) — planned, not built. *(Order-book imbalance now has a path in
+  the Monster's `M` layer, but no live depth provider is wired.)*
+* The strategy factory with automatic promotion/retirement (M3) — planned.
+* News is fetched by the caller (`tools/fetch_news.py`) and passed in; the
+  Monster does not yet run its own background poller inside the loop.
+
+---
+
+## 8. Test evidence
 
 | Suite                        | What it pins down                                             |
 |------------------------------|--------------------------------------------------------------|
@@ -230,9 +328,12 @@ Tracked honestly so it is not mistaken for done:
 | `omniseed_market_feeds`      | adapters, cache, limiter, normalisation, provenance reuse, meme refusal, explicit failure |
 | `omniseed_market_data`       | T6 fetcher integrity (provenance, exit-2, no silent synth)    |
 | `omniseed_trading_edge`      | walk-forward no-look-ahead, risk clamp, daily kill-switch, journal append/resume |
-| `omniseed_paper_session`     | multi-asset merged timeline, per-asset gates, ABSTAIN, composite kill-switch, journal-based resume, determinism |
+| `omniseed_paper_session`     | multi-asset merged timeline, per-asset gates, ABSTAIN, composite kill-switch, resume, determinism, **Monster gate (fail-closed, veto, threshold)** |
 | `omniseed_paper_loop`        | watch parsing, CSV merge/dedup, feed health → ABSTAIN, engine invocation, status heartbeat |
 | `omniseed_paper_reports`     | journal parsing, book replay, day P&L, Markdown/HTML rendering, opt-in SMTP config |
+| `omniseed_monster_features`  | indicator correctness + the **no-look-ahead proof** (prefix invariance) |
+| `omniseed_monster_sniper`    | layer arithmetic, every hard veto, **0.85 reachability**, `[1%,2%]` sizing band, cross-asset invalidation |
+| `omniseed_monster_news`      | keyword weights, recency decay, sentiment alignment, anomaly detection, event match requires BOTH halves, CSV round-trip, scan CLI |
 
 Run the board with `ctest --test-dir build -C Release`.
 
