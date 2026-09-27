@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>OmniSeed — paper dashboard</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b23; --line:#242b36; --fg:#e6e9ef;
+    --muted:#8b93a7; --up:#e5484d; --down:#2fbf71; --accent:#5b9dff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); }
+  h1 { margin:0 0 4px; font-size:20px; }
+  .muted { color:var(--muted); }
+  main { padding:20px 24px 48px; max-width:1100px; margin:0 auto; }
+  section { margin-bottom:28px; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.06em;
+        color:var(--muted); margin:0 0 12px; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:12px; }
+  .kpi { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:12px 14px; }
+  .kpi-label { color:var(--muted); font-size:12px; }
+  .kpi-value { font-size:20px; font-weight:600; margin-top:4px; }
+  .card { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; overflow:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line);
+           white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .up { color:var(--up); } .down { color:var(--down); }
+  .flat { color:var(--muted); }
+  .badge { padding:2px 8px; border-radius:999px; font-size:12px; }
+  .badge.ok { background:rgba(47,191,113,.15); color:var(--down); }
+  .badge.warn { background:rgba(229,72,77,.15); color:var(--up); }
+  .meter { display:inline-block; width:38px; height:5px; margin-left:7px;
+            vertical-align:middle; background:#242b36; border-radius:3px;
+            overflow:hidden; }
+  .meter > i { display:block; height:100%; background:var(--accent); }
+  footer { color:var(--muted); font-size:12px; border-top:1px solid var(--line);
+            padding:16px 24px; }
+  code { background:#0b0e13; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OmniSeed — paper trading dashboard</h1>
+  <div class="muted">mode: paper
+    · generated — · day 1970-01-01 UTC
+    · journal <code>state\paper_journal.csv</code>
+    · <span id="live-note">static snapshot</span></div>
+</header>
+<main>
+  <section><h2>Headline</h2><div class="kpis"><div class='kpi'><div class='kpi-label'>Equity</div><div class='kpi-value flat' id="kpi-equity">0.00</div></div><div class='kpi'><div class='kpi-label'>Today&#x27;s P&amp;L</div><div class='kpi-value flat' id="kpi-daypnl">+0.00</div></div><div class='kpi'><div class='kpi-label'>Today %</div><div class='kpi-value flat' id="kpi-daypct">+0.00%</div></div><div class='kpi'><div class='kpi-label'>Open positions</div><div class='kpi-value ' id="kpi-positions">0</div></div><div class='kpi'><div class='kpi-label'>Kill-switch trips</div><div class='kpi-value ' id="kpi-halts">0</div></div><div class='kpi'><div class='kpi-label'>Feeds OK</div><div class='kpi-value '>0/1</div></div></div></section>
+  <section><h2>Equity curve</h2><div class="card"><p class='muted'>Not enough history for an equity curve yet.</p></div></section>
+  <section><h2>Open positions</h2><div class="card"><table><thead><tr><th>symbol</th><th>qty</th><th>entry</th><th>stop</th><th>to stop</th><th>confidence</th><th>last</th><th>unrealized</th></tr></thead><tbody id='pos-body'><tr><td colspan='7' class='muted'>The book is flat.</td></tr></tbody></table></div></section>
+  <section><h2>Regime status</h2><div class="card"><table><thead><tr><th>symbol</th><th>regime</th><th>direction</th><th>trend</th><th>vol</th><th>stressed</th></tr></thead><tbody id='regime-body'><tr><td colspan='6' class='muted'>No regime reading in the heartbeat. Run <code>tools/paper_loop.py</code> (needs <code>tools/monster/regime.py</code>) to populate it.</td></tr></tbody></table></div></section>
+  <section><h2>Feed health</h2><div class="card"><table><thead><tr><th>symbol</th><th>asset</th><th>provider</th><th>state</th><th>24h</th><th>last</th><th>reason</th></tr></thead><tbody><tr><td>AAPL</td><td>equity</td><td>yahoo</td><td><span class='badge warn'>ABSTAIN</span></td><td class='num up'>+1.47%</td><td class='num'>341.1</td><td>dead-feed</td></tr></tbody></table></div></section>
+  <section><h2>Recent fills</h2><div class="card"><p class='muted'>No fills recorded.</p></div></section>
+  <section><h2>Risk</h2><div class="card">
+    <table><tbody>
+      <tr><td>Per-trade risk budget</td><td class="num">2.0% of equity</td></tr>
+      <tr><td>Per-position stop</td><td class="num">8.0%</td></tr>
+      <tr><td>Daily kill-switch</td><td class="num">3.0%</td></tr>
+      <tr><td>Weekly kill-switch</td><td class="num">6.0%</td></tr>
+      <tr><td>Kill-switch trips (lifetime)</td><td class="num">0</td></tr>
+      <tr><td>ABSTAIN events</td><td class="num">0</td></tr>
+      <tr><td>Risk-gate refusals</td><td class="num">0</td></tr>
+      <tr><td>Signals journalled</td><td class="num">0</td></tr>
+      <tr><td>Records</td><td class="num">0</td></tr>
+    </tbody></table>
+    <p class="muted" style="margin:10px 0 0">Limits are enforced in the C++
+    engine; this page only reports them.</p></div></section>
+</main>
+<footer>Educational analytics. Losses are minimized by discipline, never eliminated. Past performance does not guarantee future results. Paper trading only — no real orders are ever placed.</footer>
+
+<script>
+(function () {
+  var POLL = 15000;
+  var note = document.getElementById('live-note');
+  if (location.protocol === 'file:') {
+    if (note) note.textContent = 'static snapshot — run tools/serve_dashboard.py for live updates';
+    return;
+  }
+  function money(x) { return (x === null || x === undefined) ? '\u2014'
+      : Number(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+  function signed(x) { var v = Number(x || 0); return (v >= 0 ? '+' : '-') + money(Math.abs(v)); }
+  function pnlClass(x) { return x > 0 ? 'up' : (x < 0 ? 'down' : 'flat'); }
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+  function isoDay(ts) { return new Date(ts * 1000).toISOString().slice(0, 10); }
+  function setText(id, txt) { var e = document.getElementById(id); if (e) e.textContent = txt; }
+
+  function drawCurve(c) {
+    var poly = document.getElementById('eq-poly');
+    if (!poly || !c || c.length < 2) return;
+    var W = 920, H = 260, P = 34;
+    var ts = c.map(function (p) { return p[0]; }), eq = c.map(function (p) { return p[1]; });
+    var lo = Math.min.apply(null, eq), hi = Math.max.apply(null, eq);
+    if (hi - lo < 1e-9) hi = lo + 1;
+    var t0 = Math.min.apply(null, ts), t1 = Math.max.apply(null, ts), span = (t1 - t0) || 1;
+    poly.setAttribute('points', c.map(function (p) {
+      return (P + (p[0] - t0) / span * (W - 2 * P)).toFixed(1) + ',' +
+             (H - P - (p[1] - lo) / (hi - lo) * (H - 2 * P)).toFixed(1);
+    }).join(' '));
+    poly.setAttribute('stroke', eq[eq.length - 1] >= eq[0] ? '#e5484d' : '#2fbf71');
+    setText('eq-hi', money(hi)); setText('eq-lo', money(lo));
+    setText('eq-first', isoDay(t0)); setText('eq-last', isoDay(t1));
+  }
+
+  function drawPositions(pos) {
+    var body = document.getElementById('pos-body');
+    if (!body) return;
+    var syms = Object.keys(pos || {}).sort();
+    if (!syms.length) { body.innerHTML = "<tr><td colspan='7' class='muted'>The book is flat.</td></tr>"; return; }
+    body.innerHTML = syms.map(function (s) {
+      var p = pos[s], stop = p.stop, dist = (stop !== null && stop !== undefined && p.last)
+          ? ((stop / p.last - 1) * 100).toFixed(2) + '%' : '\u2014';
+      var conf = (p.confidence === null || p.confidence === undefined) ? "<span class='muted'>\u2014</span>"
+          : Math.round(p.confidence * 100) + "%<span class='meter'><i style='width:" +
+            Math.round(p.confidence * 100) + "%'></i></span>";
+      return "<tr><td>" + esc(s) + "</td><td class='num'>" + Number(p.qty || 0).toFixed(4) +
+        "</td><td class='num'>" + money(p.avg) + "</td><td class='num'>" + money(stop) +
+        "</td><td class='num'><span class='muted'>" + dist + "</span></td>" +
+        "<td class='num'>" + conf + "</td><td class='num'>" + money(p.last) +
+        "</td><td class='num " + pnlClass(p.unrealized) + "'>" + signed(p.unrealized) + "</td></tr>";
+    }).join('');
+  }
+
+  function drawRegime(reg) {
+    var body = document.getElementById('regime-body');
+    if (!body) return;
+    var syms = Object.keys(reg || {}).sort();
+    if (!syms.length) { body.innerHTML = "<tr><td colspan='6' class='muted'>No regime reading in the heartbeat.</td></tr>"; return; }
+    body.innerHTML = syms.map(function (s) {
+      var r = reg[s] || {}, cls = ({trend_up:'up', trend_down:'down', high_vol:'warn', range:'flat'})[r.label] || 'flat';
+      function n(x, d) { return (typeof x === 'number' && isFinite(x)) ? x.toFixed(d) : '\u2014'; }
+      return "<tr><td>" + esc(s) + "</td><td><span class='badge " + cls + "'>" + esc(r.label || '?') +
+        "</span></td><td>" + esc(r.direction || '\u2014') + "</td><td class='num'>" + n(r.trend_score, 3) +
+        "</td><td class='num'>" + n(r.vol_score, 2) + "</td><td class='num'>" + (r.stressed ? 'yes' : 'no') + "</td></tr>";
+    }).join('');
+  }
+
+  function render(s) {
+    setText('kpi-equity', money(s.equity));
+    setText('kpi-daypnl', signed(s.day_pnl));
+    setText('kpi-daypct', (s.day_pct >= 0 ? '+' : '') + Number(s.day_pct || 0).toFixed(2) + '%');
+    setText('kpi-positions', String(Object.keys(s.positions || {}).length));
+    setText('kpi-halts', String(s.halts || 0));
+    var fe = document.getElementById('kpi-equity'), dp = document.getElementById('kpi-daypnl');
+    if (fe) fe.className = 'kpi-value ' + pnlClass(s.equity - s.first_equity);
+    if (dp) dp.className = 'kpi-value ' + pnlClass(s.day_pnl);
+    drawCurve(s.curve); drawPositions(s.positions); drawRegime(s.regime);
+    if (note) note.textContent = 'live · updated ' + new Date().toISOString().slice(11, 19) + ' UTC';
+  }
+
+  function tick() {
+    fetch('api/state', {cache: 'no-store'})
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(render)
+      .catch(function () { if (note) note.textContent = 'live poll failed — retrying'; });
+  }
+  tick();
+  setInterval(tick, POLL);
+})();
+</script>
+
+</body>
+</html>

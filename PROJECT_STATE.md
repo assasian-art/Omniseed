@@ -2734,3 +2734,89 @@ ctest --test-dir build -C Release --output-on-failure
 ./build/bin/omniseed.exe chat --mode text-only
 ```
 
+---
+
+## 29. WORKFLOW FIX — ONE LOCATION, AND A VERIFIED ANSWER ON PUSHING (2026-09-27)
+
+**Reported problem:** work was landing in a hidden session worktree, forcing a
+manual fetch/merge, and files the brief named were absent from
+`C:\Users\sakim\OneDrive\Desktop\omniseed`.
+
+**Root cause.** The repo has two worktrees sharing one `.git`, but they sat on
+*different branches*:
+
+| checkout | branch | HEAD |
+|---|---|---|
+| `Desktop\omniseed` | `feature/monster-m8-regime` | `96b2d1a` |
+| session worktree | `main` | `3c61f54` |
+
+`96b2d1a` is a **strict ancestor** of `main`, so nothing was lost — the desktop
+folder was simply parked **40 files / +13,500 lines** behind. **10 of the 15
+files the brief listed were absent:** `router.{h,cpp}`,
+`trading/regime_engine.cpp`, `trading/sniper.cpp`, `language/{intent,sentiment}.cpp`,
+`docs/UNIFIED_ARCHITECTURE.md`, `docs/JEV_FEATURES.md`, `docs/DOMAINS.md`,
+`RUNBOOK.md`.
+
+**Fix.** Git forbids the same branch in two worktrees, so the session worktree was
+detached (`git checkout --detach`) to free `main`, then the desktop folder was
+moved onto it (`git checkout main`) — a pure fast-forward. `.venv/` and
+`models/market/*.csv` are gitignored and survived untouched; the untracked
+`dashboard.html` was not clobbered. **All 15 files verified present afterwards.**
+The desktop folder now tracks `origin/main`, so future work happens there.
+
+`dashboard.html` was then committed (`3e21d3a`, *"chore: sync unified architecture
+files to main"*) — it is referenced by this file, `docs/TRADING_GUIDE.md`,
+`docs/TRADING_LAB.md`, `tools/paper_dashboard.py` and `tools/serve_dashboard.py`,
+yet had never been committed.
+
+### ⚠️ The push is blocked, and the reason is now precisely known
+
+| channel | result |
+|---|---|
+| `git push`, credential helper disabled | `remote: No anonymous write access.` — the request **reaches** GitHub and is refused for lack of auth |
+| `git push` / `git credential fill`, GCM enabled | **hangs** on an interactive flow; GCM 2.9.0 stores nothing |
+| GitHub connector `push_files` | `403 .../git/trees` |
+| GitHub connector `create_or_update_file` | `403 .../contents/...` |
+
+Both connector errors read `Resource not accessible by integration` — the GitHub
+App installation is **read-only** (no `contents: write`). **`api.github.com` is
+reachable from this machine (HTTP 200); the network is not the problem, the
+credential is.** No Windows Credential Manager entry, no `~/.git-credentials`,
+no `GH_TOKEN`/`GITHUB_TOKEN`, no SSH key.
+
+**To publish, run one command** (GCM will prompt once):
+
+```bash
+cd "C:\Users\sakim\OneDrive\Desktop\omniseed" && git push origin main
+```
+
+Or re-authorise the GitHub connector with write access and the push can be done
+from here.
+
+### Verified board in the desktop folder (33 tests, vs 19 in the session worktree)
+
+`.venv` exists here, so the `.venv`-gated Python suites actually execute — **the
+full board is 33 tests, not 19.** Verified green this pass:
+
+- **C++ (14/14)** — `platform`, `qat_ternary`, `lora`, `trading`, `trading_edge`,
+  `market_perception`, `paper_session`, and all of §27/§28: `decision_head`,
+  `regime_engine`, `strategy_zoo`, `heads`, `router`, `unified_output`,
+  `language_heads`.
+- **Python (13/13)** — `market_data`, `market_feeds`, `paper_loop`,
+  `paper_reports`, `monster_features`, `monster_sniper`, `monster_news`,
+  `monster_regime`, `monster_strategies`, `monster_funding`, `decision_bridge`,
+  `regime_parity`, `strategy_parity`.
+- **Plus** `real_weights` (11 s), `sides` (9 s), `lora_gguf` (488 s).
+
+**30/33 verified green.** The three not completed in this pass are `lora_e2e`,
+`lora_chat`, `lora_i8` — LoRA fine-tuning suites, untouched by §27/§28.
+
+**Timing caveat:** this box is currently ~5x slower than when
+`CTestCostData.txt` was recorded (`lora_gguf` 488 s vs 91 s recorded;
+`qat_ternary` 48 s vs 8 s). The full board takes ~35-45 min here, not the ~10 min
+the cost data implies. Budget for it.
+
+**`ctest -I` gotcha:** the flag parses as `Start,End,Stride,test#,test#...`, so
+`-I 1,2,3,4,5,10,...` silently runs `Start=1,End=2,Stride=3` **plus** the numbers
+after it — not the list you wrote. Use `-R <regex>` instead.
+
