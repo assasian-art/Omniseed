@@ -82,9 +82,21 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-19 tests as of this writing. Expect ~5 minutes — two Python parity suites
-dominate it (`omniseed_strategy_parity` is ~140 s, `omniseed_regime_parity`
-~38 s).
+20 tests on a fresh clone (no `.venv`), **34** in a checkout that has one — see
+the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
+one, because the LoRA suites alone can take ~8 minutes each.
+
+To skip the four slow LoRA suites while iterating:
+
+```bash
+ctest --test-dir build -C Release --output-on-failure \
+      -E "omniseed_lora_e2e|omniseed_lora_gguf|omniseed_lora_chat|omniseed_lora_i8"
+```
+
+⚠️ **`ctest -I` is not a test-number list.** The flag parses as
+`Start,End,Stride,test#,test#...`, so `-I 1,2,3,4,5,10,...` silently runs
+`Start=1,End=2,Stride=3` **plus** the numbers after it — not the list you wrote.
+Use `-R <regex>` or `-E <regex>`.
 
 ### ⚠️ A green board is NOT a complete green board
 
@@ -117,6 +129,7 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_router.exe           # 348 checks, incl. the <100 us budget
 ./build/bin/omniseed_unified_output.exe   # 267 checks, incl. the fast path
 ./build/bin/omniseed_language_heads.exe   # 614 checks
+./build/bin/omniseed_soul.exe             # 242 checks, persona + honesty gate
 ```
 
 These four print measured latency, so running them is also how you re-measure:
@@ -207,6 +220,39 @@ pipe.router().set_config(c.router);        // both, or the fast path sees stale 
 > **`trained()` is false and `provenance()` says `NOT FULLY FITTED` until every
 > row is fitted.** A seeded head emits well-formed but meaningless values. Do not
 > ship a decision on one. See `docs/JEV_FEATURES.md` §2.
+
+### Turning on the soul
+
+The soul is **off by default**, so existing paths produce byte-identical
+documents. Turn it on deliberately:
+
+```cpp
+UnifiedPipeline::Config c = pipe.config();
+c.use_soul = true;                  // then re-init: pipe.init(768)
+pipe.set_config(c);
+pipe.init(768);                     // init() applies the config
+
+SoulState st = pipe.soul().perceive("I'm worried, this is urgent");
+UnifiedOutput out = pipe.run(h, std::string("I'm worried, this is urgent"));
+std::printf("%s\n", out.to_json().c_str());   // now carries a "soul" section
+```
+
+Or use the soul on its own — it needs no model and no hidden state:
+
+```cpp
+Soul soul; soul.init();
+SoulState st = soul.perceive("make me a guaranteed profit");
+std::string reply = soul.speak("Here is the plan.", st);
+//  st.persona.stance == Refuse, value_id == "no_guarantees"
+//  reply == "I won't do that. ..." — the base reply is REPLACED, not wrapped.
+
+soul.record("buy 50 AAPL", "uptrend + MACD agree", 0.72);
+soul.resolve(+0.031);                            // realised outcome
+std::printf("%s\n", soul.capability_report().c_str());
+```
+
+Full design, the three ordering rules, and the honest limitations:
+**`docs/SOUL.md`**.
 
 ---
 

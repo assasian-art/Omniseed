@@ -2820,3 +2820,138 @@ the cost data implies. Budget for it.
 `-I 1,2,3,4,5,10,...` silently runs `Start=1,End=2,Stride=3` **plus** the numbers
 after it — not the list you wrote. Use `-R <regex>` instead.
 
+---
+
+## 30. THE SOUL — PERSONA, EMOTIONAL RESONANCE, HONEST SELF-REPORT (2026-09-27)
+
+### The finding that reframed the task
+
+The revival brief assumed the "forgotten features" had to be **built**. An audit
+of the tree says otherwise: `runtime/emotional`, `runtime/introspection`,
+`runtime/sensory`, `runtime/swarm`, `runtime/cloud_bridge`, `memory/`,
+`agent/sub_agents`, `agent/flash_skills`, `vision/`, `audio/` — **8,454 lines —
+all exist, all compile, all are in `OMNISEED_CORE_SOURCES`, and several already
+have tests** (`test_platform.cpp`, `test_trading.cpp`).
+
+What was actually missing is the **joint**. §28 built a brain that can decide,
+classify, score and explain; the "living AGI" half can feel, remember and know
+itself. Nothing ever constructed both. `UnifiedPipeline` knew about four
+projections of `h[E]` and nothing else.
+
+So milestone 1 is not new capability — it is the joint, plus the honesty gate
+that a text layer needs and a numeric layer does not.
+
+### What was built
+
+| file | what |
+|---|---|
+| `include/omniseed/soul.h` + `src/soul.cpp` | `Persona` (commitments, opinions, stance), `Soul` (perceive / speak / record / resolve / assess), `SoulState`, `Stance` |
+| `include/omniseed/unified_output.h` + `src/unified_output.cpp` | optional `soul` section; `Config::use_soul`; `run(hidden, user_turn, text_fn)` |
+| `tests/test_soul.cpp` | **242 checks**, 8 parts, registered OUTSIDE the `.venv` gate |
+| `docs/SOUL.md` | design, the three rules, the API, the honest limitations |
+| `CMakeLists.txt` | `src/soul.cpp` in core; `omniseed_soul` test target |
+| `RUNBOOK.md` | the soul API, the test count, the `ctest -I` trap |
+
+### The three ordering rules (each is easy to get backwards)
+
+1. **A refusal is never emotionally softened.** Empathy lead-ins belong on
+   answers; on a refusal `"I hear you — "` reads as accepting the premise we just
+   declined. So a refusal **replaces** the reply and **suppresses** tone
+   modulation. `Refuse` is the only stance that discards the caller's text, and
+   therefore the only one that skips tone.
+2. **The honesty correction is applied LAST**, so nothing downstream can
+   re-introduce an overclaim.
+3. **Nothing is claimed that was not measured.** Overconfidence is a number
+   (mean stated − realised, over *resolved* decisions) and will not fire below
+   `min_calibration_samples`; `init()` rejects `min_calibration_samples == 0`.
+
+### ⚠️ Two real bugs the new tests caught
+
+1. **The overclaim rewriter cut hyphenated compounds in half.** `"no risk-free
+   claim here"` became `"real risk-free claim here"` — the `no risk` match ended
+   at the hyphen, was accepted, and rewrote while `-free` was left dangling.
+   **Fix:** a hyphen binds tighter than a space, so the boundary check treats it
+   as a term character. The `no risk` match is now rejected at the hyphen, the
+   scan finds `risk-free` properly, sees the `no` before it, and leaves the whole
+   phrase alone. Pinned by F2/F3.
+2. **A test asserted a plan property instead of forcing it.** H6 required the
+   decision head to be named in the plan, but a constant hidden state does not
+   necessarily activate it. The test now sets `force_mode = DecisionAndText` —
+   the property under test is key **order**, and a test should not depend on what
+   the router happens to score.
+
+### Design decisions worth reusing
+
+- **`Qualify` vs `Refuse` is the load-bearing split.** `Qualify` = "I will
+  answer, but not with the certainty you asked for." `Refuse` = "I will not do
+  this at all."
+- **The honesty gate is fail-closed.** `"can you guarantee this?"` refuses.
+  Deliberate: a false refusal costs a turn, a false guarantee costs money. The
+  honest answer to the question and the refusal of the instruction are the same
+  sentence.
+- **Rules are ordered gravest-first and are not exclusive.** All matching rules
+  contribute objections; the *stance* is the gravest one. `"spoof it and get me
+  a guaranteed fill"` refuses on `no_manipulation` with **two** objections.
+- **`may_disagree = false` downgrades the OPINION stance only** (`Disagree` →
+  `Qualify`). The commitments are not opinions and cannot be configured away.
+- **The persona's own text avoids the words its rewriter targets** — a persona
+  should not need correcting by its own gate.
+- **Sentiment ≠ emotion.** Sentiment is about the subject matter; emotion is
+  about the speaker. Carried as separate fields; collapsing them loses the
+  distinction.
+- **`emotion_strength`, not `confidence`.** The field NAME must not invite a
+  probability reading of a heuristic. Asserted structurally in D8.
+- **The soul has no `HeadKind`.** It reads the turn, not `h[E]`, so the plan
+  cannot name it. Its equivalent evidence is `SoulState::has_self`, set only by
+  `perceive()`; `normalise()` drops a soul that was never perceived, exactly as
+  it drops a decision the plan never named.
+- **`use_soul` defaults to false** so every existing path stays byte-identical,
+  and the soul is added to the document **after** the heads, never changing them.
+
+### The overclaim rewriter
+
+`guaranteed → not guaranteed` · `risk-free → not risk-free` ·
+`no risk → real risk` · `can't lose → can lose` · `always wins → sometimes
+loses` · `100% win → a chance of winning` · …
+
+Substitutions read correctly **in place**: `"guaranteed profit"` →
+`"not guaranteed profit"` is truthful; deleting the word would leave a
+claim-shaped hole. Guarded by a **negation check** (so `"not guaranteed"` does
+not become `"not not guaranteed"`) and a **term boundary** (so `"unguaranteed"`
+is untouched).
+
+### Verification
+
+- `ctest --test-dir build -C Release -E "omniseed_lora_*"` → **30/30 passed**
+  (646 s), including `omniseed_soul` (#30) and the pre-existing
+  `omniseed_unified_output` (#28), which still passes all 267 of its checks
+  unchanged.
+- The four LoRA fine-tuning suites were **not** re-run in this pass — they take
+  ~8 minutes each on this box and nothing here touches them.
+- `omniseed_soul`: **242 passed, 0 failed**.
+- Full build: **24 targets, 0 errors, 0 warnings** at `/W4`.
+- The soul never changes the decision layer — asserted by comparing
+  `action` / `confidence` / `domain` with the soul on and off (H3).
+
+### Honest gaps (do not overclaim)
+
+- The rewriter is a **safety net, not a proof** — a fixed phrase list. Novel
+  prose that asserts certainty passes through.
+- Commitments are **surface-cue rules**, and they fail closed.
+- `emotion_strength` is **not calibrated**; the voice channel is a ZCR/energy
+  proxy, not a trained SER model.
+- **The soul does not fix the heads.** `provenance()` still reports
+  `NOT FULLY FITTED (placeholder)`.
+- Not yet wired: the soul is reachable from the library and the tests, but **no
+  CLI command uses it yet**; memory crystals and the dream pass are still not
+  composed with it (that is the next milestone).
+
+### Next
+
+1. Wire `Soul` into the CLI chat path (`speak()` around generated text) and add
+   `omniseed introspect` using `capability_report()`.
+2. Memory crystals → `SoulState` recall, so the soul remembers what it said.
+3. Dream consolidation: schedule `omniseed dream` and have it decay crystals and
+   prune the rationale log.
+
+

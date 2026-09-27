@@ -58,6 +58,10 @@ set(OMNISEED_CORE_SOURCES
     src/scoring_head.cpp
     src/domain_decision.cpp
     src/unified_output.cpp
+    # The soul: persona + emotional resonance + honest self-report. Composes
+    # runtime/emotional and runtime/introspection, which existed but had no
+    # caller, into something the unified document can carry.
+    src/soul.cpp
     # Language domain: deterministic, offline intent / language / sentiment.
     src/language/intent.cpp
     src/language/sentiment.cpp
@@ -686,6 +690,25 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_language_heads COMMAND omniseed_language_heads
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_language_heads PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # The soul: the persona's commitments and refusal rules, emotional fusion
+    # through the existing runtime/emotional layer, the overclaim rewriter that
+    # makes "guaranteed" unable to leave the process, and the honest
+    # self-report built from resolved decisions. Registered OUTSIDE the .venv
+    # gate on purpose — a gate that never executes is not a gate.
+    add_executable(omniseed_soul tests/test_soul.cpp)
+    target_include_directories(omniseed_soul PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_soul PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_soul PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_soul PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_soul COMMAND omniseed_soul
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_soul PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.

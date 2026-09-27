@@ -51,6 +51,15 @@ int32_t UnifiedOutput::normalise() {
         warnings.push_back("dropped score: not named in the activation plan");
         ++dropped;
     }
+    // The soul has no HeadKind — it reads the turn, not h[E], so the plan
+    // cannot name it. Its evidence of having run is `has_self`, which only
+    // Soul::perceive() sets. Same rule, different witness.
+    if (has_soul && !soul.has_self) {
+        has_soul = false;
+        soul = SoulState();
+        warnings.push_back("dropped soul: never perceived a turn");
+        ++dropped;
+    }
     return dropped;
 }
 
@@ -59,6 +68,7 @@ bool UnifiedOutput::consistent() const {
     if (has_text && !router.has(HeadKind::Token)) return false;
     if (has_classification && !router.has(HeadKind::Classify)) return false;
     if (has_score && !router.has(HeadKind::Score)) return false;
+    if (has_soul && !soul.has_self) return false;
     return true;
 }
 
@@ -66,8 +76,9 @@ std::string UnifiedOutput::to_json() const {
     std::string out = "{\"router\":";
     out += router.to_json();
 
-    // Order is the mandate's: router, decision, text, classification, score.
-    // A reader scanning the document top-down sees the plan before its results.
+    // Order is the mandate's: router, decision, text, classification, score,
+    // then soul. A reader scanning the document top-down sees the plan before
+    // its results, and the machine-readable heads before the human one.
     if (has_decision) {
         out += ",\"decision\":";
         out += decision.to_json();
@@ -84,6 +95,10 @@ std::string UnifiedOutput::to_json() const {
     if (has_score) {
         out += ",\"score\":";
         out += score.to_json();
+    }
+    if (has_soul) {
+        out += ",\"soul\":";
+        out += soul.to_json();
     }
     if (!warnings.empty()) {
         out += ",\"warnings\":[";
@@ -122,6 +137,14 @@ bool UnifiedPipeline::init(int32_t n_embd, uint32_t seed) {
     add_default_label_sets(classifier_);
     add_default_domains(decisions_);
 
+    // The soul stage is initialised only when it is configured to run, so a
+    // caller that never asks for it cannot be broken by a bad soul config.
+    soul_ready_ = false;
+    if (cfg_.use_soul) {
+        if (!soul_.init(cfg_.soul)) { error_ = soul_.error(); return false; }
+        soul_ready_ = true;
+    }
+
     ready_ = true;
     return true;
 }
@@ -137,6 +160,11 @@ std::string UnifiedPipeline::provenance() const {
     out += " | decisions="; out += decisions_.provenance();
     out += " | classifier="; out += classifier_.provenance();
     out += " | scorer="; out += scorer_.provenance();
+    // The soul is the one stage whose honesty does not depend on fitted
+    // weights: it reports a measured calibration gap, not a projection.
+    out += " | soul=";
+    out += soul_ready_ ? "active (rule-based, self-reporting)"
+                       : "not configured";
     out += trained() ? " | ALL FITTED" : " | NOT FULLY FITTED (placeholder)";
     return out;
 }
@@ -203,6 +231,29 @@ UnifiedOutput UnifiedPipeline::run(
 
 UnifiedOutput UnifiedPipeline::run(const float* hidden) const {
     return run(hidden, std::function<std::string(const DomainDecision&)>());
+}
+
+UnifiedOutput UnifiedPipeline::run(
+    const float* hidden, const std::string& user_turn,
+    const std::function<std::string(const DomainDecision&)>& text_fn) const {
+    // The heads first, exactly as before — the soul must never change what the
+    // decision layer produced, only add to the document.
+    UnifiedOutput out = run(hidden, text_fn);
+
+    if (!soul_ready_ || user_turn.empty()) return out;
+
+    out.soul = soul_.perceive(user_turn);
+    out.has_soul = out.soul.has_self;
+    // Re-normalise so the soul obeys the same "present iff computed" rule the
+    // heads do, even if a future caller sets has_soul by hand.
+    out.normalise();
+    return out;
+}
+
+UnifiedOutput UnifiedPipeline::run(const float* hidden,
+                                   const std::string& user_turn) const {
+    return run(hidden, user_turn,
+               std::function<std::string(const DomainDecision&)>());
 }
 
 } // namespace omniseed
