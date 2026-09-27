@@ -46,6 +46,10 @@ endif()
 
 # ----------------------------- Core static library ---------------------------
 set(OMNISEED_CORE_SOURCES
+    # System-1 decision head ("two heads, one brain"): hidden state -> action
+    # distribution in one matvec. Sits above core/ because it is a decision
+    # layer that both the agent loop and the trading runtime consume.
+    src/decision_head.cpp
     src/core/platform.cpp
     src/core/tensor.cpp
     src/core/bitlinear.cpp
@@ -480,6 +484,53 @@ if(OMNISEED_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_monster_funding PROPERTIES TIMEOUT 300)
     endif()
+
+    # Decision bridge (T2 integration): the C++ DecisionResult JSON contract,
+    # fail-closed screening ("silence is not consent"), entry provenance
+    # round-trip through the frozen journal CSV, the dashboard panels
+    # (entry/stop/confidence, day P&L, regime), the DecisionGate fail-closed
+    # matrix, regime reading, and the local HTTP server routes.
+    #
+    # Stdlib-only, so it deliberately does NOT sit behind the .venv gate above:
+    # it must run in CI (where no .venv exists) because it re-reads the C++
+    # risk headers and fails if the Python copy of the 2%/3%/8% limits drifts.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(EXISTS "${OMNISEED_VENV_PY}")
+        set(OMNISEED_TEST_PY "${OMNISEED_VENV_PY}")
+    elseif(Python3_Interpreter_FOUND)
+        set(OMNISEED_TEST_PY "${Python3_EXECUTABLE}")
+    else()
+        set(OMNISEED_TEST_PY "")
+    endif()
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_decision_bridge
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decision_bridge.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_decision_bridge PROPERTIES TIMEOUT 300)
+    endif()
+
+    # System-1 decision head ("two heads, one brain"): action space + labels,
+    # the one-matvec contract, softmax/argmax, fail-closed routing (ABSTAIN and
+    # EXPLAIN never self-route), confidence/margin gates, determinism, input
+    # immutability, persistence round-trip + rejection paths, and the >=100x
+    # speed claim against the cheapest possible System-2 token step.
+    # Fully offline: no model, no GGUF, no network.
+    add_executable(omniseed_decision_head tests/test_decision_head.cpp)
+    target_include_directories(omniseed_decision_head PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_decision_head PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_decision_head PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_decision_head PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_decision_head COMMAND omniseed_decision_head
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_decision_head PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

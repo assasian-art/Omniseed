@@ -93,6 +93,17 @@ void print_usage() {
         "  --assistant-mode    shorthand for --assistant-lora with the default\n"
         "                      sidecar path\n"
         "  --seed S         sampling seed, deterministic per seed\n"
+        "  --mode M         System-1 decision head routing:\n"
+        "                     off            System-2 only (default)\n"
+        "                     hybrid         consult the head first; act on it\n"
+        "                                    when confident, else generate text\n"
+        "                     decision-only  never generate text; return the\n"
+        "                                    head's decision (or ABSTAIN)\n"
+        "  --decision-threshold F  self-routing confidence bar (default 0.85)\n"
+        "  --decision-head PATH    fitted projection blob for the head; without\n"
+        "                          it the head is an UNTRAINED placeholder\n"
+        "                          whose decisions are structurally valid but\n"
+        "                          meaningless (see docs/JEV_INTEGRATION.md)\n"
         "  --quiet          suppress info logs\n");
 }
 
@@ -529,6 +540,12 @@ struct Session {
     int32_t    eval_tokens = 2048;  // ppl: token budget
     std::vector<std::string> stop_strings;   // --stop (repeatable)
 
+    // System-1 decision head ("two heads, one brain"). Off by default so the
+    // CLI behaves exactly as before unless asked otherwise.
+    DecisionMode decision_mode      = DecisionMode::Off;
+    float        decision_threshold = 0.85f;
+    std::string  decision_head_path;   // fitted projection blob (optional)
+
     Tokenizer tok;
     std::unique_ptr<RwkvModel> model;
     std::unique_ptr<LoraAdapter> lora;
@@ -660,6 +677,31 @@ int cmd_gen(Session& s) {
     return 0;
 }
 
+// Bring the System-1 decision head up and report its provenance honestly.
+// A head with no fitted projection is a PLACEHOLDER: say so loudly rather
+// than letting the operator read its routing as a judgement.
+static void announce_decision_mode(AgentLoop& loop, const AgentLoop::Config& cfg) {
+    if (cfg.decision_mode == DecisionMode::Off) return;
+
+    if (!loop.ensure_decision_head()) {
+        platform::log_warn("--mode %s requested but the decision head is "
+                           "unavailable; falling back to System-2 only",
+                           decision_mode_name(cfg.decision_mode));
+        return;
+    }
+    const DecisionHead& dh = loop.decision_head();
+    platform::log_info("decision head: mode=%s E=%d actions=%d threshold=%.2f %s",
+                       decision_mode_name(cfg.decision_mode), dh.hidden_size(),
+                       dh.action_count(), dh.threshold(),
+                       dh.trained() ? "fitted" : "UNTRAINED");
+    if (!dh.trained()) {
+        platform::log_warn("decision head has no fitted projection (%s): its "
+                           "decisions are well-formed but MEANINGLESS — pass "
+                           "--decision-head to supply real weights",
+                           dh.provenance().c_str());
+    }
+}
+
 int cmd_ask(Session& s) {
     if (!s.load()) return 1;
 
@@ -674,13 +716,21 @@ int cmd_ask(Session& s) {
     AgentLoop::Config cfg;
     cfg.max_new_tokens = s.max_tokens;
     cfg.stop_strings = s.stop_strings;
+    cfg.decision_mode      = s.decision_mode;
+    cfg.decision_threshold = s.decision_threshold;
+    cfg.decision_head_path = s.decision_head_path;
 
     AgentLoop loop(*s.model, s.tok, tools, mem, thr, imp, cfg);
+    announce_decision_mode(loop, cfg);
     const AgentLoop::Result r = loop.run(s.prompt);
 
     std::printf("%s\n", r.reply.c_str());
     for (const std::string& t : r.tool_trace) {
         std::printf("[tool] %s\n", t.c_str());
+    }
+    if (r.decision_checked) {
+        std::printf("[decision] %s%s\n", r.decision.to_json().c_str(),
+                    r.decision_fast_path ? "  <- System-1 answered" : "");
     }
     std::printf("[%.0f ms, peak %.1f MB]\n", r.ms,
                 static_cast<double>(r.peak_rss) / 1048576.0);
@@ -792,6 +842,9 @@ int cmd_chat(Session& s) {
     cfg.top_k = s.top_k;
     cfg.repeat_penalty = s.repeat_penalty;
     cfg.stop_strings = s.stop_strings;
+    cfg.decision_mode      = s.decision_mode;
+    cfg.decision_threshold = s.decision_threshold;
+    cfg.decision_head_path = s.decision_head_path;
     // Streaming: print each piece as it is decoded, then finish the line
     // after generation completes (Result.reply holds the same text).
     cfg.on_token = [](const std::string& piece) {
@@ -799,6 +852,7 @@ int cmd_chat(Session& s) {
         std::fflush(stdout);
     };
     AgentLoop loop(*s.model, s.tok, tools, mem, thr, imp, cfg);
+    announce_decision_mode(loop, cfg);
 
     RwkvState st;
     s.model->init_state(st);
@@ -815,6 +869,10 @@ int cmd_chat(Session& s) {
         std::printf("\n");
         for (const std::string& t : r.tool_trace)
             std::printf("[tool] %s\n", t.c_str());
+        // Show what System-1 said, and whether it answered by itself.
+        if (r.decision_checked)
+            std::printf("[decision] %s%s\n", r.decision.to_json().c_str(),
+                        r.decision_fast_path ? "  <- System-1 answered" : "");
     }
     return 0;
 }
@@ -855,6 +913,27 @@ int main(int argc, char** argv) {
             s.assistant_lora = "models/assistant-lora.gguf";
         else if (a == "--seed" && i + 1 < argc)
             s.seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--mode" && i + 1 < argc) {
+            const std::string m = argv[++i];
+            if (m == "off") {
+                s.decision_mode = DecisionMode::Off;
+            } else if (m == "hybrid") {
+                s.decision_mode = DecisionMode::Hybrid;
+            } else if (m == "decision-only" || m == "decision_only") {
+                s.decision_mode = DecisionMode::DecisionOnly;
+            } else {
+                // Refuse rather than silently defaulting: a typo that quietly
+                // turned the feature off would look like the feature failing.
+                platform::log_error("--mode: unknown value '%s' "
+                                    "(expected off | hybrid | decision-only)",
+                                    m.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--decision-threshold" && i + 1 < argc)
+            s.decision_threshold = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--decision-head" && i + 1 < argc)
+            s.decision_head_path = argv[++i];
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];
         else if (a == "--eval-tokens" && i + 1 < argc)
             s.eval_tokens = std::atoi(argv[++i]);

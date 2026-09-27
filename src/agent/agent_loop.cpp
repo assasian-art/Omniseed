@@ -18,6 +18,50 @@ namespace omniseed {
 const char* const kAssistantStopDefaults[3] = {
     "\nUser:", "\nAssistant:", "\nAssistant::"};
 
+const char* decision_mode_name(DecisionMode m) {
+    switch (m) {
+        case DecisionMode::Off:          return "off";
+        case DecisionMode::Hybrid:       return "hybrid";
+        case DecisionMode::DecisionOnly: return "decision-only";
+    }
+    return "unknown";
+}
+
+// ===========================================================================
+// System-1 head bring-up.
+//
+// Sized from the LOADED MODEL's config, never from a guess: a head built for
+// the wrong hidden width would project garbage and still report a confident
+// action, which is the worst possible failure mode for a decision layer.
+// ===========================================================================
+bool AgentLoop::ensure_decision_head() {
+    if (cfg_.decision_mode == DecisionMode::Off) return false;
+    if (decision_head_.ready()) return true;
+
+    if (!decision_head_.init(model_.config())) {
+        platform::log_warn("decision head: init failed (%s)",
+                           decision_head_.error().c_str());
+        return false;
+    }
+    if (!cfg_.decision_head_path.empty()) {
+        if (decision_head_.load(cfg_.decision_head_path)) {
+            platform::log_info("decision head: loaded %s (trained=%s)",
+                               cfg_.decision_head_path.c_str(),
+                               decision_head_.trained() ? "yes" : "no");
+        } else {
+            platform::log_warn("decision head: %s — keeping the seeded "
+                               "placeholder",
+                               decision_head_.error().c_str());
+        }
+    } else {
+        platform::log_warn("decision head: no projection supplied (--decision-head) "
+                           "— using the UNTRAINED seeded placeholder; decisions "
+                           "are well-formed but MEANINGLESS");
+    }
+    decision_head_.set_threshold(cfg_.decision_threshold);
+    return decision_head_.ready();
+}
+
 namespace {
 // Thread-local-ish handoff from generate() to run(): the uncertainty report
 // of the final answer pass's first logits. (AgentLoop is documented as
@@ -331,37 +375,89 @@ AgentLoop::Result AgentLoop::run(const std::string& user_input) {
         }
     }
 
+    // Turn epilogue, shared by every exit path below (System-1 fast path,
+    // decision-only abstain, and the normal System-2 answer).
+    auto finish_turn = [&]() -> Result {
+        improve_.record(key, trace, !trace.empty() &&
+                                        res.tool_trace.size() > 0 &&
+                                        !res.reply.empty(),
+                        platform::now_ms() - t0);
+        res.turns    = static_cast<int32_t>(res.tool_trace.size());
+        res.ms       = platform::now_ms() - t0;
+        res.peak_rss = platform::peak_rss_bytes();
+        return res;
+    };
+
+    // -----------------------------------------------------------------------
     // final answer pass
+    // -----------------------------------------------------------------------
     {
         const std::vector<int32_t> prompt = build_prompt(user_input, lv);
         Tensor logits("logits", {model_.config().n_vocab}, DType::F32);
-        if (prefix_hit) {
-            // Prefix fast path: the cached state already contains the system
-            // prompt + schemas; only the NEW tokens after the snapshot point
-            // need forwarding. (Snapshot is taken at the end of this turn —
-            // see below — so this turn still pays full prefill once.)
-            // NOTE: the cached state corresponds to the FULL previous prompt;
-            // we conservatively re-feed everything (correctness first), but
-            // skip re-feeding when the prompt is byte-identical to the
-            // snapshot's (the common single-session repeat case).
-            //
-            // Implementation: the snapshot stores tokens_seen; if our current
-            // prompt is the same length as the snapshot's, the prompt is
-            // (by construction of prefix_key usage) the same -> skip prefill.
-            if (static_cast<int64_t>(prompt.size()) == restored_tokens) {
-                // state already ends exactly at the prompt: no forward needed
-            } else {
-                for (const int32_t id : prompt) model_.forward(id, st, logits);
-            }
-        } else {
-            for (const int32_t id : prompt) model_.forward(id, st, logits);
-        }
         const int32_t seed = prompt.empty() ? Tokenizer::kBosId : prompt.back();
+
+        // System-1: bring the head up and consult it BEFORE any text exists.
+        const bool want_decision = ensure_decision_head();
+        Tensor hidden;                  // post-ln_out x[E] — the head's input
+        bool   have_hidden = false;
+
+        // Prefill, capturing the hidden state of the LAST prompt token only.
+        // The capture is a single E-float memcpy on that one step and is never
+        // fed back into the recurrence, so enabling it cannot change the
+        // tokens System-2 would have produced.
+        const bool reuse_state =
+            prefix_hit && static_cast<int64_t>(prompt.size()) == restored_tokens;
+        if (!reuse_state) {
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                const bool last = (i + 1 == prompt.size());
+                model_.forward(prompt[i], st, logits,
+                               (want_decision && last) ? &hidden : nullptr);
+                if (want_decision && last) have_hidden = true;
+            }
+        }
+
+        // ---- System-1 self-routing ----------------------------------------
+        if (want_decision && have_hidden) {
+            const DecisionResult d = decision_head_.decide(hidden);
+            res.decision            = d;
+            res.decision_checked    = true;
+            res.first_token_uncertainty = Uncertainty::analyze(logits);
+
+            if (d.fast_path) {
+                // Self-routed: System-1 answers, the token loop never runs.
+                res.decision_fast_path = true;
+                res.reply = d.to_json();
+                if (!cfg_.prefix_key.empty())
+                    prefix_cache_.store(cfg_.prefix_key, model_, st);
+                return finish_turn();
+            }
+            if (cfg_.decision_mode == DecisionMode::DecisionOnly) {
+                // DecisionOnly refuses to fall through. Emit the head's own
+                // verdict (normally ABSTAIN/EXPLAIN) rather than quietly
+                // generating text — the mode name would otherwise be a lie.
+                res.reply     = d.to_json();
+                res.abstained = true;
+                if (!cfg_.prefix_key.empty())
+                    prefix_cache_.store(cfg_.prefix_key, model_, st);
+                return finish_turn();
+            }
+            // Hybrid + low confidence: fall through to the full text path.
+        } else if (cfg_.decision_mode == DecisionMode::DecisionOnly) {
+            // decision-only, but the prefix fast path left us no fresh hidden
+            // state. Say so instead of silently generating text.
+            res.decision.routing = "error";
+            res.reply     = res.decision.to_json();
+            res.abstained = true;
+            return finish_turn();
+        }
+
         res.reply = generate(st, seed, throttle_.max_new_tokens(lv),
                              {Tokenizer::kAssistantEndId, Tokenizer::kEosId},
                              nullptr);
 
         // Uncertainty abstain (Phase-Omega): hedge flat/coin-flip answers.
+        // (Overrides the pre-generation probe above: this is the real answer
+        // pass's first-token distribution.)
         res.first_token_uncertainty = last_uncertainty_;
         if (!cfg_.abstain_hedge.empty() &&
             Uncertainty::should_abstain(last_uncertainty_, ucfg_)) {
@@ -374,16 +470,7 @@ AgentLoop::Result AgentLoop::run(const std::string& user_input) {
         if (!cfg_.prefix_key.empty()) prefix_cache_.store(cfg_.prefix_key, model_, st);
     }
 
-    // self-improvement bookkeeping
-    improve_.record(key, trace, !trace.empty() &&
-                                    res.tool_trace.size() > 0 &&
-                                    !res.reply.empty(),
-                    platform::now_ms() - t0);
-
-    res.turns = static_cast<int32_t>(res.tool_trace.size());
-    res.ms = platform::now_ms() - t0;
-    res.peak_rss = platform::peak_rss_bytes();
-    return res;
+    return finish_turn();
 }
 
 } // namespace omniseed

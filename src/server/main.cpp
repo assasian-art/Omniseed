@@ -115,6 +115,32 @@ void respond(Socket_t client, const std::string& body,
     send_all(client, body.c_str(), body.size());
 }
 
+// Escapes a string for embedding in a JSON response body. Model replies are
+// arbitrary text and routinely contain quotes; emitting them raw produced
+// invalid JSON, so every reply now goes through here.
+std::string json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 16);
+    for (const char c : s) {
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20u) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c & 0xFF);
+                    o += buf;
+                } else {
+                    o.push_back(c);
+                }
+        }
+    }
+    return o;
+}
+
 // Extracts "..." value for a top-level key from a small JSON body.
 std::string json_field(const std::string& body, const std::string& key) {
     const auto kpos = body.find("\"" + key + "\"");
@@ -451,11 +477,24 @@ int main(int argc, char** argv) {
     int port = kPort;
     std::string model_path = "./models/omniseed.gguf";
     std::string lora_path;
+    // System-1 decision head ("two heads, one brain"). Off by default so the
+    // server behaves exactly as before unless asked otherwise.
+    DecisionMode decision_mode = DecisionMode::Off;
+    float       decision_threshold = 0.85f;
+    std::string decision_head_path;
     // Documented deployment env (see Dockerfile): OMNISEED_MODEL is the
     // fallback default; an explicit --model flag wins.
     if (const char* env = std::getenv("OMNISEED_MODEL")) model_path = env;
     if (const char* env = std::getenv("OMNISEED_ASSISTANT_LORA"))
         lora_path = env;
+    // Same env-then-flag precedence for the decision head.
+    if (const char* env = std::getenv("OMNISEED_DECISION_MODE")) {
+        const std::string m = env;
+        if (m == "hybrid")             decision_mode = DecisionMode::Hybrid;
+        else if (m == "decision-only") decision_mode = DecisionMode::DecisionOnly;
+    }
+    if (const char* env = std::getenv("OMNISEED_DECISION_HEAD"))
+        decision_head_path = env;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc)
             port = std::atoi(argv[++i]);
@@ -463,6 +502,25 @@ int main(int argc, char** argv) {
             model_path = argv[++i];
         else if (std::strcmp(argv[i], "--assistant-lora") == 0 && i + 1 < argc)
             lora_path = argv[++i];
+        else if (std::strcmp(argv[i], "--decision-mode") == 0 && i + 1 < argc) {
+            const std::string m = argv[++i];
+            if (m == "off") {
+                decision_mode = DecisionMode::Off;
+            } else if (m == "hybrid") {
+                decision_mode = DecisionMode::Hybrid;
+            } else if (m == "decision-only" || m == "decision_only") {
+                decision_mode = DecisionMode::DecisionOnly;
+            } else {
+                platform::log_error("--decision-mode: unknown value '%s' "
+                                    "(expected off | hybrid | decision-only)",
+                                    m.c_str());
+                return 2;
+            }
+        }
+        else if (std::strcmp(argv[i], "--decision-threshold") == 0 && i + 1 < argc)
+            decision_threshold = static_cast<float>(std::atof(argv[++i]));
+        else if (std::strcmp(argv[i], "--decision-head") == 0 && i + 1 < argc)
+            decision_head_path = argv[++i];
     }
 
 #ifdef _WIN32
@@ -527,7 +585,29 @@ int main(int argc, char** argv) {
     ComputeThrottle thr;
     SelfImprovement imp;
     AgentLoop::Config cfg;
+    cfg.decision_mode      = decision_mode;
+    cfg.decision_threshold = decision_threshold;
+    cfg.decision_head_path = decision_head_path;
     AgentLoop loop(model, tok, tools, mem, thr, imp, cfg);
+    // Report head provenance once at startup. An unfitted head is a
+    // placeholder: the operator must know its routing is not a judgement.
+    if (cfg.decision_mode != DecisionMode::Off) {
+        if (loop.ensure_decision_head()) {
+            const DecisionHead& dh = loop.decision_head();
+            platform::log_info("decision head: mode=%s E=%d threshold=%.2f %s",
+                               decision_mode_name(cfg.decision_mode),
+                               dh.hidden_size(), dh.threshold(),
+                               dh.trained() ? "fitted" : "UNTRAINED placeholder");
+            if (!dh.trained())
+                platform::log_warn("decision head has no fitted projection: "
+                                   "decisions are well-formed but MEANINGLESS "
+                                   "(pass --decision-head)");
+        } else {
+            platform::log_warn("--decision-mode %s requested but the head is "
+                               "unavailable; System-2 only",
+                               decision_mode_name(cfg.decision_mode));
+        }
+    }
 
     while (true) {
         Socket_t client = ::accept(listener, nullptr, nullptr);
@@ -564,6 +644,13 @@ int main(int argc, char** argv) {
                                  ? (server_whisper->decoder_loaded()
                                         ? "\"real\"" : "\"fallback\"")
                                  : "false") +
+                            ",\"decision_mode\":\"" +
+                            decision_mode_name(cfg.decision_mode) + "\"" +
+                            ",\"decision_head\":" +
+                            (loop.decision_head().ready()
+                                 ? (loop.decision_head().trained()
+                                        ? "\"fitted\"" : "\"untrained\"")
+                                 : "false") +
                             ",\"peak_rss\":" +
                             std::to_string(platform::peak_rss_bytes() / 1048576) +
                             "}";
@@ -583,7 +670,16 @@ int main(int argc, char** argv) {
             // fields leave stops unchanged; "stop": [] reverts to defaults.
             loop.set_stop_strings(request_stops(body));
             const AgentLoop::Result r = loop.run(task);
-            respond(client, "{\"reply\":\"" + r.reply + "\"}");
+            // Additive fields: the decision head's verdict for this turn (when
+            // it was consulted) and whether System-1 answered on its own.
+            std::string b = "{\"reply\":\"" + json_escape(r.reply) + "\"";
+            if (r.decision_checked) {
+                b += ",\"decision\":" + r.decision.to_json();
+                b += ",\"fast_path\":";
+                b += r.decision_fast_path ? "true" : "false";
+            }
+            b += "}";
+            respond(client, b);
         } else if (path == "/gen" && method == "POST" && have_model) {
             const std::string prompt = json_field(body, "prompt");
             loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),

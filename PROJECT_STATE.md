@@ -1971,3 +1971,333 @@ side needed **no** change. No guaranteed-profit claim anywhere.
 
 
 
+
+## 24. T7+ — SYSTEM-1 DECISION HEAD: "TWO HEADS, ONE BRAIN" (2026-09-26)
+
+The architectural shift requested this pass: stop treating the core decision
+layer as something that needs a Python wrapper. System-1 decision capability now
+lives **inside the C++ runtime** — `omniseed.exe` reads a decision straight off
+the backbone's hidden state without generating a single token. New doc:
+`docs/JEV_INTEGRATION.md` (incl. the Jev/TypeSafe research and its limits).
+
+### C++ — the head (`include/omniseed/decision_head.h`, `src/decision_head.cpp`, new)
+
+- `DecisionHead` projects the post-`ln_out` residual `h[E]` onto a 7-action
+  space with **one matvec** `[A,E] x [E]` + softmax + argmax. No token loop is
+  reachable from `decide()`; it is allocation-free after the first call and
+  never mutates the recurrent state.
+- `DecisionResult { action_type, confidence_score, target_asset, invalidation,
+  margin, routing, fast_path, matvecs, ms }` + `to_json()`. `invalidation` is
+  the per-action *default* stop level: `0` means NOT SPECIFIED / unknown, which
+  is deliberately distinct from "no stop" — the head cannot recover a price
+  level from a hidden state, so the risk engine owns the real value.
+- Fail-closed routing: `ABSTAIN` and `EXPLAIN` can never self-route, however
+  confident. A near-tie fails the margin gate and escalates.
+- Persistence (self-describing LE blob, validated on load) with `set_action()`
+  as the offline-fitting hook. `trained()` is true only when **every** row is
+  fitted, so a half-populated head cannot masquerade as a real one.
+
+### C++ — the tap and the routing
+
+- `RwkvModel::forward` gained an optional `Tensor* hidden_out = nullptr`
+  (`src/core/rwkv.cpp`). It receives `xl3` — the same vector the text head
+  projects to logits. Taken *before* the vocab projection, never fed back into
+  the recurrence, and the tensor is reused across steps. `nullptr` is
+  bit-identical to the previous behaviour.
+- `agent_loop.cpp`: after the prompt prefill, `DecisionHead::decide(hidden)` runs
+  before any text exists. `confidence >= threshold` → the action is executed
+  immediately and System-2 is **never entered**; otherwise the turn falls
+  through to the unchanged generation path.
+- New `DecisionMode { Off, Hybrid, DecisionOnly }`. `Off` is the default in the
+  CLI, the server, and `AgentLoop::Config`, so the feature costs nothing when
+  unused and cannot silently change existing behaviour.
+- Prefix-cache edge case handled explicitly: when the prompt is not re-fed there
+  is no fresh hidden state, so the loop escalates rather than advancing the
+  recurrent state purely to manufacture one.
+
+### CLI + server
+
+- `omniseed ask|chat --mode off|hybrid|decision-only --decision-threshold F
+  --decision-head PATH`. An unknown `--mode` is refused (exit 2) rather than
+  silently defaulting. `chat` prints `[decision] {json}` per turn and marks the
+  turns System-1 answered alone.
+- `omniseed_server --decision-mode|--decision-threshold|--decision-head`, with
+  `OMNISEED_DECISION_MODE` / `OMNISEED_DECISION_HEAD` env fallbacks. `/health`
+  reports the mode and the head's provenance; `/ask` adds `"decision"` and
+  `"fast_path"` when the head was consulted.
+- Drive-by fix: `/ask` reply strings are now JSON-escaped — a reply containing a
+  quote previously produced a malformed response body.
+
+### Verification
+
+- `tests/test_decision_head.cpp` (new, ctest `omniseed_decision_head`) —
+  **162 checks, 0 failures** (149 at first landing; the `invalidation` field
+  added in `5257a8a` brought the count up), fully offline (no model, no GGUF,
+  no network).
+- Speed claim measured with the same clock and the same scalar fp32 inner loop
+  on both sides, against the **most charitable possible** System-2 baseline (a
+  bare output-head matvec per token, no attention/FFN/channel-mix — so the ratio
+  is a *lower bound*): tiny E=64/V=256 → **3,419–5,040x**; mid E=256/V=8192 →
+  **246,349–252,057x**. The mandated bar is 100x.
+- Full local board `ctest -C Release`: **10/10 passed** at this commit (11/11
+  once the T2 bridge suite below was registered).
+- `omniseed_server` builds clean with `-DOMNISEED_BUILD_SERVER=ON`.
+- No new Python dependency in the decision path; the <400 MB budget and the 2%
+  risk-limit logic in C++ are untouched.
+
+### Honest limits (carried in the doc, not buried)
+
+- The shipped head is **untrained**: `init()` seeds a deterministic placeholder
+  projection that is structurally valid and semantically meaningless.
+  `trained()` / `provenance()` report it, and both the CLI and the server log a
+  warning when the mode is on and the head is not fitted.
+- Confidence is a **raw softmax, not calibrated**. Jev's RLCD calibration is not
+  reproduced; 0.85 is a tuned operating point, not a probability of success.
+- Fitting the projection offline is **not implemented** — `set_action()` /
+  `save()` / `load()` are the interface for it. This is the next honest step,
+  not a finished feature.
+
+## 25. T7+ T2 — INTEGRATION: JSON CONTRACT, PROVENANCE, DASHBOARD, GATE (2026-09-27)
+
+Integration and polish pass. No new strategy, no new research: everything here
+wires up pieces that were already built and tested, and adds the tests that
+prove the wiring holds.
+
+### Naming reality vs the brief
+
+The brief named `python/trading/paper_daemon.py` and `journal.csv`. Neither
+exists and neither should: the paper daemon is **C++**
+(`src/trading/paper_daemon.cpp`, driven by
+`omniseed_agent2.exe trading-paper-session`), and the journal is
+`state/paper_journal.csv`. Those paths were treated as naming intent. What was
+actually missing was the **seam** between the C++ side and the Python
+tooling — that is what this pass builds.
+
+### `tools/decision_bridge.py` (new) — the JSON half of the contract
+
+Parses the `DecisionResult` JSON that `agent_loop.cpp` emits on the fast path.
+Strictly typed fields, and the fail-closed rules are the *only* thing it
+exports as policy:
+
+- `NEVER_TRADES = {ABSTAIN, EXPLAIN}` — these can never become an order,
+  however confident.
+- `OPENS_RISK = {BUY, SELL, HEDGE}`.
+- `screen()` raises `ValueError` if asked for a threshold **below** 0.85. The
+  mandate bar may be raised, never lowered.
+- A watched symbol with **no** decision is refused, not ignored: *silence is
+  not consent*.
+- Malformed input never raises out of `screen()` — it is refused.
+
+CLI: `--json` / `--jsonl` / `--threshold` / `--allow-unknown-stop` /
+`--self-test`; exit 0 = tradeable, 1 = refused, 2 = malformed.
+
+### Entry provenance through a frozen journal schema
+
+The journal is a frozen 10-field CSV (`ts,kind,ticker,qty,price,pnl,equity,
+cash,exposure,reason`) and `Position` carries no stop or confidence field. So
+provenance rides in the free-text `reason` column:
+
+```
+entry conf=<0..1> stop=<price> stop_pct=<frac>
+```
+
+- Written by `entry_reason()` in `paper_daemon.cpp` on both entry paths.
+  Spaces only, so `csv_safe()` (which rewrites `,`/`\n`/`\r`) cannot mangle it.
+- `stop` is derived from the **same `RiskLimits` the exit check uses**, so the
+  dashboard can never display a stop the engine would not honour.
+- `paper_report.py` recovers it in `replay_positions()`; the stop **level** is
+  recomputed from the blended average to match `RiskManager::check_exit`, and
+  a legacy row with no provenance reports `None` — never `0`.
+
+### Dashboard + server
+
+- `tools/paper_dashboard.py` — one self-contained HTML document (no `<link>`,
+  no `<img>`, no CDN). Panels: live equity curve (inline SVG), open positions
+  with **entry / stop / distance-to-stop / confidence meter / last / unrealized**,
+  daily P&L KPIs, regime status, feed health, and a risk panel that quotes the
+  engine's own limits.
+- `tools/serve_dashboard.py` (new) — stdlib `ThreadingHTTPServer`; routes `/`,
+  `/api/state`, `/healthz`, `/journal.csv`, 404 otherwise; `Cache-Control:
+  no-store`. An inlined poller re-draws the KPIs, the curve, the positions and
+  the regime table in place. Opened from `file://` it degrades to a static
+  snapshot and says so instead of failing silently.
+- `tools/paper_loop.py` — `DecisionGate` (`off` | `file` | `agent`) and the
+  regime reading are wired into the heartbeat. The gate can only **append to
+  the engine's `--skip` list**; it cannot widen risk. Every unusable path fails
+  closed (missing log, sub-mandate threshold, unknown source, agent failure).
+
+### Why the new test is NOT behind the `.venv` gate
+
+`tests/test_decision_bridge.py` is stdlib-only, so it is registered with
+`find_package(Python3)` *outside* the `.venv` guard that the LoRA suites use.
+It has to run in CI (where no `.venv` exists) because
+`test_engine_limits_match_cpp()` re-reads `include/omniseed/trading/*.h` and
+fails if the Python copy of the 2% / 3% / 8% limits ever drifts from C++.
+
+### Verification
+
+- `tests/test_decision_bridge.py` (new, ctest `omniseed_decision_bridge`) —
+  **141 checks, 0 failures** when a market CSV is reachable; **133** when it is
+  not (section 8 skips honestly and prints why).
+- Section 8 is the cross-language contract: it runs the **real daemon** and
+  parses what it actually wrote, because the fixture-based tests would keep
+  passing if `entry_reason()`'s format silently changed.
+- End-to-end on real data (`models/market/AAPL_1d.csv`, 1254 bars): the daemon
+  produced **43 entries / 42 exits**, every entry reason parsed, every
+  `stop == entry x (1 - stop_pct)` to price precision, and the report layer
+  recovered `AAPL qty=64 entry=323.13 stop=297.28 conf=0.500` — i.e.
+  `323.13 x 0.92 = 297.28`.
+- Live server smoke on port 8791: `/` 200, `/api/state` 200, `/healthz` 200,
+  `/nope` 404.
+- Full local board `ctest -C Release`: **11/11 passed**.
+
+### Honest limits
+
+- The journal's `conf=` is the **rule-based strategy's `Signal::strength`**, not
+  the System-1 head's softmax. The head is still untrained (§24), so routing it
+  into the paper loop would put an uncalibrated number in front of real risk
+  logic. The dashboard labels it "confidence" in the strategy sense.
+- The gate is **risk-removing only**. The 2% per-trade budget and the 3% daily
+  kill-switch remain C++-enforced and untouched; Python mirrors them for
+  display and is contract-tested against drift.
+- Legacy journal rows have no provenance; their confidence renders as `—`.
+  Back-filling would mean inventing numbers, so it is not done.
+- The head's `invalidation` is a default the risk engine is expected to
+  override; nothing in the paper path consumes it yet.
+
+## 26. ⭐ TRADING SYSTEM v1.0 COMPLETE (2026-09-27)
+
+Everything that was researched, prototyped and tested separately is now
+**assembled, merged and runnable from `main`**. No new strategy was added in
+this pass — the brief was integration and polish, and that is all this is.
+
+### What v1.0 contains
+
+| Layer | Artifact | State |
+|---|---|---|
+| Market data | `tools/fetch_market_data.py`, provenance CSV | ✅ |
+| Perception + risk gates | `src/trading/*`, M1/M4 | ✅ |
+| Walk-forward edge lab + risk engine + daily kill-switch | T7.1 | ✅ |
+| Paper daemon (multi-asset, journal resume) | `src/trading/paper_daemon.cpp` | ✅ |
+| 24/7 paper loop + report + dashboard | `tools/paper_loop.py`, `paper_report.py`, `paper_dashboard.py` | ✅ |
+| **Monster M7** — sniper entry, news hunter, cross-asset filter, sizing | `tools/monster/*`, PR #2 | ✅ merged |
+| **Monster M8** — regime engine, strategy ensemble, funding carry | `tools/monster/*`, PR #3 | ✅ merged |
+| **System-1 decision head** — "two heads, one brain" | `src/decision_head.cpp` | ✅ merged |
+| **T2 integration** — JSON contract, provenance, dashboard, gate | `tools/decision_bridge.py`, `serve_dashboard.py` | ✅ merged |
+
+### How to run it — exact commands
+
+Run everything from the repo root. On Windows the venv interpreter is
+`.venv\Scripts\python.exe` (POSIX: `.venv/bin/python`).
+
+**1. Get some market data** (once; the loop also refreshes it itself)
+
+```
+.venv\Scripts\python.exe tools\fetch_market_data.py --ticker AAPL --timeframe 1d
+```
+
+**2. Start the paper daemon — the 24/7 loop**
+
+```
+.venv\Scripts\python.exe tools\paper_loop.py --watch equity:AAPL --interval 300
+```
+
+- Defaults: `--watch equity:AAPL,crypto:BTCUSDT,fx:EURUSD`,
+  `--journal state/paper_journal.csv`, `--csv-dir models/market/paper`.
+- One cycle and exit instead of looping forever: add `--once`.
+- Dry run (poll + refresh CSVs, never invoke the engine): `--dry-run`.
+- Optional System-1 gate (can only *remove* risk): `--decision-source file
+  --decision-jsonl <path>`.
+- The engine itself is `build\bin\omniseed_agent2.exe
+  trading-paper-session --streams "SYM,asset,path.csv" ...` if you want to run
+  a single session without the loop.
+
+**3. Open the dashboard**
+
+Live (recommended — auto-refreshes every 15 s):
+
+```
+.venv\Scripts\python.exe tools\serve_dashboard.py --port 8787 --open
+```
+
+…then browse **http://127.0.0.1:8787**. The server is stdlib-only and
+loopback-bound; routes are `/`, `/api/state`, `/healthz`, `/journal.csv`.
+
+Static snapshot instead (single self-contained file, no server):
+
+```
+.venv\Scripts\python.exe tools\paper_dashboard.py --journal state\paper_journal.csv --out dashboard.html
+```
+
+**4. Optional — System-1 fast path in the agent**
+
+```
+build\bin\omniseed.exe ask --mode hybrid --decision-threshold 0.85 --decision-head <blob> "what should I do with AAPL"
+```
+
+`--mode` is `off` (default) | `hybrid` | `decision-only`. `off` allocates no
+head and is bit-identical to previous behaviour.
+
+**5. Rebuild + verify**
+
+```
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release
+```
+
+### Merge record (this pass)
+
+Three branches, all rooted at the same base (`fd7f999`), merged into `main`:
+
+- **PR #2** `feature/monster-trading-model` (`e848c6b`) — subsumed by PR #3.
+- **PR #3** `feature/monster-m8-regime` (`0d0ebbc`) — merged; it already
+  contained `e848c6b`, so M7 arrived with it.
+- **Integration** `workbuddy/main-ddf5e156` (`76b17a8`) — the System-1 head
+  plus the T2 wiring.
+
+One conflict: `tools/paper_loop.py` (both sides extended the same ctor, the
+same cycle body, the same argparse block and the same `PaperLoop` call).
+Resolved as a **superset union** — verified by diffing the result against both
+parents and confirming every removal was only a signature the other side had
+extended.
+
+### Verification (post-merge, on the merged tree)
+
+- `ctest -C Release`: **11/11 passed** (22.9 s).
+- The 11 stdlib-only Python suites (venv-gated in CMake, run explicitly here):
+  **661 checks, 0 failures** — including all six Monster suites and the T2
+  bridge suite.
+- `tests/test_decision_bridge.py` with a real feed: **146 checks, 0 failures**,
+  including the live daemon→reader contract.
+- Release `build/bin/omniseed.exe` builds clean: **0.44 MB** (budget 400 MB);
+  all 13 binaries total 2.7 MB.
+- `--mode bogus` is refused with a clear message rather than silently
+  defaulting.
+- Fixed while verifying: `tests/test_paper_reports.py` asserted "no `<script>`
+  tag at all", which the T2 mandate's embedded-JS dashboard necessarily
+  violates. Corrected to assert the real invariant — no *external* script
+  source — while the separate `no remote refs` check still pins
+  self-containment. This suite had never actually run (it is venv-gated and
+  no `.venv` existed), which is exactly why the assertion had drifted.
+
+### Known gap, stated plainly
+
+The stdlib-only Python suites sit behind CMake's `.venv` guard, and CI creates
+no `.venv` — so **they do not run in CI**. `test_decision_bridge` was
+deliberately registered *outside* that guard because its
+`test_engine_limits_match_cpp` check guards the 2%/3%/8% limits against drift
+and is worthless if it never executes. The other Python suites still only run
+on a developer box with a `.venv`; moving them out of the guard is a
+recommended follow-up, not something this pass changed.
+
+### Hard limits — unchanged and still enforced
+
+- **2% per-trade risk budget** and **3% daily / 6% weekly kill-switch** remain
+  C++-enforced in `include/omniseed/trading/*.h`. Python only mirrors them for
+  display, and a contract test fails if that mirror drifts.
+- The System-1 decision gate is **risk-removing only**: it can append to the
+  engine's `--skip` list and nothing else. Every unusable path fails closed.
+- Edge binary **0.44 MB**, far under the 400 MB budget.
+- No claim of "no loss" is made anywhere; losses are minimised by discipline,
+  never eliminated.
+

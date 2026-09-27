@@ -163,8 +163,12 @@ def test_html(tmp):
           "kpi-value up" in doc and "--up:#e5484d" in doc)
     check("html: feed badge", "badge warn" in doc)
     check("html: disclaimer", "never eliminated" in doc)
-    # Self-contained: no external resources at all.
-    check("html: no external script", "<script" not in doc.lower())
+    # Self-contained: no EXTERNAL resources at all. Inline JS/CSS is required by
+    # the T2 live dashboard (single file, embedded JS/CSS), so the guard is
+    # "no external script SOURCE", not "no script tag" — the `no remote refs`
+    # check below is what actually pins self-containment.
+    check("html: no external script",
+          "<script src" not in doc.lower() and "javascript:" not in doc.lower())
     check("html: no remote refs",
           "http://" not in doc and "https://" not in doc and 'src="' not in doc)
     check("html: escapes nothing unescaped", "&lt;" not in doc or True)

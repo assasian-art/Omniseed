@@ -495,7 +495,8 @@ void RwkvModel::apply_targeted(int32_t l, LoraTarget target,
     }
 }
 
-void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
+void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits,
+                        Tensor* hidden_out) const {
     const int32_t E = cfg_.n_embd;
     const int32_t H = cfg_.n_heads;
     const int32_t D = cfg_.head_size;
@@ -759,6 +760,16 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits) const {
         Tensor xin3("xin3", {E}, DType::F32);
         std::memcpy(xin3.f32(), x.data(), E * sizeof(float));
         tensor_ops::layer_norm(xin3, &ln_out_w_, &ln_out_b_, xl3);
+    }
+
+    // System-1 tap ("two heads, one brain"): hand the post-ln_out residual to
+    // the DecisionHead. Taken BEFORE the vocab projection and never fed back
+    // into the recurrence, so reading it cannot change any generated token.
+    if (hidden_out != nullptr) {
+        if (hidden_out->dtype() != DType::F32 || hidden_out->numel() != E)
+            *hidden_out = Tensor("hidden", {static_cast<int64_t>(E)}, DType::F32);
+        std::memcpy(hidden_out->f32(), xl3.f32(),
+                    static_cast<size_t>(E) * sizeof(float));
     }
 
     const int64_t V_head = head_.dim(0);

@@ -155,7 +155,20 @@ public:
     static void copy_state(const RwkvState& src, RwkvState& dst);
 
     // Single token step: updates st in place, writes logits [n_vocab] fp32.
-    void forward(int32_t token, RwkvState& st, Tensor& logits) const;
+    //
+    // `hidden_out`, when non-null, receives the post-ln_out residual x[E] —
+    // the model's internal state for THIS token, which is exactly what the
+    // System-1 DecisionHead consumes. It is the same vector the text head
+    // projects to logits, so both heads read one identical opinion rather
+    // than two approximations of it.
+    //
+    // The tensor is reallocated in place only when its dtype/shape do not
+    // already match, so callers can pass a default-constructed Tensor and
+    // reuse it across steps: zero allocation after the first call. Passing
+    // nullptr (the default) costs nothing and is bit-identical to the old
+    // behaviour.
+    void forward(int32_t token, RwkvState& st, Tensor& logits,
+                 Tensor* hidden_out = nullptr) const;
 
     int32_t greedy_pick(const Tensor& logits) const;
 
