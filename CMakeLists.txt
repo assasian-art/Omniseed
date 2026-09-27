@@ -89,6 +89,10 @@ set(OMNISEED_CORE_SOURCES
     src/trading/paper_daemon.cpp
     src/trading/market_perception.cpp
     src/trading/risk_gate.cpp
+    src/trading/regime_engine.cpp
+    src/trading/strategy_zoo.cpp
+    src/trading/router.cpp
+    src/trading/sniper.cpp
     src/runtime/introspection.cpp
     src/runtime/cloud_bridge.cpp
     src/agent/sub_agents.cpp
@@ -510,6 +514,33 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_decision_bridge.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_decision_bridge PROPERTIES TIMEOUT 300)
+
+        # Regime parity: the C++ engine must produce the SAME NUMBERS as the
+        # Python oracle it replaces. This is the gate that makes retiring the
+        # Python from the runtime path safe — a hand-port of 700 lines of
+        # numerics WILL drift otherwise, and a silently-diverging second
+        # implementation is worse than no port at all.
+        # Stdlib-only; also registered outside the .venv gate on purpose.
+        add_test(NAME omniseed_regime_parity
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_regime_parity.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_regime_parity PROPERTIES TIMEOUT 900)
+
+        # Strategy parity: same contract for the strategy zoo, router and
+        # sniper (~1,400 lines of numerics ported from three Python modules).
+        # Compares every signal's direction/confidence/reason, every router
+        # field, and every sniper layer on synthetic trend/chop/squeeze/vol
+        # series and on a real feed when one is present.
+        add_test(NAME omniseed_strategy_parity
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_strategy_parity.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_strategy_parity PROPERTIES TIMEOUT 900)
     endif()
 
     # System-1 decision head ("two heads, one brain"): action space + labels,
@@ -531,6 +562,61 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_decision_head COMMAND omniseed_decision_head
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_decision_head PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # C++ regime engine (port of tools/monster/regime.py): the statistics, the
+    # causal window (prefix invariance), the label logic, hysteresis, and the
+    # regressions for the four bugs that were fixed in the Python.
+    # Fully offline: no model, no GGUF, no network.
+    add_executable(omniseed_regime_engine tests/test_regime_engine.cpp)
+    target_include_directories(omniseed_regime_engine PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_regime_engine PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_regime_engine PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_regime_engine PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_regime_engine COMMAND omniseed_regime_engine
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_regime_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # C++ strategy zoo + router + sniper (ports of tools/monster/strategies.py,
+    # router.py, sniper_engine.py). Covers the B4 regression (a lone
+    # low-confidence signal must not veto), the "ensemble blocks only, never
+    # promotes" invariant, the 0.85-gate reachability table, and prefix
+    # invariance for all three layers. Fully offline.
+    add_executable(omniseed_strategy_zoo tests/test_strategy_zoo.cpp)
+    target_include_directories(omniseed_strategy_zoo PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_strategy_zoo PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_strategy_zoo PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_strategy_zoo PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_strategy_zoo COMMAND omniseed_strategy_zoo
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_strategy_zoo PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
+    # oracle. Not a test itself.
+    add_executable(omniseed_regime_dump tests/regime_dump.cpp)
+    target_include_directories(omniseed_regime_dump PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_regime_dump PRIVATE omniseed_core)
+    target_compile_definitions(omniseed_regime_dump PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # Dumper used by tests/test_strategy_parity.py to diff the C++ strategy zoo,
+    # router and sniper against their Python oracles. Not a test itself.
+    add_executable(omniseed_strategy_dump tests/strategy_dump.cpp)
+    target_include_directories(omniseed_strategy_dump PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_strategy_dump PRIVATE omniseed_core)
+    target_compile_definitions(omniseed_strategy_dump PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --------------------------------- CLI binary --------------------------------

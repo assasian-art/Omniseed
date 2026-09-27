@@ -15,10 +15,20 @@ GLM-5.3-FLASH
   untested here.
 - **Build:** `build.bat` (auto-detects VS via vswhere) or
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
-- **Test:** `build\bin\omniseed_tests.exe` — **206/206 passing** +
+- **Test:** `ctest --test-dir build -C Release` — **15/15 passing** (§27).
+  Individually: `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
   `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
-- **Last updated:** §19 T7.1 TRADING EDGE LAB (2026-09-26): walk-forward
+  + `build\bin\omniseed_regime_engine.exe` — **157 checks** +
+  `build\bin\omniseed_strategy_zoo.exe` — **291 checks**
+- **Last updated:** §27 TRUE INTEGRATION (2026-09-27): the Monster trading
+  intelligence moved **into the C++ runtime** — regime engine, strategy zoo,
+  router and sniper are now C++ classes rather than Python modules feeding the
+  runtime through a CSV seam. Guarded by two Python-vs-C++ parity gates that
+  diff every field on synthetic series and 1,255 real AAPL bars. Board **15/15
+  green**; new `omniseed_strategy_zoo` (291 checks) and `omniseed_regime_engine`
+  (157 checks). See the §27 finding on the sniper's 0.85 gate.
+  Previous: §19 T7.1 TRADING EDGE LAB (2026-09-26): walk-forward
   validation (select on train, replay out-of-sample, hard no-look-ahead),
   per-trade risk budget clamped to 1–2% + a per-UTC-day drawdown kill-switch,
   and a paper daemon with an append-only, resumable journal. New
@@ -2301,3 +2311,200 @@ recommended follow-up, not something this pass changed.
 - No claim of "no loss" is made anywhere; losses are minimised by discipline,
   never eliminated.
 
+
+---
+
+## 27. TRUE INTEGRATION — THE TRADING INTELLIGENCE MOVES INTO THE RUNTIME (2026-09-27)
+
+### The problem this section answers
+
+The Monster trading intelligence lived in Python (`tools/monster/*.py`) and the
+C++ runtime read its conclusions back as a CSV of feature rows
+(`ts,confidence,veto,regime,detail`). That is a **seam, not an architecture**:
+the model's own runtime could not answer "what regime is this, and what do my
+strategies think?" without a separate process running first. `grep` for
+`popen`/`CreateProcess`/`subprocess` across `src/` returns only two
+`std::system("mkdir ...")` calls — so the coupling was a *data contract*, not a
+runtime dependency, but the model was still structurally blind.
+
+This section records moving that intelligence into the runtime, where the model
+can answer those questions itself.
+
+### What was audited (Phase 1)
+
+Every Python module in `tools/`. There is no `python/` directory. The split:
+
+| module | lines | what it is | verdict |
+|---|---|---|---|
+| `monster/regime.py` | 771 | multi-axis regime detection | **MOVED** → `src/trading/regime_engine.cpp` |
+| `monster/strategies.py` | 470 | momentum / mean-reversion / breakout / OFI + channel + stat primitives | **MOVED** → `src/trading/strategy_zoo.cpp` |
+| `monster/features.py` | 332 | causal indicator primitives (sma/ema/rsi/macd/bb/atr/vwap/zscore/swings/fib) | **MOVED** → `strategy_zoo.cpp` (`namespace features`) |
+| `monster/sniper_engine.py` | 374 | weighted 4-layer confluence score `S` + the veto ladder | **MOVED** → `src/trading/sniper.cpp` |
+| `monster/router.py` | 184 | regime-adaptive blend → conviction / agreement + the 4-condition veto | **MOVED** → `src/trading/router.cpp` |
+| `monster/correlation_matrix.py` | 164 | cross-asset lead-lag | Python (needs the peer feed); consumed as `EvalContext` |
+| `monster/state_vector.py` | 115 | assembles the distilled vector for the model | Python (Phase 3 will fold this into the unified output) |
+| `monster/sizing.py` | 88 | adaptive sizing | already C++ (`RiskManager::size_by_risk`) — Python was the mirror |
+| `monster/funding.py` | 300 | funding-rate carry scanner | **stays Python** — needs a network feed |
+| `monster/news_hunter.py` | 200 | news → `event_driven` flag | **stays Python** — network + LLM |
+| `paper_dashboard.py` | 493 | HTML rendering | **stays Python** — presentation, no logic |
+| `serve_dashboard.py` | 193 | HTTP server | **stays Python** — an HTTP server is not model inference |
+| `paper_report.py` / `nightly_report.py` | 481 | nightly report | stays Python — reporting |
+| `market_feeds.py` / `fetch_*.py` | ~1300 | network data acquisition | stays Python — I/O |
+| `paper_loop.py` | 673 | the old polling loop | superseded by `src/trading/paper_daemon.cpp` |
+| `decision_bridge.py` | 398 | the Python shim that called the model | superseded by the C++ decision head + unified output |
+| `qat_*` / `lora_*` / `convert_*` / `modal_*` / `dbg_*` | ~3000 | offline training/quantisation tooling | stays Python — never on the runtime path |
+
+**Rule applied:** anything that *decides* moves to C++; anything that
+*transports, presents, or trains* stays Python. A Python module that only reads
+a file and prints HTML has no business being a decision path, and a C++ engine
+has no business opening a socket to a market-data vendor.
+
+### Two mandate premises that were already true
+
+Stated plainly because "fixing" them would have been pointless, risky churn:
+
+- **`DecisionHead` is already a C++ class** (`include/omniseed/decision_head.h`,
+  commit `7179ff8`) — not a Python script.
+- **The 2% per-trade / 3% daily limits are already C++-enforced** in
+  `include/omniseed/trading/*.h`. Python only mirrors them for display, and
+  `tests/test_decision_bridge.py::test_engine_limits_match_cpp` fails if the
+  mirror drifts.
+
+### The four named bugs were already fixed in the Python
+
+Each was verified by reading the source, not assumed. Phase 5 therefore became
+"port the *fixed* behaviour and lock it with a regression test", which is what
+was done — the four regressions are now pinned C++-side:
+
+| named bug | where it was already fixed | C++ regression test |
+|---|---|---|
+| the `0.8125 < 0.85` gate | `regime.py` — smoothed vol percentile + absolute ATR stress, so entry bars stop being labelled `high_vol` | `test_strategy_zoo.cpp` D2 (ceiling table) |
+| Hurst on price levels | `regime.py:547` already feeds `hurst_rs` the **returns** | `test_regime_engine.cpp` B1 |
+| ER horizon mismatch | `regime.py:538` already **sweeps** `er_n = (10,20,40)` and averages the normalised values | `test_regime_engine.cpp` B2 |
+| ensemble veto on a single signal | `router.py:155` already requires `weight >= veto_min_weight (0.50)` | `test_strategy_zoo.cpp` C (**B4**) |
+
+### The new files
+
+| file | what |
+|---|---|
+| `include/omniseed/trading/regime_engine.h` / `src/trading/regime_engine.cpp` | the multi-axis causal regime engine + `RegimeTracker` hysteresis |
+| `include/omniseed/trading/strategy_zoo.h` / `src/trading/strategy_zoo.cpp` | `features::` primitives, Donchian/Keltner/OFI, the four strategies, vol-target |
+| `include/omniseed/trading/router.h` / `src/trading/router.cpp` | continuous regime weighting → conviction/agreement, the weight-gated veto |
+| `include/omniseed/trading/sniper.h` / `src/trading/sniper.cpp` | the weighted 4-layer score `S` + the veto ladder |
+| `tests/regime_dump.cpp`, `tests/strategy_dump.cpp` | JSON dumpers, so the parity tests can diff C++ against the oracles |
+| `tests/test_regime_engine.cpp`, `tests/test_strategy_zoo.cpp` | the C++ suites |
+| `tests/test_regime_parity.py`, `tests/test_strategy_parity.py` | the parity gates |
+
+### Why a parity gate, and not a blind hand-port
+
+A ~1,400-line numeric port **will** drift from its original. A silently
+diverging second implementation is strictly worse than not porting at all,
+because the divergence is invisible and the C++ is the one making decisions. So
+the Python modules stay in the tree as the **oracle**, and
+`test_regime_parity.py` / `test_strategy_parity.py` diff the two field by field.
+While those are green the two are interchangeable, which is what makes it safe
+to retire the Python from the runtime path *without touching it*.
+
+They compare every signal's `direction` / `confidence` / `reason`, every router
+field (`conviction`, `agreement`, `weight`, `w_trend`, `active`, `size_factor`,
+`veto_long`), and every sniper layer (`score`, `micro`, `tech`, `regime_score`,
+`cross`, `votes`, `regime`, `veto`, `veto_reason`, `factors`, `trend_score`,
+`half_life`, `conviction`, `agreement`, `propose`) — on synthetic trend / chop /
+squeeze / vol series, with the regime tracker both on and off, in all three
+sniper modes (advanced / legacy / ensemble), and on **1,255 real AAPL daily
+bars**. Tolerance is `1e-9` relative; both-NaN counts as equal, because "no
+reading" on both sides is agreement, not a mismatch.
+
+Both parity suites are registered **outside** CMake's `.venv` guard, on purpose.
+The stdlib-only Python suites sit behind an `if(EXISTS "${OMNISEED_VENV_PY}")`
+check, CI creates no `.venv`, and this worktree has none either — so a
+venv-gated suite silently never runs. That is exactly how
+`tests/test_paper_reports.py` drifted into asserting something a later mandate
+made impossible. A parity gate that never executes is not a gate.
+
+### Verification (this pass)
+
+- `ctest --test-dir build -C Release`: **15/15 passed** (287 s). Board grew from
+  11 to 15 with `omniseed_regime_engine`, `omniseed_regime_parity`,
+  `omniseed_strategy_zoo`, `omniseed_strategy_parity`.
+- `omniseed_strategy_zoo.exe`: **291 checks, 0 failed** — feature primitives on
+  hand-checkable inputs, every strategy branch (including `fade`, which needs a
+  hand-built regime because a trending series is correctly never tradeable),
+  the B4 lone-signal regression, the weight floor at exactly 0.50, veto
+  precedence, the 0.85 reachability table, "the ensemble blocks only, never
+  promotes" (score bit-identical with the ensemble on and off), and prefix
+  invariance across 259 prefixes.
+- `omniseed_regime_engine.exe`: **157 checks, 0 failed**.
+- `test_strategy_parity.py`: **38 passed, 0 failed** (including the real feed).
+- `test_regime_parity.py`: **18 passed, 0 failed** (including the real feed).
+- Release build clean under `/W4`; no new warnings.
+
+### ⚠️ Finding: the sniper proposes nothing on real data
+
+Measured, not inferred. Over the 1,255 real AAPL daily bars in
+`models/market/AAPL_1d.csv`:
+
+```
+max S = 0.8317   (the 0.85 bar is never reached)
+proposals = 0
+technical-vote histogram:  0 votes -> 266,  1 -> 709,  2 -> 266,  3 -> 14   (never 4+)
+veto reasons: insufficient-confluence 1130, high-vol-needs-mean-reversion 103,
+              none 13, counter-regime 9
+```
+
+The arithmetic is not the problem — `docs/MONSTER_DESIGN.md`'s reachability
+table is correct and the `high_vol` case (ceiling 0.8125) really was fixed:
+
+```
+with M = T = C = 1.0:   trend_up 1.0000 | range 0.8750 | high_vol 0.8125 | trend_down 0.7500
+```
+
+The problem is that those ceilings assume `cross = 1.0`. With **no cross-asset
+context** — the default, since `EvalContext` is optional — `cross` is 0.5, and
+then even a perfect bar is capped at:
+
+```
+trend_up: 0.25 + 0.35*0.90 + 0.25*1.00 + 0.15*0.5 = 0.8900   reachable
+range:    0.25 + 0.35*0.90 + 0.25*0.50 + 0.15*0.5 = 0.7650   NOT reachable
+```
+
+(`tech = 0.90` is the 3-vote rung, and 3 is both `min_factors` and the observed
+maximum on this feed.) Since `range` is 81% of the bars, the gate is closed for
+most of the tape, and the 0.8317 observed maximum says the favourable
+combination never actually coincided even on the `trend_up` bars.
+
+This is **the same bug class the mandate named** — a gate that cannot open — and
+it is **pinned, not fixed**: `test_strategy_zoo.cpp` D2 asserts both the
+documented ceiling table *and* the no-context numbers above, so the situation
+cannot drift unnoticed in either direction. Changing it means changing what the
+system trades (lower `min_confidence`, reweight the layers, or supply real
+cross-asset context), which is the owner's decision, not a silent one.
+
+### Other findings, reported not silently changed
+
+- **`find_swings`'s `kind` parameter is inert in the oracle.** It always returns
+  strict local *minima*, so `find_swings(highs, ..., "high")` returns minima of
+  the high series rather than swing highs, and the Fibonacci-support factor is
+  built from the wrong object. The C++ reproduces the oracle exactly (so parity
+  holds) and additionally exposes `find_local_maxima` for the correct one. Which
+  the sniper uses is a behaviour change and is left to the owner.
+- **`bollinger` does not NaN-check its window, while `rolling_std` does.** The
+  inconsistency is the oracle's and is reproduced, because "cleaning it up"
+  would change which bars produce a number.
+- **The oracle's `last_swing_pair` is O(lows x highs) per bar**, which makes a
+  full-feed Python scan quadratic-to-cubic. The parity test therefore compares
+  the sniper on 250-bar prefixes and says so in a comment, rather than silently
+  timing out or quietly skipping.
+
+### What is still Python, and why
+
+`paper_dashboard.py`, `serve_dashboard.py` (an HTTP server is not model
+inference); `paper_report.py`, `nightly_report.py` (reporting);
+`market_feeds.py`, `fetch_*.py` (network I/O); `funding.py`, `news_hunter.py`
+(external feeds); `correlation_matrix.py`, `state_vector.py` (Phase 3 folds
+these into the unified single-pass output); the `qat_*` / `lora_*` / `convert_*`
+/ `modal_*` / `dbg_*` offline tooling (never on the runtime path).
+
+`paper_loop.py` and `decision_bridge.py` are now **superseded** — the C++ paper
+daemon and the C++ decision head do their jobs — but they are left in the tree
+as reference until the unified output path (Phase 3) is verified end to end.
