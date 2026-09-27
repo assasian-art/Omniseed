@@ -165,6 +165,16 @@ public:
                       const std::function<std::string(const DomainDecision&)>& text_fn) const;
     UnifiedOutput run(const float* hidden, const std::string& user_turn) const;
 
+    // The stateful sibling of the two-argument run, and the only non-const
+    // entry point here. It is separate on purpose: remembering is a WRITE, and a
+    // const run() that silently appended to long-term memory would make the
+    // pipeline non-idempotent in a way its signature denies. Same document, plus
+    // the soul's recall of related past turns, plus the owner's question stored.
+    // Requires Config::use_soul; without it this is exactly run(hidden, user_turn).
+    UnifiedOutput run_memorable(const float* hidden, const std::string& user_turn,
+                                const std::function<std::string(const DomainDecision&)>& text_fn);
+    UnifiedOutput run_memorable(const float* hidden, const std::string& user_turn);
+
     // ---- provenance ---------------------------------------------------------
     // True only when EVERY head is fitted. A pipeline of seeded heads emits
     // well-formed but meaningless documents.

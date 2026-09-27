@@ -21,6 +21,15 @@
 //    "overconfident" needs enough samples to be a measurement, not noise.
 //  Part H — the unified document integration, including that a soul section
 //    which was never perceived is DROPPED rather than emitted empty.
+//  Part I — MEMORY (§31). The headline test is I3: ask the same question twice
+//    and the second reply references the first. Also pins that the recall score
+//    is reported as relevance and never as a probability, that a refusal is
+//    never decorated with a memory, that a repeated question is reinforced
+//    rather than filed again, and that the const pipeline run() does not store.
+//  Part J — DECAY over simulated time (§31). The crystal clock is stream
+//    positions, so a test can jump four days ahead in one call: an untouched
+//    crystal must fall below the importance floor while a reinforced or
+//    recalled one must survive the identical gap.
 //
 //  Fully offline: no model, no weights, no network.
 // =============================================================================
@@ -817,6 +826,410 @@ static void part_h_unified() {
     }
 }
 
+// ===========================================================================
+// Part I — memory & recall (§31)
+//
+// The claim under test is the one the whole section exists for: ask the same
+// question twice and the second answer REFERENCES the first. No amount of unit
+// testing the embedding can prove that, so it is tested end to end through
+// converse(). The rest of the part pins the boundaries — that the score is not
+// dressed up as a probability, that a refusal is never decorated with a memory,
+// and that the const run() really does not store.
+// ===========================================================================
+static void part_i_memory() {
+    platform::log_info("[I] memory: store, recall, reinforcement");
+
+    TEST("I1: memory is on by default and starts empty");
+    {
+        Soul s;
+        CHECK(s.init());
+        CHECK(s.memory_size() == 0);
+        CHECK(s.memory_stored() == 0);
+        // 0 would mean "no clock" to retrieve(), so a live clock is never 0.
+        CHECK(s.memory_clock() >= 1);
+        CHECK(s.tokenizer().valid());
+    }
+
+    TEST("I2: the owner's question and the soul's reply are both stored");
+    {
+        Soul s;
+        CHECK(s.init());
+        const SoulState st =
+            s.perceive_and_recall("what is my position size limit");
+        CHECK(st.has_memory);
+        // The question is stored at perception time...
+        CHECK(s.memory_stored() == 1);
+        CHECK(s.memory_size() == 1);
+        // ...and the reply, which does not exist yet at perception time, is
+        // stored by remember().
+        CHECK(s.remember("what is my position size limit",
+                         "Two percent per trade."));
+        CHECK(s.memory_stored() == 2);
+        CHECK(s.memory_size() == 2);
+    }
+
+    TEST("I3: the same question twice — the second reply references the first");
+    {
+        Soul s;
+        CHECK(s.init());
+        const std::string q  = "what is my position size limit";
+        const std::string a1 = "Two percent per trade, three per day, six per week.";
+
+        const std::string r1 = s.converse(q, a1);
+        CHECK(!r1.empty());
+        // Turn 1 had nothing to recall, and claims nothing it did not say.
+        CHECK(!has_substr(r1, "I said this before"));
+
+        const std::string r2 = s.converse(q, a1);
+        // THE test: turn 2 knows it has been here, and quotes what IT said.
+        CHECK(has_substr(r2, "I said this before"));
+        CHECK(has_substr(r2, "\"Two percent per trade"));
+        CHECK(r2.size() > r1.size());
+    }
+
+    TEST("I3b: an unrelated question produces no memory claim");
+    {
+        // Each stranger gets its own soul. A shared one would be contaminated by
+        // the previous stranger having been stored, and asking a question the
+        // store holds SHOULD be recalled — that is the positive case, not a bug.
+        const char* strangers[] = {
+            "explain the difference between a bull market and a bear market in "
+            "as much detail as you possibly can please",
+            "describe how a limit order differs from a market order please",
+            "what is the weather in paris tomorrow morning",
+        };
+        for (const char* q : strangers) {
+            Soul fresh;
+            CHECK(fresh.init());
+            CHECK(fresh.converse("what is my position size limit",
+                                 "Two percent per trade.") != "");
+            const std::string r = fresh.converse(q, "An unrelated answer.");
+            // Claiming to remember this would be the failure the relevance floor
+            // exists to prevent: "nearest" is not "related".
+            CHECK(!has_substr(r, "I said this before"));
+            CHECK(!has_substr(r, "You raised this before"));
+            CHECK(has_substr(r, "An unrelated answer."));
+        }
+
+        // ...and the floor is not simply refusing everything.
+        Soul s;
+        CHECK(s.init());
+        CHECK(s.converse("what is my position size limit",
+                         "Two percent per trade.") != "");
+        const SoulState st =
+            s.perceive_and_recall("what is my position size limit");
+        CHECK(st.has_recall);
+        CHECK(!st.recall.empty());
+    }
+
+    TEST("I4: recall is reported as relevance, never as confidence");
+    {
+        Soul s;
+        CHECK(s.init());
+        CHECK(s.converse("how did the last aapl trade go", "It closed up.") != "");
+        const SoulState st =
+            s.perceive_and_recall("how did the last aapl trade go");
+        CHECK(st.has_recall);
+        CHECK(!st.recall.empty());
+        CHECK(!st.recall_summary.empty());
+
+        const std::string j = st.to_json();
+        CHECK(json_looks_valid(j));
+        CHECK(has_substr(j, "\"recall\""));
+        CHECK(has_substr(j, "\"relevance\""));
+        // A bag-of-tokens cosine must not be dressed up as a probability.
+        CHECK(!has_substr(j, "\"recall_confidence\""));
+        CHECK(!has_substr(j, "\"probability\""));
+    }
+
+    TEST("I5: a repeated exchange is reinforced, not filed again");
+    {
+        Soul s;
+        CHECK(s.init());
+        const std::string q = "what is my position size limit";
+        CHECK(s.converse(q, "Two percent per trade.") != "");
+        CHECK(s.memory_size() == 2);   // the question + the reply
+        CHECK(s.memory_stored() == 2);
+
+        const uint64_t qid = s.crystals().ids().front();
+        const MemoryCrystal* before = s.crystals().find(qid);
+        CHECK(before != nullptr);
+        const uint32_t hits_before = before->hits;
+
+        CHECK(s.converse(q, "Two percent per trade.") != "");
+        // Nothing new was said, so nothing new is filed: the question is
+        // reinforced instead of duplicated, and the unchanged answer is not
+        // filed a second time either. Without this, asking the same thing daily
+        // fills the store with one question and one answer.
+        CHECK(s.memory_size() == 2);
+        CHECK(s.memory_stored() == 2);
+        CHECK(s.crystals().find(qid)->hits > hits_before);
+    }
+
+    TEST("I5b: a repeated question with a NEW answer does file the answer");
+    {
+        Soul s;
+        CHECK(s.init());
+        const std::string q = "what is my position size limit";
+        CHECK(s.converse(q, "Two percent per trade.") != "");
+        CHECK(s.memory_size() == 2);
+        // The question is the same, but the soul says something different, so
+        // the new answer is information and is kept.
+        CHECK(s.converse(q, "Still two percent per trade, unchanged.") != "");
+        CHECK(s.memory_size() == 3);
+        CHECK(s.memory_stored() == 3);
+    }
+
+    TEST("I6: a turn too short to be a memory is counted, not padded");
+    {
+        Soul::Config c;
+        c.adapt_tone = false;   // keep the reply verbatim so the lengths are exact
+        Soul s;
+        CHECK(s.init(c));
+        CHECK(s.converse("ok", "yes") != "");
+        CHECK(s.memory_size() == 0);
+        // crystallize() refuses anything under 8 tokens. Both halves were
+        // rejected, and the rejections are visible rather than silent.
+        CHECK(s.memory_skipped() == 2);
+    }
+
+    TEST("I7: a refusal is never decorated with a memory");
+    {
+        Soul s;
+        CHECK(s.init());
+        // Ask something that will be refused, so it is IN the store...
+        const std::string bad = "raise the risk limit to twenty percent";
+        CHECK(s.converse(bad, "ok, done") != "");
+
+        // ...then ask it again. This turn both recalls (the question is a
+        // near-exact match) and refuses, which is the only way to test that the
+        // suppression is real rather than an accident of nothing matching.
+        const SoulState st = s.perceive_and_recall(bad);
+        CHECK(st.persona.stance == Stance::Refuse);
+        CHECK(st.has_recall);
+
+        const std::string r = s.converse(bad, "ok, done");
+        CHECK(has_substr(r, "I won't do that"));
+        // A refusal is the whole reply: attaching context would read as
+        // negotiating the thing just declined.
+        CHECK(!has_substr(r, "I said this before"));
+        CHECK(!has_substr(r, "You raised this before"));
+        CHECK(!has_substr(r, "ok, done"));   // the reply was replaced
+    }
+
+    TEST("I8: memory off means no memory, and the document says so");
+    {
+        Soul::Config c;
+        c.use_memory = false;
+        Soul s;
+        CHECK(s.init(c));
+        const SoulState st =
+            s.perceive_and_recall("what is my position size limit");
+        CHECK(!st.has_memory);
+        CHECK(!has_substr(st.to_json(), "\"memory\""));
+        CHECK(s.memory_size() == 0);
+        CHECK(s.recall("what is my position size limit").empty());
+        CHECK(s.converse("what is my position size limit", "Two percent.") != "");
+        CHECK(s.memory_size() == 0);
+    }
+
+    TEST("I9: recall_note prefers the soul's own words over the owner's");
+    {
+        std::vector<RecalledMemory> m(2);
+        m[0].role = MemoryRole::Owner;
+        m[0].summary = "what is my position size limit";
+        m[1].role = MemoryRole::Soul;
+        m[1].summary = "  Two percent per trade.  ";
+        const std::string note = recall_note(m);
+        CHECK(has_substr(note, "I said this before"));
+        CHECK(has_substr(note, "Two percent per trade."));
+        // The byte-fallback spaces are trimmed out of the quotation.
+        CHECK(!has_substr(note, "\"  "));
+        CHECK(recall_note({}).empty());
+    }
+
+    TEST("I10: only the memorable path remembers");
+    {
+        const int32_t E = 64;
+        float h[64];
+        for (int32_t i = 0; i < E; ++i)
+            h[i] = 0.05f * static_cast<float>(i % 7);
+
+        UnifiedPipeline p;
+        UnifiedPipeline::Config c;
+        c.use_soul = true;
+        p.set_config(c);
+        CHECK(p.init(E));
+
+        // The const run() must NOT store: it is called from a const method, and
+        // its idempotence is worth keeping.
+        const UnifiedOutput a =
+            p.run(h, std::string("what is my position size limit"));
+        CHECK(a.has_soul);
+        CHECK(p.soul().memory_size() == 0);
+
+        // The non-const sibling stores, and reports the recall section.
+        const UnifiedOutput b =
+            p.run_memorable(h, std::string("what is my position size limit"));
+        CHECK(b.has_soul);
+        CHECK(p.soul().memory_size() == 1);
+
+        const UnifiedOutput d =
+            p.run_memorable(h, std::string("what is my position size limit"));
+        CHECK(d.soul.has_recall);
+        CHECK(has_substr(d.to_json(), "\"recall\""));
+    }
+}
+
+// ===========================================================================
+// Part J — decay and reinforcement over simulated time (§31)
+//
+// Time here is the crystal clock (stream positions), not wall clock, because
+// that is what MemoryCrystals stores. A test can therefore simulate four days
+// of silence in one call, which is the only practical way to test an Ebbinghaus
+// curve. The config compresses the units: tau = 1 day, 1000 tokens = 1 day, so
+// 4000 tokens is four days and exp(-4) ~= 1.8% is decisively under the floor.
+// ===========================================================================
+static MemoryCrystals::Config fast_decay_config() {
+    MemoryCrystals::Config c;
+    c.decay_tau_days = 1.0;
+    c.tokens_per_day = 1000.0;
+    c.min_importance = 0.05f;
+    return c;
+}
+
+static std::vector<int32_t> role_wrapped(const Tokenizer& tok,
+                                        const std::string& s) {
+    return tok.wrap_modality(Tokenizer::kUserStartId, Tokenizer::kUserEndId,
+                             tok.encode(s, false));
+}
+
+static void part_j_decay() {
+    platform::log_info("[J] decay and reinforcement over simulated time");
+
+    TEST("J1: an untouched crystal decays away; a reinforced one survives");
+    {
+        Tokenizer tok;
+        CHECK(tok.build_minimal());
+        MemoryCrystals mem(fast_decay_config());
+
+        uint64_t ida = 0, idb = 0;
+        CHECK(mem.crystallize(role_wrapped(tok, "alpha beta gamma"), tok, 0,
+                              -1.0f, &ida));
+        CHECK(mem.crystallize(role_wrapped(tok, "bravo charlie delta"), tok, 0,
+                              -1.0f, &idb));
+        CHECK(ida != 0 && idb != 0 && ida != idb);
+        CHECK(mem.size() == 2);
+
+        // Four days of silence, then the owner asks about B again.
+        CHECK(mem.reinforce(idb, 4000));
+
+        // A's age is 4 days, so its effective importance is exp(-4) ~= 1.8% of
+        // what it was: under the 5% floor. B was touched at 4000, so its age is
+        // zero and it survives.
+        CHECK(mem.decay(4000) == 1);
+        CHECK(mem.size() == 1);
+        CHECK(mem.find(ida) == nullptr);
+        CHECK(mem.find(idb) != nullptr);
+    }
+
+    TEST("J2: recall is reinforcement — a retrieved memory survives the gap");
+    {
+        Tokenizer tok;
+        CHECK(tok.build_minimal());
+        MemoryCrystals mem(fast_decay_config());
+
+        uint64_t ida = 0, idb = 0;
+        CHECK(mem.crystallize(role_wrapped(tok, "alpha beta gamma"), tok, 0,
+                              -1.0f, &ida));
+        CHECK(mem.crystallize(role_wrapped(tok, "bravo charlie delta"), tok, 0,
+                              -1.0f, &idb));
+
+        // Ask about A at the far end of the gap. Supplying the clock is what
+        // makes retrieval refresh recency; without it only the hit counter
+        // moves and A would die alongside B.
+        const auto hits = mem.retrieve(role_wrapped(tok, "alpha beta gamma"), 1, 4000);
+        CHECK(hits.size() == 1);
+        CHECK(hits[0].id == ida);
+        CHECK(hits[0].score > 0.5f);   // the exact tokens, so near-identical
+
+        CHECK(mem.decay(4000) == 1);
+        CHECK(mem.find(ida) != nullptr);
+        CHECK(mem.find(idb) == nullptr);
+    }
+
+    TEST("J3: decay ignores nothing — the clock argument is honoured");
+    {
+        Tokenizer tok;
+        CHECK(tok.build_minimal());
+        MemoryCrystals mem(fast_decay_config());
+        uint64_t id = 0;
+        CHECK(mem.crystallize(role_wrapped(tok, "alpha beta gamma"), tok, 0,
+                              -1.0f, &id));
+
+        // At the crystal's own clock it is young, so it survives...
+        CHECK(mem.decay(0) == 0);
+        CHECK(mem.find(id) != nullptr);
+        // ...and the SAME crystal at a clock four days later does not. The old
+        // implementation ignored this argument entirely, so both calls returned
+        // the same answer and neither could ever have been observed.
+        CHECK(mem.decay(4000) == 1);
+        CHECK(mem.find(id) == nullptr);
+    }
+
+    TEST("J4: a clock behind the stamp cannot inflate importance");
+    {
+        Tokenizer tok;
+        CHECK(tok.build_minimal());
+        MemoryCrystals mem(fast_decay_config());
+        uint64_t id = 0;
+        CHECK(mem.crystallize(role_wrapped(tok, "alpha beta gamma"), tok, 5000,
+                              -1.0f, &id));
+        const MemoryCrystal* c = mem.find(id);
+        CHECK(c != nullptr);
+        CHECK(c->last_access_token == 5000);   // born already "touched"
+
+        // A caller whose clock is behind the crystal's stamp must not produce a
+        // negative age, which would push effective importance ABOVE 1.0 and make
+        // the crystal immortal.
+        CHECK(mem.decay(100) == 0);
+        const MemoryCrystal* after = mem.find(id);
+        CHECK(after != nullptr);
+        CHECK(after->importance <= 1.0f);
+        CHECK(mem.reinforce(id, 100));
+        CHECK(mem.find(id)->importance <= 1.0f);
+    }
+
+    TEST("J5: the soul decays its own memories on its own clock");
+    {
+        Soul::Config c;
+        c.memory = fast_decay_config();
+        c.adapt_tone = false;
+        Soul s;
+        CHECK(s.init(c));
+
+        CHECK(s.converse("alpha beta gamma delta", "noted") != "");
+        CHECK(s.converse("zulu yankee xray whiskey", "noted too") != "");
+        const size_t before = s.memory_size();
+        CHECK(before >= 2);
+
+        const std::vector<uint64_t> ids = s.crystals().ids();
+        CHECK(!ids.empty());
+        const uint64_t keep = ids.front();   // the first thing it ever heard
+
+        // Four days pass with no conversation.
+        s.advance_memory_clock(4000);
+        // Then that first question comes up again, which is use.
+        CHECK(s.reinforce_memory(keep));
+
+        const size_t dropped = s.decay_memories();
+        CHECK(dropped == before - 1);
+        CHECK(s.memory_size() == 1);
+        CHECK(s.memory_dropped() == dropped);
+        CHECK(s.crystals().find(keep) != nullptr);
+    }
+}
+
 int main() {
     platform::log_info("=== omniseed soul: persona, emotion, honesty ===");
     part_a_commitments();
@@ -827,6 +1240,8 @@ int main() {
     part_f_overclaims();
     part_g_self_report();
     part_h_unified();
+    part_i_memory();
+    part_j_decay();
     platform::log_info("=== %d passed, %d failed ===", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

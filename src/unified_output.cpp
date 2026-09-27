@@ -161,10 +161,19 @@ std::string UnifiedPipeline::provenance() const {
     out += " | classifier="; out += classifier_.provenance();
     out += " | scorer="; out += scorer_.provenance();
     // The soul is the one stage whose honesty does not depend on fitted
-    // weights: it reports a measured calibration gap, not a projection.
+    // weights: it reports a measured calibration gap, not a projection. Its
+    // memory is reported by SIZE, because "memory=on" says nothing about
+    // whether anything was ever stored.
     out += " | soul=";
-    out += soul_ready_ ? "active (rule-based, self-reporting)"
-                       : "not configured";
+    if (!soul_ready_) {
+        out += "not configured";
+    } else if (soul_.config().use_memory) {
+        out += "active (rule-based, self-reporting, memory=";
+        out += std::to_string(soul_.memory_size());
+        out += " crystals)";
+    } else {
+        out += "active (rule-based, self-reporting, memory=off)";
+    }
     out += trained() ? " | ALL FITTED" : " | NOT FULLY FITTED (placeholder)";
     return out;
 }
@@ -254,6 +263,26 @@ UnifiedOutput UnifiedPipeline::run(const float* hidden,
                                    const std::string& user_turn) const {
     return run(hidden, user_turn,
                std::function<std::string(const DomainDecision&)>());
+}
+
+UnifiedOutput UnifiedPipeline::run_memorable(
+    const float* hidden, const std::string& user_turn,
+    const std::function<std::string(const DomainDecision&)>& text_fn) {
+    // Everything the const run does, unchanged.
+    UnifiedOutput out = run(hidden, text_fn);
+    if (!soul_ready_ || user_turn.empty()) return out;
+
+    // The non-const path: perceive, recall, and store the owner's question.
+    out.soul = soul_.perceive_and_recall(user_turn);
+    out.has_soul = out.soul.has_self;
+    out.normalise();
+    return out;
+}
+
+UnifiedOutput UnifiedPipeline::run_memorable(
+    const float* hidden, const std::string& user_turn) {
+    return run_memorable(hidden, user_turn,
+                         std::function<std::string(const DomainDecision&)>());
 }
 
 } // namespace omniseed

@@ -2954,4 +2954,174 @@ is untouched).
 3. Dream consolidation: schedule `omniseed dream` and have it decay crystals and
    prune the rationale log.
 
+---
+
+## 31. MEMORY & RECALL — THE SOUL REMEMBERS (2026-09-27)
+
+Milestone 2 of the memory/dream/calibration sequence. §30 gave the soul a voice
+and a self-report; it still forgot every exchange the moment the turn ended.
+
+### The finding
+
+`MemoryCrystals` (512 lines, `memory/memory_crystals.h/.cpp`) **already existed,
+already compiled, and was already tested** — `test_platform.cpp` covers
+crystallize, retrieve and save/load. But it was reachable only from
+`AgentLoop::build_prompt()` and one CLI demo. The soul had no memory, and the
+memory had no soul. As in §30, the missing piece was the **joint**, not the
+capability.
+
+Reading the decay path first was what made this milestone worth doing: the
+mechanism was **inverted**, and nothing had ever called it.
+
+### ⚠️ The decay bug: the model ran backwards
+
+`decay(double now_unix_seconds)` **ignored its argument** and derived age as
+`last_access_token / 100000.0` — reading a *stream position* as if it were
+already an *elapsed age*. Together with `retrieve()` writing
+`last_access_token = created_at_token + query_tokens.size()`, two inversions
+compounded:
+
+| | before | after |
+|---|---|---|
+| a crystal created at position 0 | **immortal** (age always 0) | ages normally |
+| a crystal created late | decayed **immediately** | ages normally |
+| effect of recall | made the memory **older** | **resets** the age |
+| the `now` argument | ignored | honoured |
+
+So "fade unless reinforced" was exactly backwards: using a memory could not save
+it, and creating one late could kill it. **Zero callers** existed, so the fix
+cost no compatibility.
+
+Fixes: `crystallize()` stamps `last_access_token = stream_pos` at birth;
+`decay(uint64_t now_token)` computes `age_days = (now − last_access)/tokens_per_day`
+(clamped at zero, so a clock behind the stamp cannot yield importance > 1.0);
+`retrieve(..., now_token)` refreshes recency; `reinforce(id, now_token, boost)`
+raises importance and resets the age. `tokens_per_day` (100k) replaced a literal.
+
+### ⚠️ Two false-memory bugs — found by the demo, NOT by the tests
+
+This is the part worth reading. The 378-check suite was **fully green** while the
+feature was wrong in two ways that only showed up when `demo-soul` printed a
+conversation:
+
+1. **Recall had no relevance floor.** `retrieve()` returns the *k nearest*
+   crystals whatever they say, and "nearest" among a handful of unrelated
+   memories still looks like an answer. An unrelated question scored **0.775**
+   and the soul confidently announced `"I said this before: ..."` about something
+   it had never seen. **Fix:** `min_relevance`, measured (below) — not guessed.
+2. **The gloss was being stored.** Turn 2's reply included turn 1's gloss, so
+   turn 3 quoted itself: `"I said this before: \"I said this before: ...\""` —
+   compounding every turn. **Fix:** the gloss is composed in `converse()` and
+   **never stored**; what is stored is the reply the owner would have received
+   with no memory at all.
+
+Both were caught by *looking at the output*, not by an assertion. The lesson is
+recorded here because it generalises: a green suite proves the properties you
+thought to assert, and nothing else.
+
+### What was built
+
+| file | what |
+|---|---|
+| `include/omniseed/memory/memory.h` + `src/memory/memory_crystals.cpp` | corrected `decay`/`retrieve`, `reinforce`, `find`, `ids`, `crystallize(..., out_id)`, `tokens_per_day`, `MemoryCrystal::score`, embed-dim clamp |
+| `include/omniseed/soul.h` + `src/soul.cpp` | `RecalledMemory`, `MemoryRole`, `recall_note()`, `SoulState` recall/memory sections, `perceive_and_recall`, `remember`, `converse`, `recall`, `top_match`, `decay_memories`, `reinforce_memory`, `advance_memory_clock`, `save/load_memories` |
+| `include/omniseed/unified_output.h` + `src/unified_output.cpp` | non-const `run_memorable()`; `provenance()` reports the crystal count |
+| `src/cli/main.cpp` | `omniseed demo-soul` |
+| `tests/test_soul.cpp` | parts **I** and **J**: 378 checks total (was 242) |
+| `docs/SOUL.md`, `RUNBOOK.md`, this file | design, the measured thresholds, the API |
+
+### Design decisions
+
+- **`perceive()` stays `const` and stores nothing.** `UnifiedPipeline::run()` is
+  a const method that calls it, and a const method that silently appends to
+  long-term memory is a trap: the caller cannot see the write in the signature,
+  and `run()` stops being idempotent in a way no type can express. Remembering
+  therefore lives in **named non-const** entry points — `perceive_and_recall()`,
+  `remember()`, `converse()`, and `run_memorable()`. I10 asserts the const
+  `run()` really does not store.
+- **`converse()` is the only stateful path.** `speak()` remains byte-identical to
+  §30: the memory gloss is an annotation on the turn, not an utterance, so it is
+  composed outside `speak()` and is not emotionally modulated. Rule 2 still holds
+  — the overclaim rewriter runs last, on the composed string.
+- **A refusal is never decorated with a memory.** A refusal is the whole reply;
+  attaching "we discussed this" would read as negotiating the thing just
+  declined. I7 forces a turn that *both* recalls and refuses, so the suppression
+  is tested rather than accidentally true.
+- **A recalled question brings its answer.** A reply's words rarely resemble the
+  question's, so the reply crystal never clears the floor against its own
+  question — the soul would only ever quote *the owner*. Answers are therefore
+  linked to their question at store time (`MemoryLinks`) and inherited, because
+  the answer is relevant **by construction**, not by its own cosine.
+- **Repeated exchanges are reinforced, not re-filed.** A question scoring ≥ 0.98
+  against one already held is reinforced; if its answer is also unchanged, the
+  answer is not re-filed either. Without both, a store that appends per turn is a
+  log file. `demo-soul` shows turn 3 repeating turn 1 with the store staying at
+  **4 crystals**.
+- **`max_len_tokens` is 96 for the soul**, not the memory layer's 48 — 48
+  truncates an ordinary sentence mid-word, and a soul that quotes a half-sentence
+  is worse than one that says nothing. Scoped to `Soul::Config` rather than
+  changed in the shared default, which `AgentLoop` relies on.
+- **Turns under the 8-token floor are counted** (`memory_skipped()`), not padded
+  to fit.
+
+### The thresholds are measured, not guessed
+
+`demo-soul` prints this table on every run and labels each row `ok`/`MISMATCH`:
+
+| probe | score | verdict |
+|---|---|---|
+| a question the store holds (verbatim) | 0.988 | claimed |
+| the same, one character off | 0.990 | claimed |
+| a paraphrase of it | 0.973 | claimed |
+| a question from an earlier turn | 0.989 | claimed |
+| a question **never** seen (short) | 0.828 | no claim |
+| a question **never** seen (long) | 0.876 | no claim |
+
+`min_relevance = 0.92` sits in the gap. `duplicate_recall_score = 0.98` sits
+above every true match and below the 1.0 ceiling.
+
+### Verification
+
+- `omniseed_soul`: **378 passed, 0 failed** (was 242). Parts A–H unchanged and
+  still green, which is what proves `speak()`'s byte-exact ordering survived.
+- **Full board: `ctest --test-dir build -C Release` → 34/34 passed (3300 s).**
+  The whole board, including all nine LoRA/Python suites, not just the C++
+  half — the slowest single suite was `omniseed_lora_chat` at 1232 s. This box
+  is ~5× slower than `CTestCostData.txt` implies; the board takes ~55 min.
+- `omniseed demo-soul` end-to-end: turn 2 (unrelated) claims nothing; turn 3
+  (repeated) quotes the soul's own prior answer, untruncated; the store stays at
+  4 crystals; 3 of 4 crystals decay away at +50 days while the reinforced one
+  survives.
+- Full build: **0 errors, 0 warnings** at `/W4`.
+- The persistence format is **unchanged**: `save()`/`load()` are untouched and
+  the version stays 2, so existing crystal sidecars still load. `MemoryCrystal`
+  gained a `score` field, which is a retrieval artifact and is deliberately not
+  serialised.
+
+### Honest gaps (do not overclaim)
+
+- **The relevance margin is thin and it narrows as the store grows.** Byte-level
+  bags are close to character histograms, so unrelated English still scores
+  0.83–0.88 and the floor sits in a ~0.10-wide gap. With the trained 8k–16k
+  vocabulary the tokens are words rather than bytes and discrimination is far
+  better — **but both thresholds must be re-derived** (`demo-soul` prints the
+  numbers). Until then, recall is a **near-verbatim** matcher, and it
+  under-claims rather than over-claims.
+- **Speaker roles and question/reply links are session-local** and not persisted,
+  so crystals restored from disk report role `unknown` and are unpaired.
+- **No CLI chat path uses any of this yet** — `demo-soul` is the only caller.
+- **The dream pass does not call `decay_memories()` yet** (that is milestone 3),
+  and calibration is still untouched (milestone 4).
+
+### Next
+
+1. **Milestone 3 — dream consolidation:** scan the last 24 h of crystals and the
+   rationale log, extract what worked/failed, strengthen or decay, write
+   `state/dream_log.json`. The decay and reinforcement primitives now exist for
+   it to call.
+2. **Milestone 4 — head training & calibration** (highest value).
+3. Re-derive `min_relevance` / `duplicate_recall_score` against a real vocabulary
+   (the tokenizer is the root cause of the thin margin).
+
+
 

@@ -18,23 +18,27 @@ namespace omniseed {
 // ===========================================================================
 void MemoryCrystals::embed_tokens(const std::vector<int32_t>& ids,
                                   float* out) const {
-    std::memset(out, 0, sizeof(float) * static_cast<size_t>(cfg_.embed_dim));
+    // MemoryCrystal::embedding is a fixed 64-float array, so the width is
+    // capped here rather than trusted from config: a larger embed_dim would
+    // otherwise write past the end of every crystal.
+    const int32_t dim = cfg_.embed_dim < 64 ? cfg_.embed_dim : 64;
+    std::memset(out, 0, sizeof(float) * static_cast<size_t>(dim));
     for (const int32_t id : ids) {
         // Fibonacci hashing for stable spread.
         const uint64_t h = (static_cast<uint64_t>(id) * 0x9E3779B97F4A7C15ull);
-        const size_t i1 = static_cast<size_t>(h % cfg_.embed_dim);
+        const size_t i1 = static_cast<size_t>(h % static_cast<uint64_t>(dim));
         const size_t i2 =
-            static_cast<size_t>((h >> 17u) % static_cast<uint64_t>(cfg_.embed_dim));
+            static_cast<size_t>((h >> 17u) % static_cast<uint64_t>(dim));
         out[i1] += 1.0f;
         out[i2] += 0.5f;
     }
     // L2 normalize
     double n2 = 0.0;
-    for (int32_t i = 0; i < cfg_.embed_dim; ++i)
+    for (int32_t i = 0; i < dim; ++i)
         n2 += static_cast<double>(out[i]) * out[i];
     const float inv =
         static_cast<float>(1.0 / std::sqrt(n2 + 1e-12));
-    for (int32_t i = 0; i < cfg_.embed_dim; ++i) out[i] *= inv;
+    for (int32_t i = 0; i < dim; ++i) out[i] *= inv;
 }
 
 // ===========================================================================
@@ -42,7 +46,8 @@ void MemoryCrystals::embed_tokens(const std::vector<int32_t>& ids,
 // ===========================================================================
 bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
                                  const Tokenizer& tok, uint64_t stream_pos,
-                                 float entropy) {
+                                 float entropy, uint64_t* out_id) {
+    if (out_id) *out_id = 0;
     if (retired_tokens.size() < 8) return false;   // too small to be useful
 
     // ---- sentence segmentation on '.'/'!'/'?'/'\n' pieces -------------------
@@ -92,6 +97,11 @@ bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
     MemoryCrystal c;
     c.id = next_id_++;
     c.created_at_token = stream_pos;
+    // A crystal is "last touched" when it is born. Leaving this at 0 made the
+    // age term measure the distance from the start of the stream instead of
+    // from creation, so the very first crystals were immortal and every later
+    // one aged by its own creation offset.
+    c.last_access_token = stream_pos;
     int32_t budget = cfg_.max_len_tokens;
     for (const size_t si : idx) {
         if (budget <= 0) break;
@@ -134,6 +144,7 @@ bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
     }
 
     crystals_.push_back(std::move(c));
+    if (out_id) *out_id = crystals_.back().id;
     return true;
 }
 
@@ -141,9 +152,14 @@ bool MemoryCrystals::crystallize(const std::vector<int32_t>& retired_tokens,
 // Retrieval: cosine similarity over crystal embeddings (+ recency bookkeeping)
 // ===========================================================================
 std::vector<MemoryCrystal> MemoryCrystals::retrieve(
-        const std::vector<int32_t>& query_tokens, int32_t k) {
+        const std::vector<int32_t>& query_tokens, int32_t k,
+        uint64_t now_token) {
     if (crystals_.empty() || k <= 0) return {};
 
+    // embed_tokens() writes cfg_.embed_dim floats; MemoryCrystal::embedding is
+    // a fixed 64-float array, so anything above 64 would already be a buffer
+    // overrun at storage time. Clamp here rather than read past the struct.
+    const int32_t dim = cfg_.embed_dim < 64 ? cfg_.embed_dim : 64;
     float q[64];
     embed_tokens(query_tokens, q);
 
@@ -152,7 +168,7 @@ std::vector<MemoryCrystal> MemoryCrystals::retrieve(
     for (size_t i = 0; i < crystals_.size(); ++i) {
         const MemoryCrystal& c = crystals_[i];
         float dot = 0.0f;
-        for (int32_t d = 0; d < cfg_.embed_dim; ++d)
+        for (int32_t d = 0; d < dim; ++d)
             dot += q[d] * c.embedding[d];
         scored.emplace_back(dot * (0.5f + 0.5f * c.importance), i);
     }
@@ -166,8 +182,12 @@ std::vector<MemoryCrystal> MemoryCrystals::retrieve(
     for (int32_t i = 0; i < take; ++i) {
         const size_t idx = scored[static_cast<size_t>(i)].second;
         crystals_[idx].hits += 1;                    // Ebbinghaus bookkeeping
-        crystals_[idx].last_access_token =           // "recency" in stream time
-            crystals_[idx].created_at_token + static_cast<uint64_t>(query_tokens.size());
+        // Recall is use. Refresh the access stamp so decay() measures age from
+        // NOW, not from birth — that is what makes recall reinforce.
+        if (now_token > 0) crystals_[idx].last_access_token = now_token;
+        // Report the relevance we scored it at, so a caller does not have to
+        // re-derive it (and cannot silently use a different formula).
+        crystals_[idx].score = scored[static_cast<size_t>(i)].first;
         out.push_back(crystals_[idx]);
     }
     return out;
@@ -176,14 +196,19 @@ std::vector<MemoryCrystal> MemoryCrystals::retrieve(
 // ===========================================================================
 // Ebbinghaus decay: effective = importance * exp(-age_days / tau)
 // ===========================================================================
-size_t MemoryCrystals::decay(double now_unix_seconds) {
-    if (cfg_.decay_tau_days <= 0.0) return 0;
+size_t MemoryCrystals::decay(uint64_t now_token) {
+    if (cfg_.decay_tau_days <= 0.0 || cfg_.tokens_per_day <= 0.0) return 0;
     size_t dropped = 0;
     for (auto it = crystals_.begin(); it != crystals_.end();) {
-        // Age in days since creation (stream position stands in for wall
-        // time when the caller does not track wall clock per crystal).
-        const double age_days = static_cast<double>(it->last_access_token) /
-                                100000.0;   // 100k tokens ≈ 1 day of use
+        // Age since the last time this crystal was touched (born, retrieved or
+        // reinforced), in days. Clamped at zero so a caller whose clock is
+        // behind a crystal's stamp cannot produce a negative age and therefore
+        // an importance ABOVE 1.0.
+        const uint64_t age_tokens =
+            now_token > it->last_access_token ? now_token - it->last_access_token
+                                              : 0;
+        const double age_days =
+            static_cast<double>(age_tokens) / cfg_.tokens_per_day;
         const double eff = static_cast<double>(it->importance) *
                            std::exp(-age_days / cfg_.decay_tau_days) *
                            (1.0 + 0.1 * std::min<uint32_t>(it->hits, 10));
@@ -195,6 +220,27 @@ size_t MemoryCrystals::decay(double now_unix_seconds) {
         }
     }
     return dropped;
+}
+
+// ===========================================================================
+// Reinforcement: a used memory gets more important and younger
+// ===========================================================================
+bool MemoryCrystals::reinforce(uint64_t id, uint64_t now_token, float boost) {
+    const float gain = boost < 0.0f ? cfg_.reinforce_boost : boost;
+    for (MemoryCrystal& c : crystals_) {
+        if (c.id != id) continue;
+        c.importance = std::min(1.0f, c.importance + gain);
+        c.hits += 1;
+        if (now_token > 0) c.last_access_token = now_token;
+        return true;
+    }
+    return false;
+}
+
+const MemoryCrystal* MemoryCrystals::find(uint64_t id) const {
+    for (const MemoryCrystal& c : crystals_)
+        if (c.id == id) return &c;
+    return nullptr;
 }
 
 // ===========================================================================

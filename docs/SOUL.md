@@ -184,6 +184,157 @@ only the evidence differs. Pinned by H5.
 The soul **never changes what the decision layer produced** (H3): the heads run
 first and the soul is added to the document afterwards.
 
+## Memory (§31) — what the soul remembers
+
+A soul that forgets every exchange the moment it ends is a lookup table with
+opinions. §31 wires the existing `MemoryCrystals` store into the Soul so it
+remembers what the owner asked and what it answered.
+
+```bash
+./build/bin/omniseed.exe demo-soul      # the whole mechanism, with measurements
+```
+
+### `perceive()` is still const, and still writes nothing
+
+This is the load-bearing decision. `UnifiedPipeline::run()` is a `const` method
+that calls `Soul::perceive()`, and **a const method that silently appends to
+long-term memory is a trap**: the caller cannot see the write in the signature,
+and calling `run()` twice stops being idempotent in a way no type can express.
+
+So remembering lives in named non-const entry points:
+
+| call | what it does |
+|---|---|
+| `perceive_and_recall(turn)` | `perceive()`, then recall related memories, then store the owner's question |
+| `remember(question, reply)` | store the soul's reply, reinforce what the turn recalled |
+| `converse(turn, base_reply)` | the whole turn: recall → `speak()` → store. **This is the path a chat loop should call** |
+| `recall(query, k)` | ranked recall, no state change |
+| `top_match(query)` | the best match **ignoring** the floor — for measuring, not for claiming |
+| `decay_memories()` | the Ebbinghaus pass, at the soul's clock |
+| `advance_memory_clock(tokens)` | simulate elapsed time (tests, dream) |
+
+`UnifiedPipeline::run_memorable()` is the non-const sibling of `run()`: same
+document, plus recall, plus the question stored. I10 asserts that the const
+`run()` really does **not** store.
+
+### The same question twice
+
+```
+turn 1  owner: what is my position size limit
+        soul : Two percent per trade, three per day, six per week.
+turn 2  owner: how did the last aapl trade go
+        soul : It closed up on light volume.                  ← no false memory
+turn 3  owner: what is my position size limit
+        soul : I said this before: "Two percent per trade, three per day,
+               six per week.". Two percent per trade, three per day, six per week.
+```
+
+Two things had to be built for turn 3 to be honest rather than merely
+impressive.
+
+**1. A relevance floor.** With no floor, `retrieve()` returns the *k nearest*
+crystals whatever they say, and "nearest" among a handful of unrelated memories
+still looks like an answer — the soul announces that it remembers things it has
+never seen. The first version of this demo did exactly that: an unrelated
+question scored **0.775** and produced a confident `"I said this before: ..."`.
+
+`min_relevance` (default **0.92**) is **measured, not guessed**. On the minimal
+byte-level tokenizer:
+
+| probe | score | verdict |
+|---|---|---|
+| a question the store holds (verbatim) | 0.988 | claimed |
+| the same question, one character off | 0.990 | claimed |
+| a paraphrase of it | 0.973 | claimed |
+| a question from an earlier turn | 0.989 | claimed |
+| a question the store has **never** seen (short) | 0.828 | no claim |
+| a question the store has **never** seen (long) | 0.876 | no claim |
+
+`demo-soul` prints this table every run and labels each row `ok` or `MISMATCH`,
+so the threshold can be re-derived rather than trusted.
+
+**2. Answers are paired with their questions.** A reply's words rarely resemble
+the question's, so a reply crystal does not clear the floor against its own
+question — the soul would only ever quote *what the owner said*. A recalled
+question therefore brings its answer with it: the answer is relevant **by
+construction**, not by its own cosine. That is what makes turn 3 quote the
+soul's own prior sentence.
+
+### Decay, and the bug that made it backwards
+
+`effective = importance × exp(−age_days / τ) × (1 + 0.1·min(hits, 10))`
+
+The previous `decay(double now_unix_seconds)` **ignored its argument** and
+derived age as `last_access_token / 100000.0` — reading a stream position as if
+it were already an elapsed age. Combined with `retrieve()` writing
+`last_access_token = created_at_token + query_tokens.size()`, the model was
+inverted in two ways at once:
+
+* a crystal created late (large stream position) decayed **immediately**, while
+  one created at position 0 could **never** decay;
+* **recall made a memory older**, not younger — so using a memory could not save
+  it from being forgotten.
+
+Fixed:
+
+* `crystallize()` sets `last_access_token = stream_pos` at birth;
+* `decay(uint64_t now_token)` honours its argument and computes
+  `age_days = (now_token − last_access_token) / tokens_per_day`, clamped at zero
+  so a clock behind the stamp cannot produce a negative age and an importance
+  above 1.0;
+* `retrieve(..., now_token)` refreshes recency — **recall is reinforcement**;
+* `reinforce(id, now_token, boost)` raises importance and resets the age.
+
+Nothing called `decay()` before this change, so the fix cost no compatibility.
+J1–J5 pin it, including that the same crystal survives at its own clock and dies
+four days later at a later one.
+
+### A repeated exchange is not filed twice
+
+Reinforcement alone is not enough: a store that appends a crystal per turn is a
+log file. Two dedupes:
+
+* a question scoring ≥ `duplicate_recall_score` (0.98) against one already held
+  is **reinforced, not re-filed**;
+* if that turn's answer is also unchanged, the answer is not re-filed either.
+
+`demo-soul` shows this directly — turn 3 repeats turn 1 and the store stays at
+**4 crystals**.
+
+### What is stored, and what is not
+
+* The question and the reply are stored as **separate crystals**, each wrapped in
+  its chat role markers so the crystal's own token stream records who spoke.
+* **The memory gloss is never stored.** It is an annotation on the turn, not
+  something the soul said. Storing it made the soul quote itself recursively:
+  `"I said this before: \"I said this before: ...\""`.
+* A turn shorter than `crystallize()`'s 8-token floor is **counted** in
+  `memory_skipped()`, not padded to fit.
+* Crystal summaries are capped at `max_len_tokens` (**96** for the soul; the
+  memory layer's own default of 48 truncates an ordinary sentence mid-word).
+
+### Known limitations of memory
+
+* **The margin is thin, and it narrows as the store grows.** Byte-level bags are
+  close to character histograms, so unrelated English still scores 0.83–0.88.
+  The 0.92 floor sits in a ~0.10-wide gap. With the trained 8k–16k vocabulary the
+  tokens are words rather than bytes and discrimination is far better — **but
+  `min_relevance` and `duplicate_recall_score` must be re-measured against it**
+  (`demo-soul` prints the numbers).
+* **Recall is near-verbatim.** A paraphrase at 0.973 clears the floor; a looser
+  one would not. The soul under-claims rather than over-claims, deliberately.
+* **Speaker roles and question/reply links are session-local.** They are not
+  persisted, so crystals restored from disk report role `unknown` and are not
+  paired. `MemoryCrystals` persists crystals, not the Soul's index over them.
+* **The gloss is not emotionally modulated.** It leads the reply, outside
+  `speak()`, because it is an annotation rather than an utterance. Rule 2 still
+  holds: the overclaim rewriter runs last, on the composed string.
+* **A refusal is never decorated with a memory.** A refusal is the whole reply;
+  attaching context would read as negotiating the thing just declined (I7).
+* **`converse()` is the only stateful path.** A caller using
+  `perceive_and_recall()` + `speak()` directly gets no gloss — and no storage of
+  the reply, because `speak()` cannot know it will be remembered.
+
 ## Known limitations — read before trusting this
 
 * **The commitments are enforced by surface cues, and they fail CLOSED toward
@@ -206,12 +357,14 @@ first and the soul is added to the document afterwards.
 
 ## Tests
 
-`tests/test_soul.cpp` — **242 checks**, registered **outside** CMake's `.venv`
-gate (a gate that never executes is not a gate). Eight parts: commitments,
+`tests/test_soul.cpp` — **378 checks**, registered **outside** CMake's `.venv`
+gate (a gate that never executes is not a gate). Ten parts: commitments,
 refusals, stances, emotion, `speak()` ordering, the rewriter, the self-report,
-and the unified-document integration.
+the unified-document integration, **memory & recall (§31)**, and **decay over
+simulated time (§31)**.
 
 ```bash
 cmake --build build --config Release --target omniseed_soul
 ./build/bin/omniseed_soul.exe
+./build/bin/omniseed.exe demo-soul
 ```

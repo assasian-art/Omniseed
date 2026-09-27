@@ -41,6 +41,17 @@ std::string to_lower(const std::string& s) {
     return out;
 }
 
+// Crystal summaries come from decode() over a byte-fallback token stream, so
+// they carry the leading and trailing spaces of the stored turn. Quoting a
+// memory with those spaces inside the quotes looks like a bug in the reply, so
+// the note composes a trimmed copy.
+std::string trim(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
 bool any_phrase(const std::string& lower, const char* const* list, size_t n) {
     for (size_t i = 0; i < n; ++i)
         if (lower.find(list[i]) != std::string::npos) return true;
@@ -155,6 +166,40 @@ bool negated_before(const std::string& lower, size_t pos) {
 }
 
 } // namespace
+
+// ===========================================================================
+// Memory — the gloss the soul puts on a recognised turn
+// ===========================================================================
+const char* memory_role_name(MemoryRole r) {
+    switch (r) {
+        case MemoryRole::Owner: return "owner";
+        case MemoryRole::Soul:  return "soul";
+        case MemoryRole::Unknown: break;
+    }
+    return "unknown";
+}
+
+std::string recall_note(const std::vector<RecalledMemory>& memories) {
+    if (memories.empty()) return std::string();
+
+    // Prefer the soul's OWN words. "I said this before" is the claim being made,
+    // and quoting the owner back at the owner proves less about memory than
+    // quoting the reply the soul actually gave.
+    const RecalledMemory* pick = &memories.front();
+    for (const RecalledMemory& m : memories) {
+        if (m.role == MemoryRole::Soul) { pick = &m; break; }
+    }
+
+    std::string out;
+    switch (pick->role) {
+        case MemoryRole::Soul:  out = "I said this before: \""; break;
+        case MemoryRole::Owner: out = "You raised this before: \""; break;
+        case MemoryRole::Unknown: out = "I remember this: \""; break;
+    }
+    out += trim(pick->summary);
+    out += "\". ";
+    return out;
+}
 
 // ===========================================================================
 // Persona — the commitments
@@ -365,6 +410,48 @@ std::string SoulState::to_json() const {
         out += "\",\"sentiment_score\":";
         heads_detail::append_float(out, sentiment.score);
     }
+    if (has_recall) {
+        out += ",\"recall\":{\"memories\":[";
+        for (size_t i = 0; i < recall.size(); ++i) {
+            if (i) out += ',';
+            out += "{\"id\":";
+            out += std::to_string(recall[i].id);
+            out += ",\"role\":\"";
+            out += memory_role_name(recall[i].role);
+            out += "\",\"hits\":";
+            out += std::to_string(recall[i].hits);
+            // "relevance", never "confidence": cosine x importance from a
+            // bag-of-tokens projection is a ranking, not a probability.
+            out += ",\"relevance\":";
+            heads_detail::append_float(out, recall[i].score);
+            if (!recall[i].summary.empty()) {
+                out += ",\"summary\":\"";
+                out += heads_detail::json_escape(trim(recall[i].summary));
+                out += '"';
+            }
+            out += '}';
+        }
+        out += ']';
+        if (!recall_summary.empty()) {
+            out += ",\"note\":\"";
+            out += heads_detail::json_escape(recall_summary);
+            out += '"';
+        }
+        out += '}';
+    }
+    if (has_memory) {
+        out += ",\"memory\":{\"crystals\":";
+        out += std::to_string(memory_crystals);
+        out += ",\"stored\":";
+        out += std::to_string(memory_stored);
+        out += ",\"skipped\":";
+        out += std::to_string(memory_skipped);
+        out += ",\"dropped\":";
+        out += std::to_string(memory_dropped);
+        out += ",\"clock\":";
+        out += std::to_string(memory_clock);
+        out += '}';
+    }
     if (has_self) {
         out += ",\"self\":{\"calibrated_samples\":";
         out += std::to_string(calibrated_samples);
@@ -412,10 +499,51 @@ bool Soul::init(const Config& cfg) {
         error_ = "Soul::init: persona name must not be empty";
         return false;
     }
+    // Memory config is validated here, with everything else, so a bad value is
+    // rejected before any state is touched.
+    if (cfg.use_memory) {
+        if (cfg.memory.embed_dim <= 0 || cfg.memory.embed_dim > 64) {
+            error_ = "Soul::init: memory.embed_dim must be in (1, 64] — "
+                     "MemoryCrystal::embedding is a fixed 64-float array";
+            return false;
+        }
+        if (cfg.recall_k < 0) {
+            error_ = "Soul::init: recall_k must be >= 0";
+            return false;
+        }
+    }
 
     cfg_ = cfg;
     persona_ = Persona(cfg_.persona);
     emotion_ = EmotionalResonance(cfg_.emotion);
+
+    // ---- memory facet (§31) -------------------------------------------------
+    // Built once and then PRESERVED across re-init: set_config() must not
+    // silently wipe what the soul has learned. Changing memory.Config therefore
+    // needs a fresh Soul, which is stated here rather than discovered later.
+    if (cfg_.use_memory) {
+        if (!tok_.valid() && !tok_.build_minimal()) {
+            error_ = "Soul::init: tokenizer build failed — memory needs a "
+                     "vocabulary to segment and embed turns";
+            return false;
+        }
+        if (!memory_ready_) {
+            crystals_ = MemoryCrystals(cfg_.memory);
+            memory_ready_ = true;
+            links_.clear();
+            last_recall_ids_.clear();
+            last_question_id_ = 0;
+            memory_clock_   = 1;   // 0 means "no clock" to retrieve()
+            memory_stored_  = 0;
+            memory_skipped_ = 0;
+            memory_dropped_ = 0;
+            // A missing sidecar is normal on a first run, so load is
+            // best-effort and its failure is not an init failure.
+            if (!cfg_.crystals_path.empty()) load_memories();
+        }
+    } else {
+        memory_ready_ = false;
+    }
 
     // Seed the goals once. These are the two the runtime can actually measure
     // today; anything else would be decoration.
@@ -496,6 +624,303 @@ SoulState Soul::perceive(const std::string& user_text, const EmotionalInput& in)
     }
     st.self_report = buf;
     return st;
+}
+
+// ===========================================================================
+// Memory: recall, storage, reinforcement, decay
+//
+// The one thing to keep straight: perceive() above is const and writes nothing.
+// Everything here is non-const and writes. That split is the whole design — see
+// the header note.
+// ===========================================================================
+void Soul::fill_memory_stats(SoulState& st) const {
+    if (!memory_ready_) return;
+    st.has_memory      = true;
+    st.memory_crystals = crystals_.size();
+    st.memory_stored   = memory_stored_;
+    st.memory_skipped  = memory_skipped_;
+    st.memory_dropped  = memory_dropped_;
+    st.memory_clock    = memory_clock_;
+}
+
+const Soul::MemoryLink* Soul::link_of(uint64_t id) const {
+    for (const MemoryLink& l : links_)
+        if (l.id == id) return &l;
+    return nullptr;
+}
+
+MemoryRole Soul::role_of(uint64_t id) const {
+    const MemoryLink* l = link_of(id);
+    if (!l) {
+        // A crystal restored from disk has no link: the mapping is session-local.
+        // Reporting "unknown" is honest; guessing "soul" would not be.
+        return MemoryRole::Unknown;
+    }
+    return static_cast<MemoryRole>(l->role);
+}
+
+bool Soul::paired_answer(uint64_t question_id, RecalledMemory* out) const {
+    for (const MemoryLink& l : links_) {
+        if (l.answers != question_id) continue;
+        if (static_cast<MemoryRole>(l.role) != MemoryRole::Soul) continue;
+        const MemoryCrystal* c = crystals_.find(l.id);
+        if (!c) continue;
+        if (out) {
+            out->id      = c->id;
+            out->score   = 0.0f;   // filled in by the caller from the question
+            out->hits    = c->hits;
+            out->role    = MemoryRole::Soul;
+            out->summary = trim(c->summary);
+        }
+        return true;
+    }
+    return false;
+}
+
+void Soul::prune_roles() {
+    const size_t cap = cfg_.memory.max_crystals * 2;
+    if (links_.size() <= cap) return;
+    std::vector<MemoryLink> keep;
+    keep.reserve(cap);
+    for (const MemoryLink& l : links_)
+        if (crystals_.find(l.id) != nullptr) keep.push_back(l);
+    links_.swap(keep);
+}
+
+uint64_t Soul::store_turn(const std::string& text, MemoryRole role,
+                          uint64_t answers) {
+    if (!memory_ready_ || text.empty()) return 0;
+
+    // Wrap the text in its chat role markers. Two reasons: the crystal's own
+    // token stream then records who spoke, and the two control tokens count
+    // toward crystallize()'s 8-token floor, so ordinary turns clear it.
+    const bool is_soul = role == MemoryRole::Soul;
+    const std::vector<int32_t> ids = tok_.wrap_modality(
+        is_soul ? Tokenizer::kAssistantStartId : Tokenizer::kUserStartId,
+        is_soul ? Tokenizer::kAssistantEndId : Tokenizer::kUserEndId,
+        tok_.encode(text, false));
+
+    // crystallize() refuses anything under 8 tokens, and padding the store with
+    // filler to clear the floor would put noise in front of real memories.
+    // Counting the skip is the honest option.
+    if (ids.size() < 8) { ++memory_skipped_; return 0; }
+
+    uint64_t id = 0;
+    if (!crystals_.crystallize(ids, tok_, memory_clock_, -1.0f, &id)) {
+        ++memory_skipped_;
+        return 0;
+    }
+    ++memory_stored_;
+    memory_clock_ += static_cast<uint64_t>(ids.size());
+    links_.push_back(MemoryLink{id, static_cast<int32_t>(role), answers});
+    prune_roles();
+    return id;
+}
+
+std::vector<RecalledMemory> Soul::recall(const std::string& query, int32_t k) {
+    std::vector<RecalledMemory> out;
+    if (!memory_ready_ || query.empty()) return out;
+    const int32_t want = k < 0 ? cfg_.recall_k : k;
+    if (want <= 0) return out;
+
+    const std::vector<int32_t> q = tok_.encode(query, false);
+    if (q.empty()) return out;
+
+    for (const MemoryCrystal& c : crystals_.retrieve(q, want, memory_clock_)) {
+        // A floor, because "nearest" is not the same as "related". Without it
+        // every query returns its k nearest crystals whatever they say, and the
+        // soul announces that it remembers things it has never seen. The
+        // default is measured, not guessed — see docs/SOUL.md.
+        if (c.score < cfg_.min_relevance) continue;
+        RecalledMemory m;
+        m.id      = c.id;
+        m.score   = c.score;
+        m.hits    = c.hits;
+        m.role    = role_of(c.id);
+        m.summary = trim(c.summary);
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+bool Soul::top_match(const std::string& query, RecalledMemory* out) {
+    if (!memory_ready_ || query.empty()) return false;
+    const std::vector<int32_t> q = tok_.encode(query, false);
+    if (q.empty()) return false;
+    // now_token = 0 on purpose: this is a diagnostic, and a diagnostic that
+    // silently reinforces what it measures would corrupt the thing it reports.
+    const std::vector<MemoryCrystal> hits = crystals_.retrieve(q, 1, 0);
+    if (hits.empty()) return false;
+    if (out) {
+        out->id      = hits[0].id;
+        out->score   = hits[0].score;
+        out->hits    = hits[0].hits;
+        out->role    = role_of(hits[0].id);
+        out->summary = trim(hits[0].summary);
+    }
+    return true;
+}
+
+SoulState Soul::perceive_and_recall(const std::string& user_text) {
+    return perceive_and_recall(user_text, EmotionalInput());
+}
+
+SoulState Soul::perceive_and_recall(const std::string& user_text,
+                                    const EmotionalInput& in) {
+    SoulState st = perceive(user_text, in);   // the const path, unchanged
+    if (!memory_ready_ || user_text.empty()) {
+        fill_memory_stats(st);
+        return st;
+    }
+
+    // 1. What do I already know about this turn?
+    st.recall = recall(user_text, cfg_.recall_k);
+
+    // A recalled QUESTION brings its answer with it. The answer is relevant by
+    // construction rather than by its own cosine — a reply's words rarely
+    // resemble the question's — and this is what lets the soul quote what IT
+    // said, which is the half of "memory" a question-only store would miss.
+    const size_t n_direct = st.recall.size();
+    for (size_t i = 0; i < n_direct; ++i) {
+        if (st.recall[i].role != MemoryRole::Owner) continue;
+        RecalledMemory ans;
+        if (!paired_answer(st.recall[i].id, &ans)) continue;
+        ans.score = st.recall[i].score;   // inherited from the question
+        st.recall.push_back(std::move(ans));
+    }
+
+    st.has_recall = !st.recall.empty();
+    if (st.has_recall) st.recall_summary = recall_note(st.recall);
+    // Remember exactly what surfaced, so remember() reinforces those and does
+    // not re-run the query (which would double-count the hit).
+    last_recall_ids_.clear();
+    last_recall_ids_.reserve(st.recall.size());
+    for (const RecalledMemory& m : st.recall) last_recall_ids_.push_back(m.id);
+
+    // 2. Remember that the owner asked. The reply is stored by remember(),
+    //    because at perception time it does not exist yet.
+    //
+    //    Unless we already hold this exact question: then filing a second copy
+    //    is how a memory store turns into a log file. Reinforce the one we have
+    //    — which is also the honest reading of "the owner keeps asking this".
+    const bool same_question =
+        !st.recall.empty() &&
+        st.recall.front().role == MemoryRole::Owner &&
+        st.recall.front().score >= cfg_.duplicate_recall_score;
+    last_turn_duplicate_ = same_question;
+    if (same_question) {
+        crystals_.reinforce(st.recall.front().id, memory_clock_);
+        // Keep the link current so this turn's reply attaches to the question
+        // already held rather than orphaning.
+        last_question_id_ = st.recall.front().id;
+    } else {
+        last_question_id_ = store_turn(user_text, MemoryRole::Owner);
+    }
+
+    fill_memory_stats(st);
+    return st;
+}
+
+bool Soul::remember(const std::string& /*question*/, const std::string& reply) {
+    if (!memory_ready_ || reply.empty()) return false;
+
+    // The exchange was USED: whatever this turn recalled has now been acted on.
+    // retrieve() already refreshed its age, so this raises its importance —
+    // the part that decides whether the memory survives a long absence.
+    for (const uint64_t id : last_recall_ids_)
+        crystals_.reinforce(id, memory_clock_);
+    last_recall_ids_.clear();
+
+    // A repeated question whose answer has not changed teaches the store
+    // nothing. Filing it anyway is the same leak as re-filing the question, one
+    // step removed — so it is skipped, and the question that was reinforced
+    // above is the whole record of the repeat.
+    if (last_turn_duplicate_) {
+        RecalledMemory previous;
+        if (paired_answer(last_question_id_, &previous) &&
+            previous.summary == trim(reply)) {
+            return false;
+        }
+    }
+
+    // Link the reply to the question it answered, so a later recall of that
+    // question can surface what the soul actually said.
+    return store_turn(reply, MemoryRole::Soul, last_question_id_) != 0;
+}
+
+std::string Soul::converse(const std::string& user_text,
+                           const std::string& base_reply,
+                           SoulState* out_state) {
+    return converse(user_text, base_reply, EmotionalInput(), out_state);
+}
+
+std::string Soul::converse(const std::string& user_text,
+                           const std::string& base_reply,
+                           const EmotionalInput& in,
+                           SoulState* out_state) {
+    SoulState st = perceive_and_recall(user_text, in);
+    const std::string answer = speak(base_reply, st);
+
+    // Store the answer and NOT the gloss below. Two reasons, both learned the
+    // hard way from the demo: a memory that quotes a memory compounds every
+    // turn ("I said this before: \"I said this before: ...\""), and the gloss is
+    // meta-commentary about the conversation rather than something the soul
+    // said. What gets stored is the reply the owner would have received with no
+    // memory at all — after the honesty gate, so it cannot remember having said
+    // something it never said.
+    if (memory_ready_) remember(user_text, answer);
+    if (out_state) *out_state = st;
+
+    // Rule 4 (§31): memory is context, and context is not offered on a refusal.
+    // A refusal is the whole reply; decorating it with "we discussed this
+    // before" would read as negotiating the thing just declined.
+    if (!st.has_recall || st.persona.stance == Stance::Refuse) return answer;
+
+    const std::string note = st.recall_summary.empty()
+                                 ? recall_note(st.recall)
+                                 : st.recall_summary;
+    if (note.empty()) return answer;
+
+    // The gloss leads, deliberately outside speak(): it is an annotation on the
+    // turn, so it must not be emotionally modulated and must not sit inside the
+    // persona's lead-in. Rule 2 still holds — the honesty gate runs last, on the
+    // composed string, because the gloss is text leaving the process too.
+    std::string out = note + answer;
+    if (cfg_.rewrite_overclaims) out = correct_overclaims(out, nullptr);
+    return out;
+}
+
+void Soul::advance_memory_clock(uint64_t tokens) { memory_clock_ += tokens; }
+
+size_t Soul::decay_memories() { return decay_memories(memory_clock_); }
+
+size_t Soul::decay_memories(uint64_t now_token) {
+    if (!memory_ready_) return 0;
+    const size_t n = crystals_.decay(now_token);
+    memory_dropped_ += n;
+    return n;
+}
+
+bool Soul::reinforce_memory(uint64_t id) {
+    if (!memory_ready_) return false;
+    return crystals_.reinforce(id, memory_clock_);
+}
+
+bool Soul::save_memories() const {
+    if (!memory_ready_ || cfg_.crystals_path.empty()) return false;
+    return crystals_.save(cfg_.crystals_path);
+}
+
+bool Soul::load_memories() {
+    if (!memory_ready_ || cfg_.crystals_path.empty()) return false;
+    if (!crystals_.load(cfg_.crystals_path)) return false;
+    // Roles and question/reply links are not persisted, so drop the stale
+    // mapping rather than let it mislabel crystals whose ids were reused by the
+    // load. Crystals restored from disk therefore report role "unknown".
+    links_.clear();
+    last_recall_ids_.clear();
+    last_question_id_ = 0;
+    return true;
 }
 
 std::string Soul::correct_overclaims(const std::string& text,

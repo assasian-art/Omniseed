@@ -129,7 +129,7 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_router.exe           # 348 checks, incl. the <100 us budget
 ./build/bin/omniseed_unified_output.exe   # 267 checks, incl. the fast path
 ./build/bin/omniseed_language_heads.exe   # 614 checks
-./build/bin/omniseed_soul.exe             # 242 checks, persona + honesty gate
+./build/bin/omniseed_soul.exe             # 378 checks, persona + memory + decay
 ```
 
 These four print measured latency, so running them is also how you re-measure:
@@ -181,8 +181,15 @@ Related flags:
 ./build/bin/omniseed.exe info          # build + config report
 ./build/bin/omniseed.exe tools         # list available tools
 ./build/bin/omniseed.exe selftest      # kernel self-test
+./build/bin/omniseed.exe demo-soul     # persona + memory + recall + decay
 ./build/bin/omniseed.exe gen --help    # generation options
 ```
+
+`demo-soul` needs no model and no weights. It runs three turns (the third repeats
+the first), prints the recall gloss, then prints the **measured** relevance
+separation that `min_relevance` comes from — each probe labelled `ok` or
+`MISMATCH` — and finishes with a simulated 50-day decay pass. It is the fastest
+way to re-derive the thresholds if you change the tokenizer.
 
 ---
 
@@ -253,6 +260,44 @@ std::printf("%s\n", soul.capability_report().c_str());
 
 Full design, the three ordering rules, and the honest limitations:
 **`docs/SOUL.md`**.
+
+### Giving the soul memory
+
+Memory is **on by default** in `Soul::Config`. It costs one minimal tokenizer and
+under 2 MB of crystals, and it needs no model.
+
+```cpp
+Soul soul; soul.init();
+
+// The turn API. converse() is the only stateful path: it recalls, composes the
+// reply, and stores the exchange. speak()/perceive() stay pure.
+std::string r1 = soul.converse("what is my position size limit",
+                               "Two percent per trade.");
+std::string r2 = soul.converse("what is my position size limit",
+                               "Two percent per trade.");
+//  r2 == "I said this before: \"Two percent per trade.\". Two percent per trade."
+//  The store did NOT grow: a repeated exchange is reinforced, not re-filed.
+std::printf("%zu crystals\n", soul.memory_size());
+
+// Persist across runs (best-effort; a missing file is not an error).
+Soul::Config c; c.crystals_path = "state/soul_crystals.bin";
+Soul s2; s2.init(c); s2.load_memories(); /* ... */ s2.save_memories();
+
+// The decay pass, and how to simulate time without waiting for it.
+soul.advance_memory_clock(5000000);   // ~50 days at 100k tokens/day
+soul.decay_memories();
+```
+
+> **`perceive()` is const and stores nothing, deliberately.**
+> `UnifiedPipeline::run()` is const and calls it; a const method that silently
+> appends to long-term memory would make `run()` non-idempotent in a way its
+> signature denies. Storing lives in `perceive_and_recall()`, `remember()` and
+> `converse()`. From the pipeline, use the non-const `run_memorable()`.
+
+> **Two thresholds are measured, not guessed**: `min_relevance` (0.92) and
+> `duplicate_recall_score` (0.98). Both are byte-level-tokenizer values. If you
+> load a real vocabulary, **re-derive them with `omniseed demo-soul`** — the
+> margin is only ~0.10 wide.
 
 ---
 

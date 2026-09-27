@@ -15,6 +15,7 @@
 //    omniseed demo-skills                   Flash Skills + Zero-Shot Synthesis
 //    omniseed demo-swarm                    Collaborative Swarm demo (loopback)
 //    omniseed demo-memory                   attention sinks + Memory Crystals
+//    omniseed demo-soul                     persona + memory + recall + decay
 //    omniseed demo-audio <wav>              sound events + scene + wake word
 //    omniseed demo-vision <w> <h>           pointer/spatial/tracker demo
 //    omniseed dream                         run Dream-State consolidation now
@@ -34,6 +35,7 @@
 #include "omniseed/runtime/sensory.h"
 #include "omniseed/runtime/swarm.h"
 #include "omniseed/runtime/token_bus.h"
+#include "omniseed/soul.h"
 #include "omniseed/vision/vision.h"
 #include "omniseed/vision/vision_tasks.h"
 
@@ -72,6 +74,7 @@ void print_usage() {
         "  demo-skills                 Flash Skills + Zero-Shot Synthesis\n"
         "  demo-swarm                  Collaborative Swarm Protocol\n"
         "  demo-memory                 1M-token window + Memory Crystals\n"
+        "  demo-soul                   persona + memory + recall + decay\n"
         "  demo-audio F.wav            sound events / scene / wake word\n"
         "  demo-vision                 pointer grounding + spatial map\n"
         "  dream                       Dream-State consolidation pass\n"
@@ -380,6 +383,110 @@ int cmd_demo_memory() {
     const auto q = tok.encode("who has the red car", false);
     for (const MemoryCrystal& c : mem.retrieve(q, 2))
         std::printf("  [crystal] %s\n", c.summary.c_str());
+    std::printf("peak RSS: %.2f MB\n",
+                static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
+    return 0;
+}
+
+// ===========================================================================
+// Demo: the soul — persona, memory, recall, decay (§30 + §31)
+//
+// The point of this demo is turn 3: the same question as turn 1, and the reply
+// says so. Everything else here is bookkeeping around that one observable fact.
+// ===========================================================================
+int cmd_demo_soul() {
+    Soul::Config cfg;   // memory is on by default
+    Soul soul;
+    if (!soul.init(cfg)) {
+        std::printf("soul init failed: %s\n", soul.error().c_str());
+        return 1;
+    }
+
+    std::printf("=== THE SOUL: memory, recall, decay ===\n\n");
+
+    struct Turn { const char* q; const char* a; };
+    const Turn turns[] = {
+        {"what is my position size limit",
+         "Two percent per trade, three per day, six per week."},
+        {"how did the last aapl trade go",
+         "It closed up on light volume."},
+        {"what is my position size limit",   // the SAME question as turn 1
+         "Two percent per trade, three per day, six per week."},
+    };
+
+    for (size_t i = 0; i < sizeof(turns) / sizeof(turns[0]); ++i) {
+        SoulState st;
+        const std::string reply = soul.converse(turns[i].q, turns[i].a, &st);
+        std::printf("turn %zu  owner: %s\n", i + 1, turns[i].q);
+        std::printf("        soul : %s\n", reply.c_str());
+        std::printf("        recalled %zu memory(ies)", st.recall.size());
+        if (!st.recall.empty())
+            std::printf(" top relevance %.3f (%s)", st.recall.front().score,
+                        memory_role_name(st.recall.front().role));
+        std::printf(" -> %s\n", st.has_recall ? "yes" : "no");
+        std::printf("        memory: %zu crystal(s)\n\n", soul.memory_size());
+    }
+
+    std::printf("memory: %zu crystals, %llu stored, %llu skipped, "
+                "clock %llu tokens\n",
+                soul.memory_size(),
+                static_cast<unsigned long long>(soul.memory_stored()),
+                static_cast<unsigned long long>(soul.memory_skipped()),
+                static_cast<unsigned long long>(soul.memory_clock()));
+
+    // --- how well does recall actually discriminate? ------------------------
+    // Reported, not assumed, and self-verifying: each probe declares whether the
+    // store should know it, and the demo prints MISMATCH when the floor got it
+    // wrong. With the minimal byte-level tokenizer the embedding is close to a
+    // character histogram, so UNRELATED English still scores high — these are
+    // the numbers the default floor comes from.
+    std::printf("\n--- relevance separation (min_relevance = %.2f) ---\n",
+                cfg.min_relevance);
+    struct Probe { const char* label; const char* q; bool in_store; };
+    const Probe probes[] = {
+        {"verbatim",           "what is my position size limit",  true},
+        {"one char off",       "what is my position size limitt", true},
+        {"paraphrase",         "what is the position size limit", true},
+        {"another turn",       "how did the last aapl trade go",  true},
+        {"NOT stored, short",  "what is the weather in paris",    false},
+        {"NOT stored, long",
+         "explain the difference between a bull market and a bear market in "
+         "as much detail as you possibly can please", false},
+    };
+    for (const Probe& p : probes) {
+        RecalledMemory m;
+        const bool found = soul.top_match(p.q, &m);
+        const bool claimed = found && m.score >= cfg.min_relevance;
+        std::printf("  %-18s %.3f  %-11s %s\n", p.label, found ? m.score : 0.0f,
+                    p.in_store ? "in store" : "not stored",
+                    claimed == p.in_store ? "ok" : "MISMATCH");
+    }
+
+    // --- the Ebbinghaus curve, compressed into one call ---------------------
+    const std::vector<uint64_t> ids = soul.crystals().ids();
+    if (!ids.empty()) {
+        const uint64_t keep = ids.front();   // the first thing it ever heard
+        const uint64_t jump = 5000000;       // ~50 days at 100k tokens/day
+        std::printf("\n--- simulated decay (tau = %.0f days, %.0f tokens/day) ---\n",
+                    cfg.memory.decay_tau_days, cfg.memory.tokens_per_day);
+        std::printf("clock advanced by %llu tokens (~%.0f days)\n",
+                    static_cast<unsigned long long>(jump),
+                    static_cast<double>(jump) / cfg.memory.tokens_per_day);
+        std::printf("reinforced crystal #%llu (it came up again during the gap)\n",
+                    static_cast<unsigned long long>(keep));
+        soul.advance_memory_clock(jump);
+        soul.reinforce_memory(keep);
+        const size_t dropped = soul.decay_memories();
+        std::printf("decay dropped %zu crystal(s); %zu left\n", dropped,
+                    soul.memory_size());
+        const MemoryCrystal* survivor = soul.crystals().find(keep);
+        if (survivor)
+            std::printf("  survivor #%llu: %s\n",
+                        static_cast<unsigned long long>(survivor->id),
+                        survivor->summary.c_str());
+        std::printf("\nEvery other memory of the same age is gone. That is the whole\n"
+                    "mechanism: being recalled and used is what resets the clock.\n");
+    }
     std::printf("peak RSS: %.2f MB\n",
                 static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
     return 0;
@@ -963,6 +1070,7 @@ int main(int argc, char** argv) {
     if (cmd == "demo-skills")   { return cmd_demo_skills(); }
     if (cmd == "demo-swarm")    { return cmd_demo_swarm(); }
     if (cmd == "demo-memory")   { return cmd_demo_memory(); }
+    if (cmd == "demo-soul")     { return cmd_demo_soul(); }
     if (cmd == "demo-vision")   { return cmd_demo_vision(); }
     if (cmd == "dream")         { return cmd_dream(); }
     if (cmd == "demo-audio")    {
