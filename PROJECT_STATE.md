@@ -15,19 +15,24 @@ GLM-5.3-FLASH
   untested here.
 - **Build:** `build.bat` (auto-detects VS via vswhere) or
   `cmake -S . -B build -G "Visual Studio 18 2026" -A x64 && cmake --build build --config Release`
-- **Test:** `ctest --test-dir build -C Release` — **15/15 passing** (§27).
+- **Test:** `ctest --test-dir build -C Release` — **19/19 passing** (§28).
   Individually: `build\bin\omniseed_tests.exe` — **206/206 passing** +
   `build\bin\omniseed_real_weights.exe` — **13/13 passing** +
   `build\bin\omniseed_trading.exe` — **2129 checks passing** (zero warnings /W4)
   + `build\bin\omniseed_regime_engine.exe` — **157 checks** +
-  `build\bin\omniseed_strategy_zoo.exe` — **291 checks**
-- **Last updated:** §27 TRUE INTEGRATION (2026-09-27): the Monster trading
-  intelligence moved **into the C++ runtime** — regime engine, strategy zoo,
-  router and sniper are now C++ classes rather than Python modules feeding the
-  runtime through a CSV seam. Guarded by two Python-vs-C++ parity gates that
-  diff every field on synthetic series and 1,255 real AAPL bars. Board **15/15
-  green**; new `omniseed_strategy_zoo` (291 checks) and `omniseed_regime_engine`
-  (157 checks). See the §27 finding on the sniper's 0.85 gate.
+  `build\bin\omniseed_strategy_zoo.exe` — **291 checks** +
+  `build\bin\omniseed_heads.exe` — **481 checks** +
+  `build\bin\omniseed_router.exe` — **348 checks** +
+  `build\bin\omniseed_unified_output.exe` — **267 checks** +
+  `build\bin\omniseed_language_heads.exe` — **614 checks**
+- **Last updated:** §28 UNIFIED INTELLIGENCE (2026-09-27): ONE backbone, many
+  heads, a smart router. `HeadRouter`, `DomainDecisionHead`, `ClassificationHead`,
+  `ScoringHead`, `UnifiedOutput`/`UnifiedPipeline` and the language domain are all
+  C++ now. Board **19/19 green**, +1,710 new checks. The new tests found and fixed
+  **two real bugs** (a tokenizer that split every word into letters, and a
+  non-injective seed that let two different seeds produce identical weights). See
+  §28 — including the honest gaps: nothing is trained, and vision/audio have label
+  spaces but no logic.
   Previous: §19 T7.1 TRADING EDGE LAB (2026-09-26): walk-forward
   validation (select on train, replay out-of-sample, hard no-look-ahead),
   per-trade risk budget clamped to 1–2% + a per-UTC-day drawdown kill-switch,
@@ -2508,3 +2513,224 @@ these into the unified single-pass output); the `qat_*` / `lora_*` / `convert_*`
 `paper_loop.py` and `decision_bridge.py` are now **superseded** — the C++ paper
 daemon and the C++ decision head do their jobs — but they are left in the tree
 as reference until the unified output path (Phase 3) is verified end to end.
+
+---
+
+## 28. UNIFIED INTELLIGENCE — ONE BACKBONE, MANY HEADS, A SMART ROUTER (2026-09-27)
+
+### 28.1 The premise check, first
+
+Two premises in the mandate were **already true**, and saying so is more useful
+than "fixing" working code:
+
+- **`DecisionHead` is already a C++ class** (`include/omniseed/decision_head.h`,
+  commit `7179ff8`). It was not a Python module.
+- **The 2% / 3% risk limits are already C++-enforced.** Python mirrors them for
+  display only.
+
+The audit table below therefore records what actually needed to move.
+
+### 28.2 PHASE 1 AUDIT
+
+| Module | Current Location | Can Move to C++? | Must Stay Python? | Priority |
+|---|---|---|---|---|
+| Decision head (trading) | `src/decision_head.cpp` | **already C++** | no | — |
+| Router (which heads run) | — (new) | **YES** → `src/router.cpp` | no | P0 |
+| Classification head | — (new) | **YES** → `src/classification_head.cpp` | no | P0 |
+| Scoring head | — (new) | **YES** → `src/scoring_head.cpp` | no | P0 |
+| Domain decision head | — (new) | **YES** → `src/domain_decision.cpp` | no | P0 |
+| Unified output formatter | — (new) | **YES** → `src/unified_output.cpp` | no | P0 |
+| Intent / language / sentiment | — (new) | **YES**, lexical → `src/language/*.cpp` | no | P0 |
+| Regime engine | `tools/monster/regime.py` | **DONE §27** → `src/trading/regime_engine.cpp` | oracle only | — |
+| Strategy zoo | `tools/monster/strategies.py` | **DONE §27** → `src/trading/strategy_zoo.cpp` | oracle only | — |
+| Ensemble router | `tools/monster/router.py` | **DONE §27** → `src/trading/router.cpp` | oracle only | — |
+| Sniper | `tools/monster/sniper_engine.py` | **DONE §27** → `src/trading/sniper.cpp` | oracle only | — |
+| Risk limits 2% / 3% | `include/omniseed/trading/risk_engine.h` | **already C++** | display mirror only | — |
+| Vision heads | — | label space registered; needs a feature vector | — | P2 |
+| Audio heads | — | label space registered; needs a feature vector | — | P2 |
+| Batch processing | — | not started | — | P3 |
+| Streaming decisions | — | not started | — | P3 |
+| Feedback hooks | — | not started (fitting hooks exist) | — | P3 |
+| `paper_dashboard.py`, `serve_dashboard.py` | `tools/` | no — I/O + HTTP | **YES** | — |
+| `market_feeds.py`, `fetch_*.py` | `tools/` | no — network I/O | **YES** | — |
+| `paper_report.py`, `nightly_report.py` | `tools/` | no — reporting | **YES** | — |
+| `qat_*`, `lora_*`, `convert_*`, `modal_*` | `tools/` | no — offline tooling | **YES** | — |
+
+### 28.3 What was built
+
+Nine new translation units and eight new headers, all in `omniseed_core`:
+
+| File | What it is |
+|---|---|
+| `include/omniseed/heads.h` + `src/heads.cpp` | the shared vocabulary: `Domain`, `LabelProb`, `ClassificationResult`, `ScoreResult`, and the JSON/seed helpers |
+| `include/omniseed/router.h` + `src/router.cpp` | `HeadRouter`, `ActivationPlan`, `HeadKind`, `RouterMode`, `refine()` |
+| `include/omniseed/classification_head.h` + `.cpp` | one `[total_labels, E]` projection, 13 named label sets |
+| `include/omniseed/scoring_head.h` + `.cpp` | three INDEPENDENT sigmoids |
+| `include/omniseed/domain_decision.h` + `.cpp` | the decision head generalised over 5 domains + the `DecisionResult` adapter |
+| `include/omniseed/unified_output.h` + `.cpp` | `UnifiedOutput::normalise()/to_json()` and `UnifiedPipeline` |
+| `include/omniseed/language/language_heads.h` + `src/language/intent.cpp` + `src/language/sentiment.cpp` | the language domain, deterministic and offline |
+
+Plus four test suites, the `--mode text-only` CLI alias, and four new docs:
+`docs/UNIFIED_ARCHITECTURE.md`, `docs/JEV_FEATURES.md`, `docs/DOMAINS.md`,
+`RUNBOOK.md`.
+
+### 28.4 The architecture, in one paragraph
+
+`input -> RWKV-7 forward pass -> h[E] -> {router, decision, token, classify, score}`.
+Every head is a projection `[K, E] x [E] -> [K]` plus a squashing function, so the
+marginal cost of a head is `K * E` multiply-accumulates, not a second forward
+pass. The **router** decides which heads run and in what mode; the **decision head
+runs first**; if it is confident (`>= 0.85`) and the task is simple the pipeline
+returns the decision and **never calls the text producer**; otherwise the decision
+is handed to the text producer as **prefix context**, so the text explains the
+decision that was actually made. `UnifiedOutput` emits ONE JSON document in which
+a field is present **iff its head ran**.
+
+### 28.5 ⚠️ TWO REAL BUGS, found by the new tests
+
+Both were introduced during this work and both were caught by the tests written
+for the same work — which is the entire argument for writing them.
+
+**Bug A — the tokenizer split every word into its letters.**
+`src/language/intent.cpp` had a single `flush()` that pushed *and cleared* both
+the ASCII word buffer and the Bengali run. The ASCII branch called it *before*
+appending each character, so `"Hello"` tokenised to `["h","e","l","l","o"]`. Every
+English intent and sentiment test failed at once; the Bengali tests passed, which
+is exactly the signature you would expect. Fixed by splitting the operation into
+`close_word()` and `close_beng()`, which is also the correct semantics: starting
+an ASCII word must end a Bengali run **without** destroying the word being built.
+
+**Bug B — the seed was not injective, so two different seeds produced identical
+weights.** `HeadRouter::seed_weights` and `ScoringHead::seed_weights` used
+`seed | 0x9E3779B97F4A7C15ull`. Because the constant already has bits `0x4F10`
+set, `20240 | C == 20241 | C` — so bumping the seed by one silently produced a
+**byte-identical head**. Fixed to the multiply-add form
+(`seed * C + D`, a bijection mod 2^64 since the multiplier is odd), which is what
+`DecisionHead::seed_weights` had been doing correctly all along.
+`tests/test_router.cpp` B12 now pins it.
+
+`ClassificationHead` and `DomainDecisionHead` were checked for the same pattern
+and are correct — they key each row on FNV-1a of `(seed, name)` using **XOR**,
+which is injective in the seed's low bits.
+
+### 28.6 Measurements (Release, E = 768, 2000–4000 iterations)
+
+| Head | Cost | Budget | Margin |
+|---|---|---|---|
+| `decide(general)` 4 actions | **0.498 us** | 1 ms | ~2000x |
+| `decide(trading)` 7 actions | 0.756 us | 1 ms | ~1300x |
+| `decide(vision)` / `decide(audio)` | 0.940 / 0.941 us | 1 ms | ~1000x |
+| `decide(language)` 6 actions | **1.150 us** (worst) | 1 ms | ~870x |
+| `classify(language.intent)` 7 labels | 2.139 us | 1 ms | ~470x |
+| `score()` 3 rows | 0.505 us | 1 ms | ~2000x |
+| `HeadRouter::plan()` 9 matvecs | **15.307 us** | 100 us | ~6.5x |
+
+On the mandate's **897 ns** figure: the 4-action domains **beat** it (general is
+498 ns); the 6-action language domain is ~1.3x over. The cost scales with the
+action count, so it is a per-action-space number, not a constant. The test asserts
+the 1 ms budget and prints every row.
+
+The router is the interesting one: 15.3 us for 6,912 MACs is **not**
+arithmetic-bound. The returned `ActivationPlan` owns a `heads` vector and a
+`reason` string, and those two allocations cost more than the multiply-accumulates.
+Reserving both took it from 19.4 us to 15.3 us. `include/omniseed/router.h` now
+says this instead of the "a few microseconds" estimate it previously carried,
+which was wrong.
+
+### 28.7 Verification
+
+- **`ctest`: 19/19 green** (was 15/15).
+- **+1,710 new checks**: `omniseed_heads` 481, `omniseed_router` 348,
+  `omniseed_unified_output` 267, `omniseed_language_heads` 614.
+- **No regression**: all 15 pre-existing tests still pass, including the two
+  Python-vs-C++ parity gates over 1,255 real AAPL bars.
+- Zero warnings under `/W4 /permissive- /Zc:__cplusplus /utf-8`.
+- Binaries: `omniseed.exe` 457 KB, `omniseed_agent2.exe` 327 KB. The 0.1B ternary
+  GGUF is 192–280 MB, inside the <400 MB edge rule.
+
+The invariants asserted rather than assumed:
+
+- the fast path **never calls** the text producer on `decision_only` — asserted by
+  **invocation count** (0), because a timing number cannot tell "skipped" from
+  "fast" (`test_unified_output.cpp` C1);
+- `refine()` **never adds a head** — checked over 5 input plans x 8 confidences
+  (`test_router.cpp` C7);
+- a field is dropped and reported when the plan does not name its head
+  (`test_unified_output.cpp` A2/A3);
+- **no domain can self-route** with the threshold above the maximum attainable
+  confidence (`test_heads.cpp` D9), and none with a margin floor of 1.0 (D11);
+- priority > 0.99 **and** urgency < 0.01 from the same hidden state — the test a
+  softmax could not pass (`test_heads.cpp` C4);
+- `"not bad, it's good"` is **positive** (`test_language_heads.cpp` D3);
+- negators appear in **neither** lexicon, asserted structurally (D7);
+- `"no problem"` is positive and `"no good"` is negative (D4).
+
+### 28.8 The honest gaps
+
+1. **Nothing is trained.** Every projection is a deterministic placeholder.
+   `trained()` is false and `provenance()` says `NOT FULLY FITTED (placeholder)`.
+   A seeded head emits well-formed but **meaningless** values.
+2. **Calibrated confidence is NOT implemented.** Temperature scaling needs
+   labelled data, a fitted projection, and a held-out split; none exists. Shipping
+   the scalar without the data would produce a calibrated-*looking* number with no
+   justification. The language heads' `confidence` is documented as a **heuristic
+   strength**, explicitly not a probability. See `docs/JEV_FEATURES.md` §2.
+3. **Vision and audio have label spaces and no logic.** Registered, so a fitted
+   projection would light them up — but nothing produces a vision or audio feature
+   vector into `h[E]`. Registering a label space is not the same as having the
+   capability.
+4. **Batch, streaming decisions, and feedback hooks are NOT started.**
+   Hierarchical routing is one level; ensemble voting exists only inside trading
+   (`src/trading/router.cpp`, with the 0.50 veto weight floor).
+5. **The CLI does not use the router on its default path.** `--mode` still drives
+   the existing `DecisionMode` path, which has a live consumer contract
+   (`tools/decision_bridge.py` reads its JSON). Rewiring it is a behaviour change
+   that needs its own parity gate, not a quiet refactor. `--mode text-only` is
+   accepted as an alias for `off`.
+6. **The HTTP server does not expose `mode`, and the dashboard does not read the
+   unified document.** Both are I/O-layer work.
+7. **Romanised Bengali reads as English** — detection is by script, and
+   `"ami bhalo achi"` is pure ASCII. Pinned as a known limitation in
+   `test_language_heads.cpp` B4 so a future fix is deliberate.
+8. **Bengali `না` is both the negator and the sentence-final question particle.**
+   A lexical scorer cannot separate them without syntax.
+
+### 28.9 Next steps
+
+1. **Fit one head and calibrate it.** That is the single highest-value next step:
+   it turns "well-formed but meaningless" into a real capability, and it is the
+   prerequisite for every confidence claim in this tree. The fitting hooks and the
+   `fitted_rows()` accounting are already in place.
+2. **Feed the router into the CLI's `--mode` path** behind a parity gate against
+   the existing `DecisionMode` behaviour, so the unified path is not a second
+   untested implementation.
+3. **Expose `mode` on the HTTP server** and have the dashboard read the unified
+   document.
+4. **Produce vision/audio feature vectors into `h[E]`** to light up the label
+   spaces that are already registered.
+5. **Fix the sniper's 0.85-gate ceiling** (see §27): on 1,255 real AAPL bars the
+   sniper proposes nothing, because with no cross-asset context `cross = 0.5` caps
+   a perfect `range` bar at 0.7650. Pinned in `test_strategy_zoo.cpp` D2, not
+   silently changed — fixing it changes what the system trades.
+
+### 28.10 Exact commands
+
+```bash
+# build (strip the proxy vars or MSBuild aborts)
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    cmake --build build --config Release --parallel
+
+# the full board
+ctest --test-dir build -C Release --output-on-failure
+
+# the head stack alone, with latency printed
+./build/bin/omniseed_heads.exe
+./build/bin/omniseed_router.exe
+./build/bin/omniseed_unified_output.exe
+./build/bin/omniseed_language_heads.exe
+
+# CLI modes
+./build/bin/omniseed.exe chat --model models/rwkv7-0.1B-ternary.gguf --mode hybrid
+./build/bin/omniseed.exe chat --mode text-only
+```
+

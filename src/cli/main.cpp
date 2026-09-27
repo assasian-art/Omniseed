@@ -95,6 +95,8 @@ void print_usage() {
         "  --seed S         sampling seed, deterministic per seed\n"
         "  --mode M         System-1 decision head routing:\n"
         "                     off            System-2 only (default)\n"
+        "                     text-only      alias for 'off': generate text and\n"
+        "                                    never consult the decision head\n"
         "                     hybrid         consult the head first; act on it\n"
         "                                    when confident, else generate text\n"
         "                     decision-only  never generate text; return the\n"
@@ -921,11 +923,18 @@ int main(int argc, char** argv) {
                 s.decision_mode = DecisionMode::Hybrid;
             } else if (m == "decision-only" || m == "decision_only") {
                 s.decision_mode = DecisionMode::DecisionOnly;
+            } else if (m == "text-only" || m == "text_only" || m == "textonly") {
+                // The mandate's name for what this tree has always called "off":
+                // generate text and do not consult the decision head at all.
+                // Accepting the name costs nothing and stops a caller who read
+                // the mandate from getting an error for typing the documented
+                // spelling.
+                s.decision_mode = DecisionMode::Off;
             } else {
                 // Refuse rather than silently defaulting: a typo that quietly
                 // turned the feature off would look like the feature failing.
                 platform::log_error("--mode: unknown value '%s' "
-                                    "(expected off | hybrid | decision-only)",
+                                    "(expected off | text-only | hybrid | decision-only)",
                                     m.c_str());
                 return 2;
             }

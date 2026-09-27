@@ -50,6 +50,17 @@ set(OMNISEED_CORE_SOURCES
     # distribution in one matvec. Sits above core/ because it is a decision
     # layer that both the agent loop and the trading runtime consume.
     src/decision_head.cpp
+    # "One backbone, multiple heads": the shared heads vocabulary, the router
+    # that decides which heads run, and the per-head readouts of h[E].
+    src/heads.cpp
+    src/router.cpp
+    src/classification_head.cpp
+    src/scoring_head.cpp
+    src/domain_decision.cpp
+    src/unified_output.cpp
+    # Language domain: deterministic, offline intent / language / sentiment.
+    src/language/intent.cpp
+    src/language/sentiment.cpp
     src/core/platform.cpp
     src/core/tensor.cpp
     src/core/bitlinear.cpp
@@ -599,6 +610,82 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_strategy_zoo COMMAND omniseed_strategy_zoo
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_strategy_zoo PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # The head stack ("one backbone, multiple heads"): the shared vocabulary,
+    # the classification head (many label sets over ONE projection), the scoring
+    # head (three INDEPENDENT sigmoids — a softmax could not express "urgent and
+    # unimportant at once"), and the domain-general decision head with its
+    # fail-closed routing ladder. Fully offline: no model, no GGUF, no network.
+    add_executable(omniseed_heads tests/test_heads.cpp)
+    target_include_directories(omniseed_heads PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_heads PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_heads PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_heads PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_heads COMMAND omniseed_heads
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_heads PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # The HeadRouter: per-head gates, the domain softmax, fail-closed planning
+    # (no gate fired -> run the SUPERSET, never a shortcut), every CLI mode
+    # spelling, and refine()'s downgrade-only fast path. Also MEASURES the
+    # mandate's "<100 microseconds" budget at the real edge width instead of
+    # asserting it in a comment. Fully offline.
+    add_executable(omniseed_router tests/test_router.cpp)
+    target_include_directories(omniseed_router PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_router PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_router PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_router PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_router COMMAND omniseed_router
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_router PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # The unified document + pipeline: present-iff-it-ran, normalise() dropping
+    # any field the activation plan does not name (a stale value from a previous
+    # turn must not leak into this one), the mandate's JSON key order, and the
+    # fast path proven by INVOCATION COUNT — a timing number cannot distinguish
+    # "the text head was skipped" from "the text head was fast". Fully offline.
+    add_executable(omniseed_unified_output tests/test_unified_output.cpp)
+    target_include_directories(omniseed_unified_output PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_unified_output PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_unified_output PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_unified_output PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_unified_output COMMAND omniseed_unified_output
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_unified_output PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # The language domain, in C++ with no model and no Python: UTF-8 script
+    # detection (Bengali from its own Unicode block), the tokenizer, intent
+    # rules for EN and BN, and the sentiment negation SCOPING rule ("not bad,
+    # it's good" must be positive). The romanised-Bengali gap is pinned as a
+    # known limitation rather than left implicit. Fully offline.
+    add_executable(omniseed_language_heads tests/test_language_heads.cpp)
+    target_include_directories(omniseed_language_heads PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_language_heads PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_language_heads PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_language_heads PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_language_heads COMMAND omniseed_language_heads
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_language_heads PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
