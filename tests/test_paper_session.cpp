@@ -21,6 +21,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace omniseed;
@@ -421,6 +422,104 @@ static void test_signals() {
     }
 }
 
+// ===========================================================================
+// 7. Monster gate (tools/monster) — the distilled sniper confidence
+// ===========================================================================
+static void ensure_dir(const std::string& path) {
+    const auto slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return;
+    const std::string d = path.substr(0, slash);
+#if OMNISEED_PLATFORM_WINDOWS
+    const std::string cmd = "if not exist \"" + d + "\" mkdir \"" + d + "\"";
+#else
+    const std::string cmd = "mkdir -p '" + d + "'";
+#endif
+    (void)std::system(cmd.c_str());
+}
+
+static void write_monster_csv(const std::string& path,
+                              const std::vector<Bar>& bars, double conf,
+                              bool veto, const std::string& regime) {
+    ensure_dir(path);
+    std::ofstream f(path);
+    f << "ts,confidence,veto,regime,detail\n";
+    for (const Bar& b : bars)
+        f << b.time << "," << conf << "," << (veto ? 1 : 0) << "," << regime
+          << ",S=" << conf << " test\n";
+}
+
+static void test_monster_gate() {
+    const std::string dir = "state/test_session_m";
+    const std::string jpath = dir + "/journal.csv";
+    const std::string mdir = dir + "/monster";
+    const std::vector<Bar> bars = make_series(240, 86400, 9);
+
+    // One scenario = a fresh journal + a chosen monster feed.
+    auto run = [&](const std::string& tag, bool enabled, double min_conf,
+                   const std::string& sym_for_csv) {
+        const std::string jp = dir + "/" + tag + ".csv";
+        std::remove(jp.c_str());
+        PaperSessionConfig cfg;
+        cfg.monster_enabled = enabled;
+        cfg.monster_min_conf = min_conf;
+        if (!sym_for_csv.empty()) cfg.monster_dir = mdir;
+        cfg.streams.push_back(stream("AAA", AssetClass::Equity, bars));
+        PaperJournal j(jp);
+        std::string err;
+        j.scan_existing(err);
+        CHECK(j.open(err));
+        const PaperSessionResult r = PaperSession::run(cfg, j);
+        j.close();
+        return std::pair<PaperSessionResult, std::string>(r, slurp(jp));
+    };
+
+    // --- baseline: no monster gate ---------------------------------------
+    const auto base = run("base", false, 0.85, "");
+    TEST("monster: baseline (no gate) enters normally");
+    CHECK(base.first.error.empty());
+    CHECK(base.first.entries > 0);
+    CHECK(base.first.monster_blocked == 0);
+
+    // --- every bar passes the gate ---------------------------------------
+    write_monster_csv(mdir + "/AAA.csv", bars, 1.0, false, "trend_up");
+    const auto pass = run("pass", true, 0.85, "AAA");
+    TEST("monster: a passing feed does not change the outcome");
+    CHECK(pass.first.monster_blocked == 0);
+    CHECK(pass.first.entries == base.first.entries);
+    CHECK(pass.second.find("monster-block") == std::string::npos);
+    TEST("monster: the signal log carries the distilled confidence");
+    CHECK(pass.second.find("monster[S=1.000 trend_up]") != std::string::npos);
+
+    // --- confidence below the bar ----------------------------------------
+    write_monster_csv(mdir + "/AAA.csv", bars, 0.40, false, "range");
+    const auto low = run("low", true, 0.85, "AAA");
+    TEST("monster: confidence below the bar blocks every entry");
+    CHECK(low.first.entries == 0);
+    CHECK(low.first.monster_blocked > 0);
+    CHECK(low.second.find("monster-block:AAA:S=0.400<0.85") !=
+          std::string::npos);
+
+    // --- a hard veto ------------------------------------------------------
+    write_monster_csv(mdir + "/AAA.csv", bars, 1.00, true, "trend_down");
+    const auto vetoed = run("veto", true, 0.85, "AAA");
+    TEST("monster: a veto blocks even at full confidence");
+    CHECK(vetoed.first.entries == 0);
+    CHECK(vetoed.first.monster_blocked > 0);
+    CHECK(vetoed.second.find("monster-block:AAA:veto:trend_down") !=
+          std::string::npos);
+
+    // --- no feature file at all -> FAIL CLOSED ---------------------------
+    const auto norow = run("norow", true, 0.85, "");
+    TEST("monster: a missing feature file fails CLOSED (a sniper refuses)");
+    CHECK(norow.first.entries == 0);
+    CHECK(norow.first.monster_blocked > 0);
+    CHECK(norow.second.find("monster-block:AAA:no-row") != std::string::npos);
+
+    // --- the gate never touches EXITS ------------------------------------
+    TEST("monster: the gate is not consulted when the gate is off");
+    CHECK(base.first.monster_blocked == 0);
+}
+
 int main() {
     platform::log_info("== multi-asset paper session (M5) ==");
     test_merged_timeline();
@@ -430,6 +529,7 @@ int main() {
     test_resume();
     test_determinism_and_errors();
     test_signals();
+    test_monster_gate();
     std::printf("RESULT: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

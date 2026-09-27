@@ -281,6 +281,43 @@ PaperDaemonResult PaperDaemon::run(const std::vector<Bar>& bars,
 }
 
 // ===========================================================================
+// Monster feature CSV (the distilled Python output)
+// ===========================================================================
+bool load_monster_csv(const std::string& path,
+                      std::map<int64_t, MonsterPoint>& out, std::string& err) {
+    err.clear();
+    out.clear();
+    std::FILE* f = platform::open_file_c(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+
+    char line[1024];
+    bool first = true;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+            s.pop_back();
+        if (s.empty()) continue;
+        if (first) {
+            first = false;
+            if (s.rfind("ts,", 0) == 0) continue;      // header row
+        }
+        std::string fl[5];
+        const size_t nf = split_fields(s, fl, 5);
+        if (nf < 2) continue;
+        const int64_t ts = std::atoll(fl[0].c_str());
+        if (ts <= 0) continue;
+        MonsterPoint mp;
+        mp.confidence = std::atof(fl[1].c_str());
+        if (nf >= 3) mp.veto = (std::atoi(fl[2].c_str()) != 0);
+        if (nf >= 4) mp.regime = fl[3];
+        if (nf >= 5) mp.detail = fl[4];
+        out[ts] = mp;
+    }
+    std::fclose(f);
+    return true;
+}
+
+// ===========================================================================
 // PaperSession — multi-asset merged-timeline replay (M5)
 // ===========================================================================
 PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
@@ -305,6 +342,20 @@ PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
                   [](const Bar& a, const Bar& b) { return a.time < b.time; });
         if (s.bars.empty() && !reported)
             res.stream_errors.push_back(s.symbol + ": no bars");
+    }
+
+    // Monster gate: auto-load per-symbol feature CSVs when a dir is given.
+    // A stream that already carries rows (tests) is left untouched. A missing
+    // file is NOT an error here — the gate simply fails closed for that stream.
+    const bool monster_active =
+        cfg.monster_enabled || !cfg.monster_dir.empty();
+    if (!cfg.monster_dir.empty()) {
+        for (auto& s : streams) {
+            if (!s.monster.empty()) continue;
+            std::string merr;
+            (void)load_monster_csv(cfg.monster_dir + "/" + s.symbol + ".csv",
+                                   s.monster, merr);
+        }
     }
 
     const int64_t resume_after = cfg.resume ? journal.last_ts() : 0;
@@ -337,6 +388,7 @@ PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
     std::vector<size_t> bar_idx(streams.size(), 0);   // next unconsumed bar
     std::vector<char> feed_warned(streams.size(), 0);
     std::vector<char> gate_warned(streams.size(), 0);
+    std::vector<char> monster_warned(streams.size(), 0);
     std::map<std::string, double> prices;
 
     bool started = false, was_halted = false;
@@ -391,9 +443,23 @@ PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
             // a fill — that is what makes the journal a decision log.
             if (cfg.journal_signals && sig.action != Action::Hold) {
                 ++res.signals;
+                std::string trace = sig.reason;
+                if (monster_active) {
+                    auto mit = streams[si].monster.find(b.time);
+                    if (mit != streams[si].monster.end()) {
+                        char mb[160];
+                        std::snprintf(mb, sizeof(mb), " monster[S=%.3f %s%s]",
+                                      mit->second.confidence,
+                                      mit->second.regime.c_str(),
+                                      mit->second.veto ? " VETO" : "");
+                        trace += mb;
+                    } else {
+                        trace += " monster[no-row]";
+                    }
+                }
                 journal.signal(ts, sym,
                                sig.action == Action::Buy ? "buy" : "sell",
-                               sig.strength, sig.reason);
+                               sig.strength, trace);
             }
             const bool stopped = has_pos &&
                 RiskManager::check_exit(pit->second, b.close, cfg.risk) ==
@@ -431,6 +497,40 @@ PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
             if (i + 1 >= streams[si].bars.size() || i < cfg.warmup_bars)
                 continue;
             if (!day_ok || has_pos || sig.action != Action::Buy) continue;
+
+            // --- Monster gate: FAIL CLOSED --------------------------------
+            // A sniper needs the distilled Python verdict to agree. No row, a
+            // veto, or a score below the bar all block the entry; the engine's
+            // own signal generator has already had to say Buy above.
+            if (monster_active) {
+                auto mit = streams[si].monster.find(b.time);
+                const bool have = mit != streams[si].monster.end();
+                const double conf = have ? mit->second.confidence : -1.0;
+                const bool veto = have ? mit->second.veto : true;
+                if (!have || veto || conf < cfg.monster_min_conf) {
+                    ++res.monster_blocked;
+                    if (!monster_warned[si]) {
+                        monster_warned[si] = 1;
+                        char mb[256];
+                        if (!have)
+                            std::snprintf(mb, sizeof(mb),
+                                          "monster-block:%s:no-row",
+                                          sym.c_str());
+                        else if (veto)
+                            std::snprintf(mb, sizeof(mb),
+                                          "monster-block:%s:veto:%s",
+                                          sym.c_str(),
+                                          mit->second.regime.c_str());
+                        else
+                            std::snprintf(mb, sizeof(mb),
+                                          "monster-block:%s:S=%.3f<%.2f",
+                                          sym.c_str(), conf,
+                                          cfg.monster_min_conf);
+                        journal.event(ts, mb);
+                    }
+                    continue;
+                }
+            }
 
             std::string why2;
             if (!RiskManager::entries_allowed(broker.state(),

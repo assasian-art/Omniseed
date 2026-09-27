@@ -132,7 +132,8 @@ class PaperLoop:
                  csv_dir=DEFAULT_CSV_DIR, capital=100000.0, years=1.0,
                  timeframe="1d", strategy="balanced", binary=None,
                  probe_fn=None, fetch_fn=None, runner=None, now_fn=None,
-                 dry_run=False, min_volume=0.0):
+                 dry_run=False, min_volume=0.0, monster_dir="",
+                 monster_min_conf=0.85, scanner=None):
         self.watch = watch
         self.journal = journal
         self.status_path = status
@@ -148,6 +149,11 @@ class PaperLoop:
         self.now_fn = now_fn or time.time
         self.dry_run = dry_run
         self.min_volume = min_volume
+        # Monster layer: when a dir is set, the loop refreshes the sniper
+        # feature CSVs there before every session and the engine gates on them.
+        self.monster_dir = monster_dir
+        self.monster_min_conf = monster_min_conf
+        self.scanner = scanner
         self.cycle_no = 0
         # per-symbol health, persisted across cycles
         self.health = {}
@@ -219,6 +225,7 @@ class PaperLoop:
                     rec["reason"] = "fetch-failed"
 
         session = self._run_session(feeds)
+        monster = self._run_monster() if self.monster_dir else None
         status = {
             "updated_ts": now,
             "updated_iso": dt.datetime.fromtimestamp(
@@ -230,6 +237,7 @@ class PaperLoop:
             "journal": self.journal,
             "feeds": feeds,
             "last_session": session,
+            "monster": monster,
         }
         self._write_status(status)
         return status
@@ -263,12 +271,31 @@ class PaperLoop:
         except Exception as e:                          # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
+    def _run_monster(self):
+        """Refresh the sniper feature CSVs before the session consumes them."""
+        if self.dry_run:
+            return {"ok": True, "dry_run": True, "out_dir": self.monster_dir}
+        if self.scanner is not None:
+            return self.scanner(self.watch, self.csv_dir, self.monster_dir,
+                                self.timeframe, self.monster_min_conf)
+        try:
+            import monster_scan as ms
+            cfg = ms.SN.SniperConfig(min_confidence=self.monster_min_conf)
+            return ms.run_scan(self.watch, csv_dir=self.csv_dir,
+                               out_dir=self.monster_dir,
+                               timeframe=self.timeframe, cfg=cfg)
+        except Exception as e:                          # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
     def _run_engine(self, streams, skip):
         cmd = [self.binary, "trading-paper-session", "--streams", streams,
                "--journal", self.journal, "--capital", str(self.capital),
                "--strategy", self.strategy]
         if skip:
             cmd += ["--skip", skip]
+        if self.monster_dir:
+            cmd += ["--monster-features", self.monster_dir,
+                    "--monster-min-conf", str(self.monster_min_conf)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         out = proc.stdout or ""
         res = {"ok": proc.returncode == 0, "returncode": proc.returncode,
@@ -283,6 +310,9 @@ class PaperLoop:
             res.update(entries=int(m.group(1)), exits=int(m.group(2)),
                        halts=int(m.group(3)), abstains=int(m.group(4)),
                        refused=int(m.group(5)))
+        m = re.search(r"monster\s*:\s*(\d+) blocked", out)
+        if m:
+            res["monster_blocked"] = int(m.group(1))
         m = re.search(r"equity\s*:\s*([-\d.]+)", out)
         if m:
             res["equity"] = float(m.group(1))
@@ -331,6 +361,10 @@ def main() -> int:
     ap.add_argument("--min-volume", type=float, default=0.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="poll + refresh CSVs but do not run the engine")
+    ap.add_argument("--monster-features", default="",
+                    help="dir for the Monster sniper feature CSVs (enables the "
+                         "confidence gate in the engine)")
+    ap.add_argument("--monster-min-conf", type=float, default=0.85)
     a = ap.parse_args()
 
     try:
@@ -343,7 +377,9 @@ def main() -> int:
                      csv_dir=a.csv_dir, capital=a.capital, years=a.years,
                      timeframe=a.timeframe, strategy=a.strategy,
                      binary=a.binary, dry_run=a.dry_run,
-                     min_volume=a.min_volume)
+                     min_volume=a.min_volume,
+                     monster_dir=a.monster_features,
+                     monster_min_conf=a.monster_min_conf)
     cycles = 1 if a.once else a.cycles
     try:
         return loop.run(cycles, a.interval)

@@ -139,6 +139,29 @@ public:
 // stream that has a bar at that timestamp may exit or enter. Entries are
 // sized per asset class (meme stays research-only / <=0.25%), and a stream
 // whose feed is not OK is skipped for entries (ABSTAIN, journalled).
+// ---------------------------------------------------------------------------
+// Monster gate (M7/Monster) — the distilled Python feature the engine consumes
+// ---------------------------------------------------------------------------
+// The Monster layer (tools/monster/*.py) does the heavy work — microstructure,
+// technical confluence, regime, cross-asset correlation, news — and emits ONE
+// row per bar:
+//      ts,confidence,veto,regime,detail
+// The engine treats a missing row as "no opinion" and, being a sniper, FAILS
+// CLOSED: no row, a veto, or confidence below the threshold all block the
+// entry. The engine's own signal generator must ALSO agree, so an entry needs
+// both layers to line up.
+struct MonsterPoint {
+    double      confidence = 0.0;
+    bool        veto = false;
+    std::string regime;
+    std::string detail;
+};
+
+// Reads the Monster feature CSV (header + rows). Missing file -> empty map,
+// `err` set. Malformed rows are skipped.
+bool load_monster_csv(const std::string& path,
+                      std::map<int64_t, MonsterPoint>& out, std::string& err);
+
 struct PaperStream {
     std::string symbol;                 // canonical ticker (AAPL / BTCUSDT / ...)
     AssetClass  asset = AssetClass::Unknown;
@@ -147,6 +170,9 @@ struct PaperStream {
     std::vector<Bar> bars;              // pre-loaded bars (else loaded from csv)
     bool        feed_ok = true;         // perception verdict; false = ABSTAIN
     std::string feed_reason;            // e.g. "stale-feed" (for the journal)
+    // Optional Monster gate: ts -> verdict. Empty = gate disabled for this
+    // stream (unless cfg.monster_enabled, which then fails closed).
+    std::map<int64_t, MonsterPoint> monster;
 };
 
 struct PaperSessionConfig {
@@ -159,6 +185,15 @@ struct PaperSessionConfig {
     bool        journal_signals = true;  // journal every non-Hold signal
     double      periods_per_year = 252.0;
     std::vector<PaperStream> streams;
+    // --- Monster gate ----------------------------------------------------
+    // When `monster_enabled` (or any stream carries monster rows), an entry
+    // additionally requires a Monster row at that bar with veto=false and
+    // confidence >= monster_min_conf. Missing row = blocked (fail closed).
+    bool        monster_enabled = false;
+    double      monster_min_conf = 0.85;
+    // Directory of `<SYMBOL>.csv` Monster feature files to auto-load per
+    // stream (skipped for a stream that already carries rows).
+    std::string monster_dir;
 };
 
 struct PaperSessionResult {
@@ -170,6 +205,7 @@ struct PaperSessionResult {
     int64_t halts = 0;                   // kill-switch activation transitions
     int64_t abstains = 0;                // entry refused: feed not OK
     int64_t refused = 0;                 // entry refused: risk/asset gate
+    int64_t monster_blocked = 0;         // entry refused: Monster gate
     double  final_equity = 0.0;
     PerfMetrics metrics;
     std::string error;
