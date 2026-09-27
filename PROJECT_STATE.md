@@ -1759,8 +1759,11 @@ the backbone's hidden state without generating a single token. New doc:
   space with **one matvec** `[A,E] x [E]` + softmax + argmax. No token loop is
   reachable from `decide()`; it is allocation-free after the first call and
   never mutates the recurrent state.
-- `DecisionResult { action_type, confidence_score, target_asset, margin,
-  routing, fast_path, matvecs, ms }` + `to_json()`.
+- `DecisionResult { action_type, confidence_score, target_asset, invalidation,
+  margin, routing, fast_path, matvecs, ms }` + `to_json()`. `invalidation` is
+  the per-action *default* stop level: `0` means NOT SPECIFIED / unknown, which
+  is deliberately distinct from "no stop" — the head cannot recover a price
+  level from a hidden state, so the risk engine owns the real value.
 - Fail-closed routing: `ABSTAIN` and `EXPLAIN` can never self-route, however
   confident. A near-tie fails the margin gate and escalates.
 - Persistence (self-describing LE blob, validated on load) with `set_action()`
@@ -1801,13 +1804,16 @@ the backbone's hidden state without generating a single token. New doc:
 ### Verification
 
 - `tests/test_decision_head.cpp` (new, ctest `omniseed_decision_head`) —
-  **149 checks, 0 failures**, fully offline (no model, no GGUF, no network).
+  **162 checks, 0 failures** (149 at first landing; the `invalidation` field
+  added in `5257a8a` brought the count up), fully offline (no model, no GGUF,
+  no network).
 - Speed claim measured with the same clock and the same scalar fp32 inner loop
   on both sides, against the **most charitable possible** System-2 baseline (a
   bare output-head matvec per token, no attention/FFN/channel-mix — so the ratio
   is a *lower bound*): tiny E=64/V=256 → **3,419–5,040x**; mid E=256/V=8192 →
   **246,349–252,057x**. The mandated bar is 100x.
-- Full local board `ctest -C Release`: **10/10 passed**.
+- Full local board `ctest -C Release`: **10/10 passed** at this commit (11/11
+  once the T2 bridge suite below was registered).
 - `omniseed_server` builds clean with `-DOMNISEED_BUILD_SERVER=ON`.
 - No new Python dependency in the decision path; the <400 MB budget and the 2%
   risk-limit logic in C++ are untouched.
@@ -1823,3 +1829,112 @@ the backbone's hidden state without generating a single token. New doc:
 - Fitting the projection offline is **not implemented** — `set_action()` /
   `save()` / `load()` are the interface for it. This is the next honest step,
   not a finished feature.
+
+## 23. T7+ T2 — INTEGRATION: JSON CONTRACT, PROVENANCE, DASHBOARD, GATE (2026-09-27)
+
+Integration and polish pass. No new strategy, no new research: everything here
+wires up pieces that were already built and tested, and adds the tests that
+prove the wiring holds.
+
+### Naming reality vs the brief
+
+The brief named `python/trading/paper_daemon.py` and `journal.csv`. Neither
+exists and neither should: the paper daemon is **C++**
+(`src/trading/paper_daemon.cpp`, driven by
+`omniseed_agent2.exe trading-paper-session`), and the journal is
+`state/paper_journal.csv`. Those paths were treated as naming intent. What was
+actually missing was the **seam** between the C++ side and the Python
+tooling — that is what this pass builds.
+
+### `tools/decision_bridge.py` (new) — the JSON half of the contract
+
+Parses the `DecisionResult` JSON that `agent_loop.cpp` emits on the fast path.
+Strictly typed fields, and the fail-closed rules are the *only* thing it
+exports as policy:
+
+- `NEVER_TRADES = {ABSTAIN, EXPLAIN}` — these can never become an order,
+  however confident.
+- `OPENS_RISK = {BUY, SELL, HEDGE}`.
+- `screen()` raises `ValueError` if asked for a threshold **below** 0.85. The
+  mandate bar may be raised, never lowered.
+- A watched symbol with **no** decision is refused, not ignored: *silence is
+  not consent*.
+- Malformed input never raises out of `screen()` — it is refused.
+
+CLI: `--json` / `--jsonl` / `--threshold` / `--allow-unknown-stop` /
+`--self-test`; exit 0 = tradeable, 1 = refused, 2 = malformed.
+
+### Entry provenance through a frozen journal schema
+
+The journal is a frozen 10-field CSV (`ts,kind,ticker,qty,price,pnl,equity,
+cash,exposure,reason`) and `Position` carries no stop or confidence field. So
+provenance rides in the free-text `reason` column:
+
+```
+entry conf=<0..1> stop=<price> stop_pct=<frac>
+```
+
+- Written by `entry_reason()` in `paper_daemon.cpp` on both entry paths.
+  Spaces only, so `csv_safe()` (which rewrites `,`/`\n`/`\r`) cannot mangle it.
+- `stop` is derived from the **same `RiskLimits` the exit check uses**, so the
+  dashboard can never display a stop the engine would not honour.
+- `paper_report.py` recovers it in `replay_positions()`; the stop **level** is
+  recomputed from the blended average to match `RiskManager::check_exit`, and
+  a legacy row with no provenance reports `None` — never `0`.
+
+### Dashboard + server
+
+- `tools/paper_dashboard.py` — one self-contained HTML document (no `<link>`,
+  no `<img>`, no CDN). Panels: live equity curve (inline SVG), open positions
+  with **entry / stop / distance-to-stop / confidence meter / last / unrealized**,
+  daily P&L KPIs, regime status, feed health, and a risk panel that quotes the
+  engine's own limits.
+- `tools/serve_dashboard.py` (new) — stdlib `ThreadingHTTPServer`; routes `/`,
+  `/api/state`, `/healthz`, `/journal.csv`, 404 otherwise; `Cache-Control:
+  no-store`. An inlined poller re-draws the KPIs, the curve, the positions and
+  the regime table in place. Opened from `file://` it degrades to a static
+  snapshot and says so instead of failing silently.
+- `tools/paper_loop.py` — `DecisionGate` (`off` | `file` | `agent`) and the
+  regime reading are wired into the heartbeat. The gate can only **append to
+  the engine's `--skip` list**; it cannot widen risk. Every unusable path fails
+  closed (missing log, sub-mandate threshold, unknown source, agent failure).
+
+### Why the new test is NOT behind the `.venv` gate
+
+`tests/test_decision_bridge.py` is stdlib-only, so it is registered with
+`find_package(Python3)` *outside* the `.venv` guard that the LoRA suites use.
+It has to run in CI (where no `.venv` exists) because
+`test_engine_limits_match_cpp()` re-reads `include/omniseed/trading/*.h` and
+fails if the Python copy of the 2% / 3% / 8% limits ever drifts from C++.
+
+### Verification
+
+- `tests/test_decision_bridge.py` (new, ctest `omniseed_decision_bridge`) —
+  **141 checks, 0 failures** when a market CSV is reachable; **133** when it is
+  not (section 8 skips honestly and prints why).
+- Section 8 is the cross-language contract: it runs the **real daemon** and
+  parses what it actually wrote, because the fixture-based tests would keep
+  passing if `entry_reason()`'s format silently changed.
+- End-to-end on real data (`models/market/AAPL_1d.csv`, 1254 bars): the daemon
+  produced **43 entries / 42 exits**, every entry reason parsed, every
+  `stop == entry x (1 - stop_pct)` to price precision, and the report layer
+  recovered `AAPL qty=64 entry=323.13 stop=297.28 conf=0.500` — i.e.
+  `323.13 x 0.92 = 297.28`.
+- Live server smoke on port 8791: `/` 200, `/api/state` 200, `/healthz` 200,
+  `/nope` 404.
+- Full local board `ctest -C Release`: **11/11 passed**.
+
+### Honest limits
+
+- The journal's `conf=` is the **rule-based strategy's `Signal::strength`**, not
+  the System-1 head's softmax. The head is still untrained (§22), so routing it
+  into the paper loop would put an uncalibrated number in front of real risk
+  logic. The dashboard labels it "confidence" in the strategy sense.
+- The gate is **risk-removing only**. The 2% per-trade budget and the 3% daily
+  kill-switch remain C++-enforced and untouched; Python mirrors them for
+  display and is contract-tested against drift.
+- Legacy journal rows have no provenance; their confidence renders as `—`.
+  Back-filling would mean inventing numbers, so it is not done.
+- The head's `invalidation` is a default the risk engine is expected to
+  override; nothing in the paper path consumes it yet.
+

@@ -18,6 +18,37 @@ import os
 
 JOURNAL_HEADER = ("ts,kind,ticker,qty,price,pnl,equity,cash,exposure,reason")
 
+# ---------------------------------------------------------------------------
+# The engine's risk contract, restated for display.
+#
+# These are NOT knobs and they are NOT enforced here — they are copies of
+# constants that live in C++, quoted so the dashboard can label its numbers
+# without inventing them. The authoritative definitions are:
+#
+#   per_trade_pct   src/trading/trading_engine.cpp  (the engine CLAMPS the
+#                   configured budget into [1%, 2%], so 2% is a ceiling)
+#   stop_loss_pct   include/omniseed/trading/trading_engine.h  (RiskLimits)
+#   daily_kill_pct  include/omniseed/trading/risk_gate.h
+#   weekly_kill_pct include/omniseed/trading/risk_gate.h
+#
+# tests/test_decision_bridge.py::test_engine_limits_match_cpp re-reads those
+# sources and fails if any value here drifts from them.
+# ---------------------------------------------------------------------------
+ENGINE_LIMITS = {
+    "per_trade_pct": 2.0,      # ceiling on risk per trade, % of equity
+    "stop_loss_pct": 0.08,     # per-position stop, fraction of entry
+    "daily_kill_pct": 3.0,     # daily loss that halts NEW entries, % of equity
+    "weekly_kill_pct": 6.0,    # weekly loss that halts NEW entries, %
+}
+
+# The C++ engine stamps each entry fill's free-text `reason` with its own
+# decision context, because the 10-field schema and the Position struct have
+# nowhere else to put it:
+#     entry conf=<0..1> stop=<price> stop_pct=<frac>
+# These are the keys we know how to read back. Anything else in the reason is
+# the rule trace and is left alone.
+_ENTRY_KV_FLOAT = ("conf", "stop", "stop_pct")
+
 
 def day_key(ts):
     """UTC date string for a unix timestamp."""
@@ -56,8 +87,41 @@ def load_journal(path):
     return out
 
 
+def parse_entry_provenance(reason):
+    """'entry conf=0.72 stop=178.42 stop_pct=0.08' -> {'conf':0.72, ...}.
+
+    Tolerant by design: an old journal row that is a bare 'entry' yields {},
+    and an unparsable token is skipped rather than raising. A missing key means
+    'the engine did not record it', which the dashboard must render as an
+    unknown — never as a zero.
+    """
+    out = {}
+    if not reason:
+        return out
+    for tok in reason.replace(";", " ").split():
+        if "=" not in tok:
+            continue
+        k, _, v = tok.partition("=")
+        k = k.strip()
+        if k not in _ENTRY_KV_FLOAT:
+            continue
+        try:
+            out[k] = float(v)
+        except ValueError:
+            continue
+    return out
+
+
 def replay_positions(records):
-    """Rebuild the open book from the recorded fills (qty>0 buy, qty<0 sell)."""
+    """Rebuild the open book from the recorded fills (qty>0 buy, qty<0 sell).
+
+    Also recovers each position's entry provenance (stop distance and the
+    signal confidence) from the entry fills' `reason` column. The stop LEVEL is
+    recomputed as ``avg * (1 - stop_pct)`` *after* the blend, which is the same
+    arithmetic RiskManager::check_exit() uses — so the number shown on the
+    dashboard is the number the engine would actually act on, even when a name
+    was built from several entries at different prices.
+    """
     pos = {}
     for r in records:
         if r["kind"] != "fill" or not r["ticker"]:
@@ -70,10 +134,27 @@ def replay_positions(records):
             total = p["qty"] + q
             p["avg"] = (p["qty"] * p["avg"] + q * px) / total
             p["qty"] = total
+            kv = parse_entry_provenance(r["reason"])
+            if "conf" in kv:
+                p["confidence"] = kv["conf"]
+            if "stop_pct" in kv:
+                p["stop_pct"] = kv["stop_pct"]
+            elif "stop" in kv and "stop_pct" not in p:
+                # Legacy row: only the absolute level was recorded.
+                p["_stop_level"] = kv["stop"]
+            p["opened_ts"] = p.get("opened_ts", r["ts"])
+            p["entries"] = p.get("entries", 0) + 1
         elif t in pos:
             pos[t]["qty"] += q
             if pos[t]["qty"] <= 1e-9:
                 del pos[t]
+
+    for p in pos.values():
+        if "stop_pct" in p:
+            p["stop"] = p["avg"] * (1.0 - p["stop_pct"])
+        else:
+            p["stop"] = p.pop("_stop_level", None)
+        p.setdefault("confidence", None)
     return pos
 
 
@@ -163,6 +244,7 @@ def analyze(journal_path, status_path=None, now_ts=None):
         "per_symbol": per_symbol,
         "positions": positions,
         "feeds": status.get("feeds", {}),
+        "regime": status.get("regime", {}),
         "status": status,
         "last_ts": records[-1]["ts"] if records else 0,
     }

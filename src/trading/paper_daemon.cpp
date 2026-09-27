@@ -6,6 +6,7 @@
 #include "omniseed/core/platform.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -34,6 +35,29 @@ size_t split_fields(const std::string& line, std::string* out, size_t max) {
         }
     }
     return n < max ? n : max;
+}
+
+// Entry provenance.
+//
+// The journal's `reason` column is the ONLY place a paper fill can carry its
+// own decision context: `Position` is {ticker, side, qty, avg_price, opened_at}
+// and the 10-field CSV schema is frozen, so there is nowhere else to put it —
+// and `reason` is the only field a reader (paper_report.py, the dashboard) can
+// get it back out of.
+//
+// Format (spaces only, so csv_safe() cannot mangle it):
+//     entry conf=<0..1> stop=<price> stop_pct=<frac>
+//
+// `stop` is derived from the SAME RiskLimits the exit check uses, so the
+// dashboard can never display a stop the engine would not actually honour.
+// `conf` is the signal strength — the rule ensemble's own conviction, 0..1.
+std::string entry_reason(double strength, double entry_price,
+                         const RiskLimits& lim) {
+    char buf[160];
+    const double stop = entry_price * (1.0 - lim.stop_loss_pct);
+    std::snprintf(buf, sizeof(buf), "entry conf=%.3f stop=%.4f stop_pct=%.4f",
+                  strength, stop, lim.stop_loss_pct);
+    return std::string(buf);
 }
 
 } // namespace
@@ -271,7 +295,8 @@ PaperDaemonResult PaperDaemon::run(const std::vector<Bar>& bars,
             ++res.entries;
             journal.fill(bars[i + 1].time, cfg.ticker, sz.qty, bars[i + 1].open,
                          0.0, broker.state().equity, broker.state().cash,
-                         broker.state().gross_exposure, "entry");
+                         broker.state().gross_exposure,
+                         entry_reason(sig.strength, bars[i + 1].open, cfg.risk));
         }
     }
 
@@ -457,7 +482,8 @@ PaperSessionResult PaperSession::run(const PaperSessionConfig& cfg,
                 ++res.entries;
                 journal.fill(nb.time, sym, sz.qty, nb.open, 0.0,
                              broker.state().equity, broker.state().cash,
-                             broker.state().gross_exposure, "entry");
+                             broker.state().gross_exposure,
+                             entry_reason(sig.strength, nb.open, cfg.risk));
             }
         }
     }

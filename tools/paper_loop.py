@@ -24,7 +24,9 @@
 # =============================================================================
 import argparse
 import datetime as dt
+import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -125,6 +127,223 @@ def derive_state(staleness, failures):
 
 
 # ---------------------------------------------------------------------------
+# Regime (M8) — optional, and honestly optional
+# ---------------------------------------------------------------------------
+def load_regime_module():
+    """tools/monster/regime.py, or None when this checkout does not have it.
+
+    The regime engine landed on its own branch. Rather than pretend, the loop
+    asks for it and reports `regime: {}` when it is absent — the dashboard then
+    says so in words.
+    """
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+    try:
+        from monster import regime as _regime     # noqa: PLC0415
+        return _regime
+    except Exception:                             # noqa: BLE001
+        return None
+
+
+def _finite_or_none(x):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def regime_for(regime_mod, csv_path):
+    """Latest CAUSAL regime reading for one symbol's provenance CSV -> dict|None.
+
+    `detect()` is pure and windowed, so this reads only the past. Bars are the
+    (ts, open, high, low, close, volume) tuples the CSV already holds — the
+    same shape tools/monster/features.py expects.
+    """
+    if regime_mod is None or not csv_path or not os.path.exists(csv_path):
+        return None
+    try:
+        rows = read_csv_rows(csv_path)
+        bars = [rows[k] for k in sorted(rows)]
+        if len(bars) < 20:
+            return None
+        st = regime_mod.detect(bars, len(bars) - 1)
+    except Exception:                             # noqa: BLE001
+        return None
+    return {
+        "label": str(st.label),
+        "direction": str(st.direction or ""),
+        "trend_score": _finite_or_none(st.trend_score),
+        "vol_score": _finite_or_none(st.vol_score),
+        "stressed": bool(st.stressed),
+        "detail": st.detail(),
+        "ts": int(st.ts or 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# System-1 decision gate — optional, and strictly risk-REMOVING
+# ---------------------------------------------------------------------------
+def load_bridge_module():
+    """tools/decision_bridge.py, or None."""
+    path = os.path.join(_HERE, "decision_bridge.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("decision_bridge", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:                             # noqa: BLE001
+        return None
+
+
+class DecisionGate:
+    """Turns System-1 verdicts into extra `--skip` entries.
+
+    This gate can only ever REMOVE risk. The 2% per-trade budget and the 3%
+    daily kill-switch are enforced in C++ and are not re-implemented or
+    relaxed here — a symbol the gate refuses simply joins the engine's `--skip`
+    list, which gates NEW entries and leaves marking, stops and exits alone.
+
+    Two sources:
+      file  — a JSONL of verdicts already produced by the head
+      agent — invoke the CLI once per symbol in `--mode decision-only`
+
+    Everything fails closed: an unreadable source, a missing head, or a
+    malformed line makes the gate refuse, never allow.
+    """
+
+    def __init__(self, source="off", jsonl=None, threshold=None,
+                 binary=None, head=None, timeout=120):
+        self.source = source
+        self.jsonl = jsonl
+        self.bridge = load_bridge_module()
+        self.threshold = (self.bridge.MANDATE_THRESHOLD if threshold is None
+                          else float(threshold))
+        self.binary = binary
+        self.head = head
+        self.timeout = timeout
+        self.last = {"active": False, "source": source, "reason": "disabled"}
+
+    def configured(self):
+        """-> (usable, why).
+
+        `usable == False` does NOT mean "inactive": only `source == "off"` is
+        inactive. Anything else that is not usable is BROKEN, and screen()
+        fails closed on it. A gate that silently disappears is a gate that
+        silently widens risk.
+        """
+        if self.source == "off":
+            return False, "source=off"
+        if self.bridge is None:
+            return False, "tools/decision_bridge.py not found"
+        try:
+            if float(self.threshold) < self.bridge.MANDATE_THRESHOLD:
+                return False, (
+                    f"threshold {self.threshold} is below the mandate's "
+                    f"{self.bridge.MANDATE_THRESHOLD}; the bar may be raised, "
+                    "never lowered")
+        except (TypeError, ValueError):
+            return False, f"threshold {self.threshold!r} is not a number"
+        if self.source == "file":
+            if not self.jsonl:
+                return False, "source=file but no --decision-jsonl"
+            if not os.path.exists(self.jsonl):
+                return False, f"no decision log at {self.jsonl}"
+            return True, ""
+        if self.source == "agent":
+            if not self.binary or not os.path.exists(self.binary):
+                return False, f"no agent binary at {self.binary}"
+            if not self.head or not os.path.exists(self.head):
+                return False, f"no decision head at {self.head}"
+            return True, ""
+        return False, f"unknown source {self.source!r}"
+
+    # -- sources -----------------------------------------------------------
+    def _from_file(self):
+        decisions, bad = {}, []
+        with open(self.jsonl, "r", encoding="utf-8") as f:
+            rows = self.bridge.parse_jsonl(f)
+        for n, d in rows:
+            if isinstance(d, self.bridge.DecisionParseError):
+                bad.append({"symbol": "", "reason": f"{self.jsonl}:{n}: {d}"})
+            else:
+                decisions[d.target_asset or f"line{n}"] = d
+        return decisions, bad
+
+    def _from_agent(self, symbols):
+        decisions, bad = {}, []
+        for sym in symbols:
+            cmd = [self.binary, "ask", "--mode", "decision-only",
+                   "--decision-head", self.head,
+                   "--decision-threshold", str(self.threshold),
+                   f"Decide on {sym}."]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=self.timeout)
+            except Exception as e:                # noqa: BLE001
+                bad.append({"symbol": sym, "reason": f"agent failed: {e}"})
+                continue
+            payload = None
+            for line in ((proc.stdout or "") + "\n" +
+                         (proc.stderr or "")).splitlines():
+                if "[decision]" in line:
+                    payload = line.split("[decision]", 1)[1].strip()
+            if not payload:
+                bad.append({"symbol": sym,
+                            "reason": "no [decision] line in agent output"})
+                continue
+            try:
+                decisions[sym] = self.bridge.parse_decision(payload)
+            except self.bridge.DecisionParseError as e:
+                bad.append({"symbol": sym, "reason": f"malformed: {e}"})
+        return decisions, bad
+
+    # -- the gate ----------------------------------------------------------
+    def screen(self, symbols):
+        """-> (skip_symbols, info). Never raises, never widens risk."""
+        symbols = list(symbols)
+        if self.source == "off":
+            self.last = {"active": False, "source": "off", "reason": "disabled"}
+            return [], self.last
+
+        usable, why = self.configured()
+        if not usable:
+            # The gate was REQUESTED but is unusable. Fail closed: skip every
+            # symbol rather than quietly reverting to ungated entries.
+            self.last = {"active": True, "source": self.source,
+                         "fail_closed": True, "reason": why,
+                         "threshold": self.threshold, "allowed": [],
+                         "refused": [{"symbol": s, "reason": why}
+                                     for s in symbols]}
+            return symbols, self.last
+
+        try:
+            if self.source == "file":
+                decisions, bad = self._from_file()
+            else:
+                decisions, bad = self._from_agent(symbols)
+        except Exception as e:                    # noqa: BLE001
+            # Fail closed: we could not read the head, so we open nothing new.
+            self.last = {"active": True, "source": self.source,
+                         "threshold": self.threshold, "fail_closed": True,
+                         "reason": f"gate failed: {e}", "allowed": [],
+                         "refused": [{"symbol": s,
+                                      "reason": "gate unavailable"}
+                                     for s in symbols]}
+            return symbols, self.last
+
+        allowed, refused = self.bridge.screen(
+            decisions, symbols=symbols, threshold=self.threshold)
+        refused = refused + bad
+        self.last = {"active": True, "source": self.source,
+                     "threshold": self.threshold, "fail_closed": False,
+                     "reason": "", "allowed": allowed, "refused": refused}
+        return [r.get("symbol") for r in refused if r.get("symbol")], self.last
+
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 class PaperLoop:
@@ -132,7 +351,8 @@ class PaperLoop:
                  csv_dir=DEFAULT_CSV_DIR, capital=100000.0, years=1.0,
                  timeframe="1d", strategy="balanced", binary=None,
                  probe_fn=None, fetch_fn=None, runner=None, now_fn=None,
-                 dry_run=False, min_volume=0.0):
+                 dry_run=False, min_volume=0.0, decision_gate=None,
+                 regime=True, regime_mod=None):
         self.watch = watch
         self.journal = journal
         self.status_path = status
@@ -148,6 +368,10 @@ class PaperLoop:
         self.now_fn = now_fn or time.time
         self.dry_run = dry_run
         self.min_volume = min_volume
+        self.decision_gate = decision_gate or DecisionGate(source="off")
+        # Regime is best-effort: absent engine -> `regime: {}`, said plainly.
+        self.regime_mod = regime_mod if regime_mod is not None else (
+            load_regime_module() if regime else None)
         self.cycle_no = 0
         # per-symbol health, persisted across cycles
         self.health = {}
@@ -218,7 +442,20 @@ class PaperLoop:
                     rec["abstain"] = True
                     rec["reason"] = "fetch-failed"
 
-        session = self._run_session(feeds)
+        # --- System-1 decision gate (optional; can only REMOVE risk) ------
+        # A refused symbol joins the engine's `--skip` list. Skipping gates NEW
+        # entries only — open positions are still marked, stopped and exited.
+        gate_skip, gate_info = self.decision_gate.screen(
+            sorted(f["symbol"] for f in feeds.values()))
+
+        # --- regime status (M8; empty and said so when the engine is absent)
+        regime = {}
+        for item in self.watch:
+            r = regime_for(self.regime_mod, self.csv_path(item))
+            if r:
+                regime[item["symbol"]] = r
+
+        session = self._run_session(feeds, extra_skip=gate_skip)
         status = {
             "updated_ts": now,
             "updated_iso": dt.datetime.fromtimestamp(
@@ -229,6 +466,8 @@ class PaperLoop:
             "timeframe": self.timeframe,
             "journal": self.journal,
             "feeds": feeds,
+            "regime": regime,
+            "decision_gate": gate_info,
             "last_session": session,
         }
         self._write_status(status)
@@ -249,9 +488,11 @@ class PaperLoop:
                 parts.append(f"{item['symbol']},{item['asset']},{path}")
         return ";".join(parts)
 
-    def _run_session(self, feeds):
+    def _run_session(self, feeds, extra_skip=()):
         streams = self._streams_arg()
-        skip = ",".join(k for k, v in feeds.items() if v.get("abstain"))
+        skip_set = {k for k, v in feeds.items() if v.get("abstain")}
+        skip_set.update(s for s in extra_skip if s)
+        skip = ",".join(sorted(skip_set))
         if not streams:
             return {"ok": False, "skipped": True,
                     "reason": "no symbol has any data yet (all feeds ABSTAIN)"}
@@ -305,8 +546,17 @@ class PaperLoop:
         while cycles == 0 or n < cycles:
             st = self.cycle(http)
             ok = sum(1 for f in st["feeds"].values() if not f["abstain"])
+            gate = st.get("decision_gate") or {}
+            gate_note = ""
+            if gate.get("active"):
+                gate_note = (f" | gate {gate.get('source')}: "
+                             f"{len(gate.get('allowed') or [])} allowed / "
+                             f"{len(gate.get('refused') or [])} refused"
+                             + (" (FAIL-CLOSED)" if gate.get("fail_closed") else ""))
+            regime_note = (f" | regime {len(st.get('regime') or {})}"
+                           if st.get("regime") else " | regime n/a")
             print(f"[loop] cycle {st['cycle']}: {ok}/{len(st['feeds'])} feeds ok "
-                  f"| session {st['last_session']}")
+                  f"{regime_note}{gate_note} | session {st['last_session']}")
             n += 1
             if cycles == 0 or n < cycles:
                 sleep_fn(max(1, interval))
@@ -331,6 +581,22 @@ def main() -> int:
     ap.add_argument("--min-volume", type=float, default=0.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="poll + refresh CSVs but do not run the engine")
+    # --- System-1 decision gate (optional; can only REMOVE risk) ----------
+    ap.add_argument("--decision-source", choices=("off", "file", "agent"),
+                    default="off",
+                    help="gate new entries on System-1 verdicts. 'file' reads "
+                         "--decision-jsonl; 'agent' invokes the CLI per symbol")
+    ap.add_argument("--decision-jsonl", default=None,
+                    help="one decision JSON per line (source=file)")
+    ap.add_argument("--decision-head", default=None,
+                    help="trained head blob for --decision-source agent")
+    ap.add_argument("--decision-binary", default=None,
+                    help="agent binary for --decision-source agent "
+                         "(default: build/bin/omniseed.exe)")
+    ap.add_argument("--decision-threshold", type=float, default=None,
+                    help="confidence bar; may only be RAISED above 0.85")
+    ap.add_argument("--no-regime", action="store_true",
+                    help="skip the M8 regime reading in the heartbeat")
     a = ap.parse_args()
 
     try:
@@ -339,11 +605,26 @@ def main() -> int:
         print(f"[loop] {e}", file=sys.stderr)
         return 2
 
+    gate = DecisionGate(source=a.decision_source, jsonl=a.decision_jsonl,
+                        threshold=a.decision_threshold,
+                        binary=a.decision_binary or (
+                            os.path.join("build", "bin", "omniseed.exe"
+                                         if os.name == "nt" else "omniseed")),
+                        head=a.decision_head)
+    if a.decision_source != "off":
+        ok, why = gate.configured()
+        if not ok:
+            print(f"[loop] decision gate requested but not usable: {why}\n"
+                  "[loop] refusing to start rather than run ungated",
+                  file=sys.stderr)
+            return 2
+
     loop = PaperLoop(watch, journal=a.journal, status=a.status,
                      csv_dir=a.csv_dir, capital=a.capital, years=a.years,
                      timeframe=a.timeframe, strategy=a.strategy,
                      binary=a.binary, dry_run=a.dry_run,
-                     min_volume=a.min_volume)
+                     min_volume=a.min_volume, decision_gate=gate,
+                     regime=not a.no_regime)
     cycles = 1 if a.once else a.cycles
     try:
         return loop.run(cycles, a.interval)
