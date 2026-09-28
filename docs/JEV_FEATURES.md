@@ -221,6 +221,14 @@ per-row-driven filters are asserted to produce the **same** event stream.
 Nothing consumes it yet — no trading loop, no agent loop, no backtest. The only
 caller is `omniseed demo-stream`. Full detail: **`docs/STREAMING.md`**.
 
+**Update (§39):** the §37 measurements were taken on a **seeded** head that
+`demo-stream` constructed inline. As of §39 the demo loads the committed
+`models/heads/trading_head.bin`, and the numbers — and one headline finding —
+changed. On the same 240 real held-out rows: **6 distinct actions** (not 1) and
+**158 raw flips** (not 0). The filter still commits **nothing**, because every
+calibrated confidence is below `min_confidence = 0.50`; that is the fail-safe
+working. See `docs/FEEDBACK.md` §8.
+
 ### 8. Hierarchical routing — **PARTIAL (one level)**
 
 One level is real: `HeadRouter` reads `h[E]` and decides *which* heads run and in
@@ -249,7 +257,7 @@ Depeweg 2018 decomposition (`total = H(mean p)`, `aleatoric = mean H(p)`,
 it** — no head ensemble has been fitted, so there is no `q(θ)`. As elsewhere in
 this tree, the gap is the *joint*, not the capability. See `docs/UNCERTAINTY.md`.
 
-### 10. Feedback hooks — **PARTIAL**
+### 10. Feedback hooks — **DONE at the record level**
 
 No mechanism records an outcome and feeds it back **into a head**. What exists is
 the *plumbing* a feedback loop would write through — the per-head fitting hooks
@@ -270,6 +278,27 @@ empty one. Fixed in §34 with one shared `kMagic`, and pinned by test C9.
 
 So the honest status is: the store exists and now persists, but nothing yet
 closes the loop from a *head's* prediction to a *recorded market outcome*.
+
+**Update (§38): the loop now closes — DONE at the record level.**
+`DecisionJournal` + `FeedbackHook` (`include/omniseed/feedback_hook.h`) record one
+row per **valid** `StreamEvent`, join it to an outcome, and persist the pair.
+Both actions are kept and scored separately: `predicted` (the **head's** raw
+action) and `held` (the **filter's** committed one), so a filter that is more
+stable *and less correct* cannot hide. `UserFeedbackLoop` gained the persistence
+it never had.
+
+The honesty convention is the point: **an unresolved prediction is not a wrong
+prediction.** `hit_rate()` returns **-1.0**, never `0.0`, when nothing is
+resolved; `Rejected` (the user said the decision was invalid) and `Expired` (no
+outcome within the horizon) are excluded from every accuracy number. One
+prediction is scored against one outcome — re-resolving a row is refused.
+
+Measured on the 369 real held-out bars with the **fitted** head: `hit_rate`
+**0.2439** and ECE **0.0555**, both matching `metrics.tsv` exactly through a
+completely independent path. `to_tsv()` emits the rows an offline re-fit would
+consume. **What is still missing:** nothing *consumes* the hook — no agent loop,
+no trading loop, no backtest — and nothing re-fits from the journal. See
+`docs/FEEDBACK.md`.
 
 ---
 

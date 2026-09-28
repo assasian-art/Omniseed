@@ -38,6 +38,7 @@
 #include "omniseed/runtime/token_bus.h"
 #include "omniseed/soul.h"
 #include "omniseed/streaming_decision.h"
+#include "omniseed/feedback_hook.h"
 #include "omniseed/vision/vision.h"
 #include "omniseed/vision/vision_tasks.h"
 
@@ -78,6 +79,7 @@ void print_usage() {
         "  demo-memory                 1M-token window + Memory Crystals\n"
         "  demo-soul                   persona + memory + recall + decay\n"
         "  demo-stream                 streaming decisions (debounce+hysteresis)\n"
+        "  demo-feedback               prediction -> outcome -> persisted record\n"
         "  demo-audio F.wav            sound events / scene / wake word\n"
         "  demo-vision                 pointer grounding + spatial map\n"
         "  dream                       Dream-State consolidation pass\n"
@@ -496,13 +498,43 @@ int cmd_demo_soul() {
 }
 
 // ===========================================================================
+// THE RUNTIME JOINT — load the FITTED decision head when one is committed.
+//
+// §32 fitted `models/heads/trading_head.bin` and the file has been in the tree
+// ever since, but NO demo path ever loaded it: every stream ran on the seeded
+// placeholder and reported actions that mean nothing. Loading it is the
+// difference between demonstrating a filter and demonstrating a filter on a
+// real projection.
+//
+// FAILS LOUDLY, NEVER SILENTLY. A missing or rejected blob falls back to the
+// seeded placeholder with a warning naming the path, because a demo that
+// quietly degrades to meaningless numbers is worse than one that says so.
+// ===========================================================================
+static const char* const kFittedDecisionHead = "models/heads/trading_head.bin";
+
+// Returns true when a FITTED head is in place. `head` is always ready.
+static bool load_decision_head(DecisionHead& head) {
+    if (!head.init(768, 4242u)) return false;
+    if (!head.load(kFittedDecisionHead)) {
+        std::printf("head   : SEEDED PLACEHOLDER — %s\n", head.error().c_str());
+        std::printf("         Actions below are WELL-FORMED and MEANINGLESS.\n");
+        return false;
+    }
+    std::printf("head   : %s\n", head.provenance().c_str());
+    if (!head.trained()) {
+        std::printf("         WARNING: the blob loaded but is NOT fitted; the "
+                    "actions below are placeholders.\n");
+    }
+    return head.trained();
+}
+
+// ===========================================================================
 // Demo: streaming decisions (Milestone 9, Phase 2.2)
 //
-// MODEL-FREE ON PURPOSE. The filter's job is to make a head's output STABLE,
-// and whether it does that is a property of the FILTER, not of the head. Using
-// a seeded head keeps this runnable on a fresh clone with no GGUF — and the
-// output says plainly that an untrained head's actions mean nothing, so nobody
-// reads the numbers as a judgement.
+// The filter's job is to make a head's output STABLE, and whether it does that
+// is a property of the FILTER, not of the head — so the churn numbers below are
+// meaningful either way. What the ACTIONS mean depends on whether a fitted
+// projection was found, and the output says which.
 //
 // The headline number is the CHURN REDUCTION: how often the raw head output
 // flips, versus how often the committed action flips. That is the whole point
@@ -510,15 +542,17 @@ int cmd_demo_soul() {
 // ===========================================================================
 int cmd_demo_stream() {
     DecisionHead head;
-    if (!head.init(768, 4242u)) {
+    if (!head.ready() && !head.init(768, 4242u)) {
         std::printf("decision head init failed: %s\n", head.error().c_str());
         return 1;
     }
 
     std::printf("=== STREAMING DECISIONS: debounce + hysteresis + release ===\n\n");
-    std::printf("head   : %s\n", head.provenance().c_str());
-    std::printf("NOTE   : an UNTRAINED head's actions are meaningless. This demo\n");
-    std::printf("         exercises the filter, not the judgement.\n\n");
+    const bool fitted = load_decision_head(head);
+    if (!fitted)
+        std::printf("NOTE   : an UNTRAINED head's actions are meaningless. This demo\n"
+                    "         exercises the filter, not the judgement.\n");
+    std::printf("\n");
 
     // --- the stream: the real held-out h[E] if present ----------------------
     // Read through <fstream> rather than std::fopen: this translation unit does
@@ -624,6 +658,26 @@ int cmd_demo_stream() {
                     static_cast<long long>(f.releases()),
                     static_cast<long long>(f.weak()));
 
+        // How many DISTINCT actions the raw head produced. A head that emits
+        // the same action for every row is CONSTANT, and no filter can make it
+        // informative — this number is the difference between "the filter
+        // stabilised a signal" and "there was no signal to stabilise". It is
+        // the acceptance test for head fitting, so it is printed, not assumed.
+        {
+            bool seen[static_cast<int>(DecisionAction::COUNT)] = {false};
+            int distinct = 0;
+            for (const StreamEvent& e : ev) {
+                if (!e.valid) continue;
+                const int a = static_cast<int>(e.observed_action);
+                if (a >= 0 && a < static_cast<int>(DecisionAction::COUNT) && !seen[a]) {
+                    seen[a] = true;
+                    ++distinct;
+                }
+            }
+            std::printf("  the raw head emitted %d distinct action(s) over %zu step(s)\n",
+                        distinct, ev.size());
+        }
+
         int shown = 0;
         int64_t total = 0;
         for (const StreamEvent& e : ev) if (e.changed) ++total;
@@ -677,8 +731,222 @@ int cmd_demo_stream() {
 
     std::printf("What this shows: the same head, the same hidden states, and a\n");
     std::printf("committed action that moves far less often than the raw output.\n");
-    std::printf("What it does NOT show: any judgement. The head is UNTRAINED, so\n");
-    std::printf("the ACTIONS above are placeholders. The FILTER is real.\n");
+    if (fitted)
+        std::printf("The head is a FITTED projection (see docs/CALIBRATION.md), so the\n"
+                    "actions above are real outputs — but they imitate a rule, not P&L.\n");
+    else
+        std::printf("What it does NOT show: any judgement. The head is UNTRAINED, so\n"
+                    "the ACTIONS above are placeholders. The FILTER is real.\n");
+    std::printf("peak RSS: %.2f MB\n",
+                static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
+    return 0;
+}
+
+// ===========================================================================
+// Demo: the feedback hook (Milestone 10, Phase 2.3)
+//
+// THE CLOSED LOOP, on real data. The 369 held-out rows the trading head never
+// saw are streamed through the filter, every prediction is recorded, and then
+// every prediction is SCORED against the label that actually followed it.
+//
+// This is the first time anything in this tree has measured a head against what
+// happened. The number it prints is not a claim about profitability — the
+// labels are a documented rule, not P&L — it is the record's own accuracy
+// report about the head, which is what makes re-fitting possible at all.
+// ===========================================================================
+int cmd_demo_feedback() {
+    DecisionHead head;
+    if (!head.init(768, 4242u)) {
+        std::printf("decision head init failed: %s\n", head.error().c_str());
+        return 1;
+    }
+
+    std::printf("=== FEEDBACK HOOK: prediction -> outcome -> record ===\n\n");
+    const bool fitted = load_decision_head(head);
+
+    // --- the real held-out tape ---------------------------------------------
+    std::vector<float> H;
+    int32_t n = 0;
+    const char* kHidden = "tests/fixtures/head_calibration/trading/hidden.f32";
+    {
+        std::ifstream in(kHidden, std::ios::binary | std::ios::ate);
+        if (in) {
+            const std::streamoff sz = in.tellg();
+            if (sz > 0 && (sz % 4) == 0) {
+                H.resize(static_cast<size_t>(sz) / sizeof(float));
+                in.seekg(0, std::ios::beg);
+                in.read(reinterpret_cast<char*>(H.data()), static_cast<std::streamsize>(sz));
+                H.resize(static_cast<size_t>(in.gcount()) / sizeof(float));
+                n = static_cast<int32_t>(H.size() / 768u);
+            }
+        }
+    }
+    if (n <= 0) {
+        std::printf("the held-out fixture is absent (%s)\n", kHidden);
+        std::printf("run tools/train_heads.py, or see docs/FEEDBACK.md.\n");
+        return 1;
+    }
+
+    // --- the realised labels -------------------------------------------------
+    // Same file the offline trainer used, so the score is against the SAME
+    // definition the head was fitted to imitate. Anything else would be
+    // measuring the head against a different question.
+    std::vector<DecisionAction> realised;
+    {
+        std::ifstream lf("tests/fixtures/head_calibration/trading/labels.tsv");
+        std::string line;
+        int col = -1;
+        if (std::getline(lf, line)) {
+            size_t pos = 0;
+            int c = 0;
+            while (true) {
+                const size_t tab = line.find('\t', pos);
+                if (line.substr(pos, tab == std::string::npos ? std::string::npos : tab - pos)
+                    == "DecisionAction") { col = c; break; }
+                if (tab == std::string::npos) break;
+                pos = tab + 1; ++c;
+            }
+        }
+        while (col >= 0 && std::getline(lf, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+                line.pop_back();
+            if (line.empty()) continue;
+            std::vector<std::string> cells;
+            size_t pos = 0;
+            while (true) {
+                const size_t tab = line.find('\t', pos);
+                cells.push_back(line.substr(
+                    pos, tab == std::string::npos ? std::string::npos : tab - pos));
+                if (tab == std::string::npos) break;
+                pos = tab + 1;
+            }
+            if (static_cast<int>(cells.size()) <= col) break;
+            DecisionAction a = DecisionAction::ABSTAIN;
+            bool ok = false;
+            for (int32_t i = 0; i < static_cast<int32_t>(DecisionAction::COUNT); ++i) {
+                const DecisionAction cand = static_cast<DecisionAction>(i);
+                if (cells[static_cast<size_t>(col)] == decision_action_name(cand)) {
+                    a = cand; ok = true; break;
+                }
+            }
+            if (!ok) break;
+            realised.push_back(a);
+        }
+    }
+    if (realised.size() != static_cast<size_t>(n)) {
+        std::printf("labels (%zu) do not match the hidden rows (%d) — refusing to "
+                    "score a misaligned tape\n", realised.size(), n);
+        return 1;
+    }
+
+    std::printf("tape   : %d real held-out bar(s) from %s\n", n, kHidden);
+    std::printf("labels : %zu realised DecisionAction(s), the same teacher the head "
+                "was fitted to imitate\n\n", realised.size());
+
+    head.set_batch_kernel(BatchKernel::Scalar);   // §36: bit-identical to per-row
+
+    struct Run {
+        const char*  label;
+        StreamMode   mode;
+    };
+    const Run runs[2] = {
+        {"Confirm mode (3 consecutive agreeing)", StreamMode::Confirm},
+        {"Window mode (vote over 5)",             StreamMode::Window},
+    };
+
+    FeedbackHook hook;
+    const std::string key = "trading.AAPL.1d";
+
+    for (const Run& r : runs) {
+        StreamingDecision f;
+        if (!f.init(head)) { std::printf("filter init failed\n"); return 1; }
+        StreamingConfig c;
+        c.mode = r.mode;
+        c.confirm_steps = 3;
+        c.window = 5;
+        f.set_config(c);
+
+        std::vector<StreamEvent> ev;
+        if (!f.push_batch(H.data(), n, ev, nullptr)) {
+            std::printf("push_batch failed: %s\n", f.error().c_str());
+            return 1;
+        }
+
+        hook.clear();
+        hook.observe_stream(ev, key);
+        for (size_t i = 0; i < hook.journal().entries().size(); ++i)
+            hook.resolve(hook.journal().entries()[i].id, realised[i], 0.0f, 1);
+
+        const JournalStats s = hook.stats();
+        std::printf("--- %s ---\n", r.label);
+        std::printf("  %s\n", f.config().to_json().c_str());
+        std::printf("  recorded %lld prediction(s); %lld resolved; %lld with a verdict\n",
+                    static_cast<long long>(s.predictions),
+                    static_cast<long long>(s.predictions - s.unresolved),
+                    static_cast<long long>(s.verdicts));
+        std::printf("  HEAD   hit_rate %.4f  (%lld/%lld)\n", s.hit_rate(),
+                    static_cast<long long>(s.hits), static_cast<long long>(s.verdicts));
+        std::printf("  FILTER hit_rate %.4f  (%lld/%lld) on the %lld step(s) it held a "
+                    "position\n", s.filter_hit_rate(),
+                    static_cast<long long>(s.filter_hits),
+                    static_cast<long long>(s.filter_verdicts),
+                    static_cast<long long>(s.committed_rows));
+        std::printf("  commitment rate %.4f of steps\n", s.commitment_rate());
+        std::printf("  mean confidence when right %.4f, when wrong %.4f, gap %.4f\n",
+                    s.mean_conf_hit, s.mean_conf_miss, s.confidence_gap);
+        std::printf("  ECE %.4f   Brier %.4f\n", s.ece, s.brier);
+
+        // The confusion matrix, printed as the action names rather than indices.
+        if (!s.confusion.empty()) {
+            std::printf("  confusion (rows = predicted, cols = realised, non-zero only):\n");
+            for (size_t a = 0; a < s.confusion.size(); ++a) {
+                for (size_t b = 0; b < s.confusion[a].size(); ++b) {
+                    if (s.confusion[a][b] == 0) continue;
+                    std::printf("    %-8s -> %-8s %lld\n",
+                                decision_action_name(static_cast<DecisionAction>(a)),
+                                decision_action_name(static_cast<DecisionAction>(b)),
+                                static_cast<long long>(s.confusion[a][b]));
+                }
+            }
+        }
+
+        // The event-log identity, extended to the record: the rows the filter
+        // reported as changes are exactly the rows the journal marked.
+        int64_t changed_rows = 0;
+        for (const JournalEntry& e : hook.journal().entries()) if (e.changed) ++changed_rows;
+        const int64_t from_filter = f.commits() + f.changes() + f.releases();
+        std::printf("  identity: %lld changed row(s) == %lld filter commit/switch/"
+                    "release(s)  %s\n", static_cast<long long>(changed_rows),
+                    static_cast<long long>(from_filter),
+                    changed_rows == from_filter ? "OK" : "MISMATCH");
+        std::printf("\n");
+    }
+
+    // --- persist -------------------------------------------------------------
+    // Both stores, in one file, so they cannot be restored out of step.
+    const std::string bin_path = "state/feedback_journal.bin";
+    const std::string tsv_path = "state/feedback_journal.tsv";
+    if (hook.save(bin_path))
+        std::printf("journal saved: %s (%zu row(s))\n", bin_path.c_str(),
+                    hook.journal().size());
+    else
+        std::printf("journal NOT saved: %s\n", hook.error().c_str());
+    {
+        std::ofstream out(tsv_path, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out << hook.journal().to_tsv();
+            std::printf("training rows: %s — the rows an offline re-fit would consume\n",
+                        tsv_path.c_str());
+        }
+    }
+
+    std::printf("\nWhat this shows: a head's prediction, recorded, then scored against\n");
+    std::printf("the outcome that actually followed. That is the loop closing.\n");
+    if (!fitted)
+        std::printf("What it does NOT show: a good head. No fitted projection was\n"
+                    "found, so the hit rate above is the SEEDED placeholder's.\n");
+    std::printf("The labels are a rule, not P&L: a high hit rate here would mean the\n");
+    std::printf("head imitates the rule well, and says nothing about profitability.\n");
     std::printf("peak RSS: %.2f MB\n",
                 static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
     return 0;
@@ -1264,6 +1532,7 @@ int main(int argc, char** argv) {
     if (cmd == "demo-memory")   { return cmd_demo_memory(); }
     if (cmd == "demo-soul")     { return cmd_demo_soul(); }
     if (cmd == "demo-stream")   { return cmd_demo_stream(); }
+    if (cmd == "demo-feedback") { return cmd_demo_feedback(); }
     if (cmd == "demo-vision")   { return cmd_demo_vision(); }
     if (cmd == "dream")         { return cmd_dream(); }
     if (cmd == "demo-audio")    {

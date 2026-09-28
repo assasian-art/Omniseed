@@ -153,6 +153,33 @@ public:
     double trust(const std::string& task_key) const;
     size_t size() const { return feedback_.size(); }
 
+    // Raw counters. Exposed so a caller that persists the ledger inside a
+    // larger container (feedback_hook.h does) does not have to re-derive them
+    // from the trust factor, which is lossy.
+    const std::unordered_map<std::string, std::pair<uint32_t, uint32_t>>&
+        table() const { return feedback_; }
+    // Restores one counter pair. Used by load() and by a container restoring
+    // its own copy; it does not add, it SETS.
+    void set(const std::string& task_key, uint32_t confirmations,
+             uint32_t corrections);
+
+    void clear() { feedback_.clear(); }
+
+    // Persistence ('OMNF' binary, little-endian). A trust ledger that vanishes
+    // on restart is not a ledger. Both load() and deserialise() parse into a
+    // LOCAL map and swap only on full success, so a malformed file leaves the
+    // live ledger UNTOUCHED rather than half-replaced or silently reset.
+    bool save(const std::string& path) const;
+    bool load(const std::string& path);
+
+    // The same bytes save() writes and load() reads, in memory. ONE format,
+    // ONE place: a container that embeds the ledger (feedback_hook.h) must not
+    // re-implement it, or the two copies drift.
+    std::string serialise() const;
+    // Fails closed: on any malformed byte the existing ledger is left UNTOUCHED
+    // and false is returned.
+    bool deserialise(const uint8_t* p, size_t n);
+
 private:
     std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> feedback_;
         // key -> {confirmations, corrections}

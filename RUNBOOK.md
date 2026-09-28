@@ -122,9 +122,10 @@ months of commits before anyone noticed.
 `omniseed_decision_bridge`, `omniseed_regime_parity`,
 `omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
 `omniseed_agent_modules`, `omniseed_uncertainty_split`,
-`omniseed_heads_batch` and `omniseed_streaming_decision` are deliberately
-registered **outside** the gate. The last five need only **committed** fixtures
-(no model, no `.venv`, no network), so they run everywhere including CI.
+`omniseed_heads_batch`, `omniseed_streaming_decision` and
+`omniseed_feedback_hook` are deliberately registered **outside** the gate. The
+last six need only **committed** fixtures (no model, no `.venv`, no network), so
+they run everywhere including CI.
 
 ### The head stack (fast, fully offline)
 
@@ -140,6 +141,7 @@ registered **outside** the gate. The last five need only **committed** fixtures
 ./build/bin/omniseed_uncertainty_split.exe # 154 checks, aleatoric vs epistemic
 ./build/bin/omniseed_heads_batch.exe       # 128 checks, batched head readout
 ./build/bin/omniseed_streaming_decision.exe # 861 checks, the streaming filter
+./build/bin/omniseed_feedback_hook.exe      # 687 checks, the record that scores it
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
@@ -198,6 +200,7 @@ Related flags:
 ./build/bin/omniseed.exe selftest      # kernel self-test
 ./build/bin/omniseed.exe demo-soul     # persona + memory + recall + decay
 ./build/bin/omniseed.exe demo-stream   # streaming decisions: churn reduction
+./build/bin/omniseed.exe demo-feedback # prediction -> outcome -> persisted record
 ./build/bin/omniseed.exe gen --help    # generation options
 ```
 
@@ -212,9 +215,25 @@ streams — the real held-out `h[E]` fixture, unscaled synthetic noise, and the
 same noise scaled ×8 — and prints, for `Confirm` and `Window` modes, how often
 the raw head output flipped versus how often the committed action changed. The
 unscaled stream is there on purpose: the filter refuses to act on it at all
-(every step is below the confidence bar), which is the fail-safe working. The
-head is a seeded placeholder, so the **actions are meaningless**; the filter is
-what the demo exercises.
+(every step is below the confidence bar), which is the fail-safe working.
+
+> **Both demos now load the FITTED head.** `load_decision_head()` reads
+> `models/heads/trading_head.bin` and prints its `provenance()`. When the blob is
+> absent or untrained it falls back to the seeded placeholder **with a warning
+> naming the path** — never silently. Before §39 the demo built a seeded head
+> inline and reported **1 distinct action** on the real tape; with the fitted
+> blob it reports **6** and flips **158** times. The "constant head" §37 found was
+> the placeholder, not the head.
+
+`demo-feedback` closes the loop: it streams the 369 real held-out bars, records
+every prediction, resolves each against the label that actually followed, and
+prints `hit_rate`, `filter_hit_rate`, `commitment_rate`, the confidence gap, ECE,
+Brier and the confusion matrix. It writes `state/feedback_journal.bin` (the
+container) and `state/feedback_journal.tsv` (the rows an offline re-fit would
+consume). Measured with the fitted head: **`hit_rate` 0.2439, ECE 0.0555** —
+matching `metrics.tsv` exactly, through a completely independent path — and
+**0 committed steps**, because the head's maximum calibrated confidence (0.4966)
+sits just under the 0.50 bar.
 
 ---
 
@@ -561,9 +580,64 @@ See it run:
 ./build/bin/omniseed.exe demo-stream    # model-free; three streams, churn reduction
 ```
 
-Measured on stream C (untrained head, so the *actions* are placeholders): **205
-raw head flips → 2 committed changes (102.5×)** in `Confirm` mode, **18 (11.4×)**
-in `Window` mode. Full detail: **`docs/STREAMING.md`**.
+Measured **with the fitted head** (§39): the real held-out tape emits **6
+distinct actions and flips 158 times**, and the filter commits **nothing** —
+every calibrated confidence is below 0.50, which is the fail-safe working.
+Synthetic noise scaled ×8: **169 flips → 6 committed (28.2×)** in `Confirm` mode,
+**40 (4.2×)** in `Window`. Full detail: **`docs/STREAMING.md`**.
+
+### Close the loop (prediction → outcome → record)
+
+A head's output is worth nothing until something checks it against what happened.
+`FeedbackHook` is that seam: it records every `StreamEvent`, joins it to an
+outcome (a realised label, or the user's verdict), and persists the pairs so an
+offline re-fit has data.
+
+```cpp
+#include "omniseed/feedback_hook.h"
+
+FeedbackHook hook;
+
+// 1. observe — one row per VALID event. An invalid event is not a prediction.
+hook.observe_stream(events, "trading.AAPL.1d");
+
+// 2a. a realised outcome for everything open on that key
+hook.outcome("trading.AAPL.1d", DecisionAction::SELL, -0.02f, /*horizon=*/5);
+// 2b. ...or per row, when each prediction was about a DIFFERENT future
+hook.resolve(id, realised_action, score, horizon);
+
+// 2c. ...or from the user. A neutral turn changes NOTHING.
+switch (hook.on_user_turn("no, that's wrong", "trading.AAPL.1d")) {
+    case UserFeedbackLoop::Verdict::Confirm: break;   // counted as a HIT
+    case UserFeedbackLoop::Verdict::Correct: break;   // counted as a MISS
+    case UserFeedbackLoop::Verdict::Reject:  break;   // NOT a miss — see below
+    default: break;                                   // no verdict, no change
+}
+
+const JournalStats s = hook.stats();
+s.hit_rate();          // -1.0 when nothing is resolved. NEVER 0.0.
+s.filter_hit_rate();   // the FILTER, scored only where it held a position
+s.confidence_gap();    // mean_conf_hit - mean_conf_miss; -1.0 unless BOTH exist
+
+hook.save("state/feedback_journal.bin");   // BOTH stores, one container
+std::ofstream("state/feedback_journal.tsv") << hook.journal().to_tsv();
+```
+
+⚠️ **An unresolved prediction is not a wrong prediction.** `hit_rate()` returns
+**-1.0** when nothing has been resolved, never `0.0`: "never checked" and "always
+wrong" are different statements. `Rejected` (the user said the decision was
+invalid) and `Expired` (the horizon passed with no outcome) are excluded from
+every accuracy number for the same reason.
+
+⚠️ **Two actions per row.** `predicted` is the **head's** raw action; `held` is
+the **filter's** committed one. They are scored separately, so a filter that is
+more stable *and less correct* cannot hide.
+
+⚠️ **Fail closed AND atomically.** A corrupt file leaves both stores exactly as
+they were — a journal that restored while its ledger did not would silently reset
+every trust factor to neutral.
+
+Full detail: **`docs/FEEDBACK.md`**.
 
 ---
 

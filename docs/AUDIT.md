@@ -73,8 +73,14 @@ The mandate's Phase 3.3 ("voice enroll/verify for owner identity") is
 | `ToolRegistry`, `AgentLoop` | `test_platform.cpp`, others |
 | `TokenBus` | `test_multimodal.cpp` (added in §33 — **the first tests it ever had**) |
 | `GrammarDecoder`, `ComputeThrottle`, `SelfImprovement`, `FocalCodec` | `test_agent_modules.cpp` (added in §34) |
+| `DecisionHead`, `ClassificationHead`, `ScoringHead`, `HeadRouter` | `test_heads.cpp`, `test_router.cpp`, `test_calibration.cpp` |
+| `StreamingDecision`, `StreamEvent` | `test_streaming_decision.cpp` (added in §37) |
+| `DecisionJournal`, `FeedbackHook`, `JournalEntry`, `JournalStats` | `test_feedback_hook.cpp` (added in §38) |
 
-After §34, **every class in `src/` is referenced by at least one test.**
+After §34, **every class in `src/` is referenced by at least one test** — and the
+rows added in §36–§38 are the ones that keep that true as new classes arrive.
+`UserFeedbackLoop` is covered by `test_agent_modules.cpp` and, for its new
+persistence, by `test_feedback_hook.cpp` E7.
 
 ---
 
@@ -173,6 +179,8 @@ batch processing, streaming decisions, feedback hooks, hierarchical routing
 level 2, and cross-head ensemble voting. Note that `ensemble`/`voting` appear
 only in **trading** files (`regime_engine`, `router`, `sniper`), which is a
 within-domain ensemble — **not** the cross-head vote the mandate describes.
+**Of those five: batch (§36), streaming (§37) and feedback hooks (§38) are now
+closed. Hierarchical routing level 2 and the cross-head vote are still open.**
 
 **Update (§36):** **batch processing is now DONE at the head level** —
 `classify_batch` / `decide_batch` / `score_batch` over `batch_gemm`, measured at
@@ -196,6 +204,25 @@ store was silently dead — now fixed. §35 built
 `UncertaintyDecomposition::from_ensemble()`, which is the *operator* a cross-head
 vote needs and is tested, but no head ensemble exists to feed it.
 
+**Update (§38):** **feedback hooks are now DONE at the record level** —
+`DecisionJournal` + `FeedbackHook` record one row per valid `StreamEvent`, join
+it to an outcome, and persist the pairs; `UserFeedbackLoop` gained the
+persistence it never had. The convention that matters is that an unresolved
+prediction is **not** a wrong one (`hit_rate()` is -1.0, never 0.0), and that
+`Rejected` / `Expired` rows are excluded from every accuracy number. Measured on
+the 369 real held-out bars with the fitted head: `hit_rate` 0.2439, ECE 0.0555,
+both matching `metrics.tsv` exactly. **What is still absent:** nothing *consumes*
+the hook, and nothing re-fits from the journal. See `docs/FEEDBACK.md`.
+
+**Update (§39):** the §33 row's "fitted vision/audio heads" absence is unchanged,
+but the **trading and language heads were never the gap** — §32 fitted and
+calibrated them and they have been committed ever since. The §37 stream A
+"constant action" finding was measured on a **seeded placeholder the demo built
+inline**, because no demo path loaded the committed blob. With the blob loaded
+the fitted head emits **6 distinct actions** and flips **158 times** on the same
+tape. **The recurring gap was, again, the joint.** `load_decision_head()` now
+loads it and says so out loud; pinned by `test_feedback_hook.cpp` F6.
+
 ---
 
 ## 7. Honest summary
@@ -206,5 +233,14 @@ vote needs and is tested, but no head ensemble exists to feed it.
   **four real defects**, one of which (5.1) silently disabled a feature for the
   module's entire life.
 - The largest verified absences are the **fitted vision/audio heads** and the
-  **dream-consolidation pass**. The epistemic/aleatoric decomposition (§35) and
-  head-level batch processing (§36) have since been closed.
+  **dream-consolidation pass**. The epistemic/aleatoric decomposition (§35),
+  head-level batch processing (§36), streaming decisions (§37) and feedback
+  hooks (§38) have since been closed. Hierarchical routing level 2 and the
+  cross-head vote remain open.
+- **§39 is the cleanest instance of the recurring shape so far.** The mandate
+  asked for the trading and language heads to be fitted; §32 had already fitted
+  and committed them, and §35's audit had always read those blobs. The
+  "constant action" that motivated the request was a **seeded placeholder** the
+  §37 demo built inline, because no demo path loaded the blob. Loading it
+  changed 1 distinct action to **6**. The finding was real, correctly reported,
+  and about the wrong subject — the gap was the **joint**, not the head.

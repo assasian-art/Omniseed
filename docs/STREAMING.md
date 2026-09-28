@@ -178,7 +178,23 @@ Reproduce with `./build/bin/omniseed.exe demo-stream` (model-free) and
 placeholder**, so the *actions* below are meaningless; what is being measured is
 the **filter**.
 
-### Churn removal — three streams
+> **Update (§39).** The tables below were measured on the **seeded** head the
+> demo used to construct inline. As of §39 `demo-stream` loads the committed
+> `models/heads/trading_head.bin`, so **the numbers have changed and stream A's
+> headline finding was wrong about its subject.** With the fitted head, stream A
+> emits **6 distinct actions** (not 1) and flips **158 times** (not 0); the
+> filter still commits **nothing**, because every calibrated confidence is below
+> `min_confidence = 0.50`. The original text is kept below, with the corrected
+> numbers alongside, because the mistake is instructive: §37 was not measuring
+> the head, it was measuring a placeholder. See `docs/FEEDBACK.md` §8.
+
+| stream | raw head flips (seeded) | **raw flips (fitted)** | `Confirm` committed (seeded) | **`Confirm` (fitted)** | `Window` (fitted) |
+|---|---|---|---|---|---|
+| A — 240 real held-out `h[E]` | **0** | **158** | 1 (commit, then held) | **0** | **0** |
+| B — 240 synthetic, unscaled | 202 | **110** | **0** | **0** | **0** |
+| C — the same, scaled ×8 | 205 | **169** | **2 → 102.5×** | **6 → 28.2×** | **40 → 4.2×** |
+
+### Churn removal — three streams (as originally measured on the seeded head)
 
 | stream | raw head flips | `Confirm`: committed changes | `Window`: committed changes |
 |---|---|---|---|
@@ -202,8 +218,7 @@ something unflattering:
   the situation the layer exists for. 205 raw flips become 2 committed changes.
 
 Note what stream C's `Confirm` column does **not** show: `changes = 0`. The
-transitions are all commit → release, never action → action, because the raw
-stream is too noisy to produce three consecutive agreements on a *different*
+transitions are all commit → release, never action → action, because the rawstream is too noisy to produce three consecutive agreements on a *different*
 action while one is held. That is hysteresis behaving correctly, and it is
 visible rather than smoothed over.
 

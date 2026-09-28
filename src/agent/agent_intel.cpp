@@ -299,6 +299,104 @@ double UserFeedbackLoop::trust(const std::string& task_key) const {
     return (static_cast<double>(c) + 1.0) / (static_cast<double>(total) + 2.0);
 }
 
+void UserFeedbackLoop::set(const std::string& task_key, uint32_t confirmations,
+                           uint32_t corrections) {
+    feedback_[task_key] = {confirmations, corrections};
+}
+
+// The on-disk magic, spelled out as BYTES on purpose — the same lesson
+// self_improvement.cpp learned the hard way: a magic written as a uint32 and
+// read as a string never matches, and the failure is silent because an
+// unreadable ledger looks exactly like an empty one.
+namespace {
+constexpr char kFeedbackMagic[4] = {'O', 'M', 'N', 'F'};
+
+void put_u32(std::string& out, uint32_t v) {
+    out.append(reinterpret_cast<const char*>(&v), 4);
+}
+}  // namespace
+
+std::string UserFeedbackLoop::serialise() const {
+    std::string out;
+    const uint32_t version = 1;
+    const uint32_t n = static_cast<uint32_t>(feedback_.size());
+    out.append(kFeedbackMagic, 4);
+    put_u32(out, version);
+    put_u32(out, n);
+
+    // Sorted, so two runs that recorded the same verdicts produce byte-identical
+    // bytes: unordered_map iteration order is unspecified and would otherwise
+    // make the record non-reproducible and untestable byte-for-byte.
+    std::vector<std::pair<std::string, std::pair<uint32_t, uint32_t>>> rows(
+        feedback_.begin(), feedback_.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    for (const auto& kv : rows) {
+        put_u32(out, static_cast<uint32_t>(kv.first.size()));
+        out.append(kv.first);
+        put_u32(out, kv.second.first);
+        put_u32(out, kv.second.second);
+    }
+    return out;
+}
+
+bool UserFeedbackLoop::deserialise(const uint8_t* p, size_t total) {
+    if (p == nullptr) return false;
+    size_t cur = 0;
+
+    // Every length below is read straight out of the buffer, so every length is
+    // corruption controlled. `need()` is applied before EVERY read.
+    auto need = [&](size_t n) -> bool { return cur <= total && n <= total - cur; };
+
+    if (total < 12 || std::memcmp(p, kFeedbackMagic, 4) != 0) return false;
+    cur += 4;
+    uint32_t version = 0;
+    std::memcpy(&version, p + cur, 4); cur += 4;
+    if (version != 1) return false;
+    uint32_t n = 0;
+    std::memcpy(&n, p + cur, 4); cur += 4;
+    // 8 bytes of counters per row is the floor, so a count larger than the
+    // buffer could possibly hold is rejected before it is used to reserve.
+    if (static_cast<size_t>(n) > (total - cur) / 8u + 1u) return false;
+
+    // Parse into a LOCAL map and swap only on full success: a failure half-way
+    // through leaves the previous ledger intact instead of replacing it with a
+    // partially-loaded one.
+    std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> loaded;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t klen = 0;
+        if (!need(4)) return false;
+        std::memcpy(&klen, p + cur, 4); cur += 4;
+        if (!need(klen)) return false;
+        std::string key(reinterpret_cast<const char*>(p + cur), klen);
+        cur += klen;
+        if (!need(8)) return false;
+        uint32_t c = 0, w = 0;
+        std::memcpy(&c, p + cur, 4); cur += 4;
+        std::memcpy(&w, p + cur, 4); cur += 4;
+        loaded[std::move(key)] = {c, w};
+    }
+
+    feedback_.swap(loaded);
+    return true;
+}
+
+bool UserFeedbackLoop::save(const std::string& path) const {
+    const std::string bytes = serialise();
+    FILE* f = platform::open_file_c(path.c_str(), "wb");
+    if (!f) return false;
+    const size_t wrote = std::fwrite(bytes.data(), 1, bytes.size(), f);
+    std::fclose(f);
+    return wrote == bytes.size();
+}
+
+bool UserFeedbackLoop::load(const std::string& path) {
+    platform::MappedFile mf;
+    if (!mf.open(path)) return false;
+    return deserialise(mf.bytes(), static_cast<size_t>(mf.size()));
+}
+
 // ===========================================================================
 // SensoryInterruptSystem
 // ===========================================================================

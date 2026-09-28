@@ -105,6 +105,11 @@ set(OMNISEED_CORE_SOURCES
     # hysteresis and release over the head's outputs. It does NOT make the
     # backbone incremental — RWKV-7 already is. See docs/STREAMING.md.
     src/streaming_decision.cpp
+    # THE FEEDBACK HOOK: the record. Every head produces a number and nothing
+    # ever checked it against what happened next, so the loop could not close.
+    # This joins the §37 event log to a persisted (prediction, outcome) pair and
+    # to UserFeedbackLoop's trust ledger. See docs/FEEDBACK.md.
+    src/feedback_hook.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
@@ -842,6 +847,27 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_streaming_decision COMMAND omniseed_streaming_decision
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_streaming_decision PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # MILESTONE 10 — the feedback hook (Phase 2.3). The record that scores the
+    # system's own predictions. UNGATED: the state-machine and persistence parts
+    # need no model, and the real-data parts use the committed h[E] fixtures, so
+    # the whole suite runs in CI. The property under test is honesty rather than
+    # arithmetic — an unmeasured rate must be -1.0 and not 0.0, an absent
+    # outcome must not be counted as a miss, and every "confidence predicts
+    # correctness" claim is paired with an anti-correlated control.
+    add_executable(omniseed_feedback_hook tests/test_feedback_hook.cpp)
+    target_include_directories(omniseed_feedback_hook PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_feedback_hook PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_feedback_hook PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_feedback_hook PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_feedback_hook COMMAND omniseed_feedback_hook
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_feedback_hook PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
