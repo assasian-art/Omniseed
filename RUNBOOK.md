@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-23 tests on a fresh clone (no `.venv`), **38** in a checkout that has one — see
+24 tests on a fresh clone (no `.venv`), **39** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -121,9 +121,10 @@ months of commits before anyone noticed.
 
 `omniseed_decision_bridge`, `omniseed_regime_parity`,
 `omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
-`omniseed_agent_modules` and `omniseed_uncertainty_split` are deliberately
-registered **outside** the gate. The last three need only **committed** fixtures
-(no model, no `.venv`, no network), so they run everywhere including CI.
+`omniseed_agent_modules`, `omniseed_uncertainty_split` and
+`omniseed_heads_batch` are deliberately registered **outside** the gate. The
+last four need only **committed** fixtures (no model, no `.venv`, no network), so
+they run everywhere including CI.
 
 ### The head stack (fast, fully offline)
 
@@ -137,6 +138,7 @@ registered **outside** the gate. The last three need only **committed** fixtures
 ./build/bin/omniseed_multimodal.exe       # 110 checks, TokenBus + the joint
 ./build/bin/omniseed_agent_modules.exe    # 131 checks, the last 4 uncovered modules
 ./build/bin/omniseed_uncertainty_split.exe # 154 checks, aleatoric vs epistemic
+./build/bin/omniseed_heads_batch.exe       # 128 checks, batched head readout
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
@@ -463,6 +465,39 @@ posterior. `from_ensemble()` implements the rigorous Depeweg decomposition and
 is tested, but nothing can feed it yet (no head ensemble has been fitted).
 Full detail, the quartile tables, the fail-closed policy and the blob format:
 **`docs/UNCERTAINTY.md`**.
+
+### Batch a backtest (1000 signals at once)
+
+Every head takes one `h[E]` at a time — the right shape for a live turn, the
+wrong shape for a backtest. The `*_batch` methods take a `[B, E]` block, which is
+exactly the layout `tools/dump_hidden.cpp` writes to `hidden.f32`, so a backtest
+can point a head straight at a dump with no repacking:
+
+```cpp
+#include "omniseed/core/batch_gemm.h"
+
+std::vector<ClassificationResult> out;
+BatchStats stats;
+if (head.classify_batch(H, B, "trading.regime", 4, out, &stats))
+    log("%d rows, %.3f us/row, %s", stats.rows, stats.us_per_row,
+        batch_kernel_name(stats.used));
+```
+
+⚠️ **The default kernel is the FAST one, and it is not bit-identical.** `Auto`
+resolves to AVX2, which reduces eight lanes instead of one accumulator. If you
+need `batch == per-row` exactly, ask for it:
+
+```cpp
+head.set_batch_kernel(BatchKernel::Scalar);   // bit-identical, ~5x slower
+```
+
+Measured (E = 768, Release): the whole head stack over 1000 signals goes
+**25.27 ms → 4.50 ms (5.62×)**. The default kernel changed **0** top-1 labels,
+actions and routing decisions across 369 real + 200 synthetic rows.
+
+⚠️ **The backbone is NOT batched.** RWKV-7 here is the scalar recurrent form, so
+1000 signals still need 1000 sequential forwards. Batching applies to the
+readout. Full detail: **`docs/BATCH.md`**.
 
 ---
 

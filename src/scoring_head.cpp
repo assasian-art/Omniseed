@@ -102,4 +102,63 @@ ScoreResult ScoringHead::score(const Tensor& hidden) const {
     return score(hidden.f32());
 }
 
+// ---------------------------------------------------------------------------
+// The batched path
+// ---------------------------------------------------------------------------
+bool ScoringHead::score_batch(const float* H, int32_t B, std::vector<ScoreResult>& out,
+                              BatchStats* stats) const {
+    out.clear();
+    if (stats != nullptr) *stats = BatchStats();
+    if (!ready_ || H == nullptr || B <= 0) return false;
+
+    const double t0 = platform::now_ms();
+
+    // ONE GEMM for the whole batch. The per-row path does ROW_COUNT separate
+    // matvecs, each with a fresh accumulator; the Scalar kernel runs the same
+    // arithmetic in the same order, which is why the results match exactly
+    // rather than approximately.
+    logits_batch_.resize(static_cast<size_t>(B) * ROW_COUNT);
+    BatchGemmPlan plan;
+    batch_gemm(H, proj_.data(), bias_.data(), logits_batch_.data(), B, E_, ROW_COUNT,
+               1.0f, batch_kernel_, &plan);
+
+    out.resize(static_cast<size_t>(B));
+    for (int32_t b = 0; b < B; ++b) {
+        const float* lg = logits_batch_.data() + static_cast<size_t>(b) * ROW_COUNT;
+        ScoreResult& r = out[static_cast<size_t>(b)];
+        r.priority   = sigmoidf(lg[Priority]);
+        r.urgency    = sigmoidf(lg[Urgency]);
+        r.confidence = sigmoidf(lg[Confidence]);
+        r.matvecs    = ROW_COUNT;
+        r.us         = 0.0;   // filled with the batch average below
+    }
+
+    const double us = (platform::now_ms() - t0) * 1000.0;
+    const double per_row = us / static_cast<double>(B);
+    for (ScoreResult& r : out) r.us = per_row;
+    last_us_ = us;
+
+    if (stats != nullptr) {
+        stats->rows           = B;
+        stats->outputs        = B * ROW_COUNT;
+        stats->us_total       = us;
+        stats->us_per_row     = per_row;
+        stats->requested      = plan.requested;
+        stats->used           = plan.used;
+        stats->simd_fell_back = plan.simd_fell_back;
+    }
+    return true;
+}
+
+bool ScoringHead::score_batch(const Tensor& H, std::vector<ScoreResult>& out,
+                              BatchStats* stats) const {
+    if (H.dtype() != DType::F32 || H.shape().size() != 2 ||
+        H.shape()[1] != static_cast<int64_t>(E_)) {
+        out.clear();
+        if (stats != nullptr) *stats = BatchStats();
+        return false;
+    }
+    return score_batch(H.f32(), static_cast<int32_t>(H.shape()[0]), out, stats);
+}
+
 } // namespace omniseed

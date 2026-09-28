@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "omniseed/core/batch_gemm.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tensor.h"
 #include "omniseed/heads.h"
@@ -83,6 +84,35 @@ public:
                                   int32_t top_k = 3) const;
     ClassificationResult classify(const Tensor& hidden, const std::string& set_name,
                                   int32_t top_k = 3) const;
+
+    // ---- the batched path ---------------------------------------------------
+    // B distributions in one GEMM, so a backtest loop pays the per-call overhead
+    // (scratch resize, `order` vector, `top_k` vector, two clock reads) once
+    // instead of B times. The temperature, the max-subtracted softmax, the
+    // top-k partial sort and the margin computation are the same code path;
+    // with the Scalar kernel the result is BIT-IDENTICAL to calling classify()
+    // B times, and the test asserts equality rather than a tolerance.
+    //
+    // FAILS CLOSED: on a not-ready head, a null pointer, an unknown set, or a
+    // Tensor whose shape is not [B, E], returns false and leaves `out` EMPTY.
+    // Never a partial batch, and never a fabricated distribution — the same
+    // stance classify() takes when it refuses to invent one.
+    //
+    // `ClassificationResult::us` is the BATCH's per-row average, not that row's
+    // own time; per-batch totals are in `BatchStats`.
+    bool classify_batch(const float* H, int32_t B, const std::string& set_name,
+                        int32_t top_k, std::vector<ClassificationResult>& out,
+                        BatchStats* stats = nullptr) const;
+    bool classify_batch(const float* H, int32_t B, int32_t set_index, int32_t top_k,
+                        std::vector<ClassificationResult>& out,
+                        BatchStats* stats = nullptr) const;
+    bool classify_batch(const Tensor& H, const std::string& set_name, int32_t top_k,
+                        std::vector<ClassificationResult>& out,
+                        BatchStats* stats = nullptr) const;
+
+    // Auto (the default) picks Simd when the CPU supports it.
+    void set_batch_kernel(BatchKernel k) { batch_kernel_ = k; }
+    BatchKernel batch_kernel() const { return batch_kernel_; }
 
     // ---- offline fitting hooks ---------------------------------------------
     void set_label_row(int32_t set_index, int32_t label_index, const float* row, float bias);
@@ -189,6 +219,11 @@ private:
 
     mutable std::vector<float> scratch_;
     mutable double             last_us_ = 0.0;
+    // Batched scratch [B, L] plus a reused index buffer, so a batch is
+    // allocation-free after the first call with a given (B, L).
+    mutable std::vector<float>   probs_batch_;
+    mutable std::vector<int32_t> order_batch_;
+    BatchKernel                  batch_kernel_ = BatchKernel::Auto;
 };
 
 // ---------------------------------------------------------------------------

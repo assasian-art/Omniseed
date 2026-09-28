@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "omniseed/core/batch_gemm.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tensor.h"
 #include "omniseed/heads.h"
@@ -62,6 +63,29 @@ public:
     ScoreResult score(const float* hidden) const;
     ScoreResult score(const Tensor& hidden) const;
 
+    // ---- the batched path ---------------------------------------------------
+    // The same readout for B hidden states at once, so a backtest loop pays the
+    // per-call overhead once instead of B times. With the Scalar kernel the
+    // result is BIT-IDENTICAL to calling score() B times — the test asserts
+    // equality, not a tolerance.
+    //
+    // FAILS CLOSED: on a not-ready head, a null pointer, or a Tensor whose shape
+    // is not [B, E], returns false and leaves `out` EMPTY. Never a partial
+    // batch: a caller that ignores the return value must not act on half an
+    // answer.
+    //
+    // In a batched result `ScoreResult::us` is the BATCH's per-row average, not
+    // that row's own time — a per-row clock read is precisely the overhead the
+    // batch exists to avoid. Per-batch totals are in `BatchStats`.
+    bool score_batch(const float* H, int32_t B, std::vector<ScoreResult>& out,
+                     BatchStats* stats = nullptr) const;
+    bool score_batch(const Tensor& H, std::vector<ScoreResult>& out,
+                     BatchStats* stats = nullptr) const;
+
+    // Auto (the default) picks Simd when the CPU supports it.
+    void set_batch_kernel(BatchKernel k) { batch_kernel_ = k; }
+    BatchKernel batch_kernel() const { return batch_kernel_; }
+
     // ---- offline fitting hooks ---------------------------------------------
     void set_row(Row which, const float* row, float bias);
 
@@ -85,7 +109,12 @@ private:
     std::string provenance_  = "uninitialised";
     std::string error_;
 
+    BatchKernel batch_kernel_ = BatchKernel::Auto;
+
     mutable double last_us_ = 0.0;
+    // Reused scratch for the batched path, so a batch is allocation-free after
+    // the first call with a given B. mutable because score_batch() is const.
+    mutable std::vector<float> logits_batch_;
 };
 
 } // namespace omniseed

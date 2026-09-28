@@ -3563,3 +3563,108 @@ goes **22 → 23**.
 
 
 
+
+---
+
+## 36. BATCHED HEAD EVALUATION — 1000 signals, 5.62x (2026-09-28)
+
+**Milestone 8. Phase 2.1 of the mandate.** Every head took one `h[E]` at a time —
+the right shape for a live turn, the wrong shape for a backtest. This adds
+`classify_batch` / `decide_batch` / `score_batch`, built on a shared
+`batch_gemm` (`[B, E] × [L, E]ᵀ + bias[L]`).
+
+Full write-up: **`docs/BATCH.md`**.
+
+### What is batched, and what is NOT — stated first
+
+**Batched: the head readout** (a GEMM, embarrassingly parallel).
+**NOT batched: the backbone.** This tree's RWKV-7 is the **scalar recurrent**
+form, so `h[E]` for bar *n+1* needs the state from bar *n*. "One forward pass for
+1000 signals" is therefore **false and is not claimed**. What this delivers is
+one GEMM for 1000 *readouts*, after 1000 necessarily sequential forwards.
+
+That is not a defect, because of where the win is: on the live path the backbone
+dominates and batching buys nothing, but on the **backtest path** the forwards
+are already paid for and cached to `hidden.f32`, and the readout — with its
+per-call scratch resize, `order` vector, `top_k` vector and two clock reads,
+repeated once per bar — was the remaining cost.
+
+### Measured (E = 768, Release)
+
+| measurement | value |
+|---|---|
+| Simd vs Scalar, worst absolute difference (B=64, E=768, L=7) | **1.07e-06** |
+| Simd vs Scalar, worst relative difference | **1.07e-04** |
+| `classify_batch`, 369 real rows | 9.5 → **1.7 µs/row** (5.6×) |
+| `decide_batch`, 369 real rows | 9.9 → **2.0 µs/row** (5.0×) |
+| **whole stack, 1000 signals** | **25.27 ms → 4.50 ms** |
+| **speedup** | **5.62×** |
+
+The "per-row" column is the *batched* call with the Scalar kernel — same code
+path, same arithmetic, only the per-call overhead removed — so this is an
+apples-to-apples number, not batched-vs-nothing.
+
+### Two kernels, two contracts (the part that matters)
+
+| kernel | accumulation | vs the per-row path |
+|---|---|---|
+| **Scalar** | one running accumulator, `e = 0…E-1`, in order | **bit-identical** |
+| **Simd** | eight AVX2 lanes, reduced at the end | within tolerance, **not** identical |
+
+Floating-point addition is not associative, so a lane-reduced sum cannot
+reproduce a serial one. The tests therefore assert **`==`** on Scalar and a
+**tolerance** on Simd — and `A5` additionally asserts the two **do differ**, so a
+future change that made them identical (SIMD not taken, or quietly rewritten as
+a serial sum) fails the test rather than passing it.
+
+`Auto` is the default and resolves to Simd, so **the default path is the fast,
+inexact one**. That is deliberate — it is the point of batching — but it means
+exactness must be asked for: `set_batch_kernel(BatchKernel::Scalar)`.
+
+The default path is held to a weaker but more meaningful contract: **the answer
+does not change.** Measured: **0** top-1 label mismatches, **0** action
+mismatches, **0** routing mismatches over 369 real held-out bars + 200 synthetic.
+
+### Fail-closed policy
+
+Every batch call returns `bool` and **clears `out`** on failure — never a partial
+batch, so a caller that ignores the return value cannot act on half an answer.
+Refused: not-ready head, null `H` with `B > 0`, `B <= 0`, unknown label set, and
+a `Tensor` whose shape is not `[B, E]`.
+
+At the KERNEL level `B == 0` is a legitimate no-op rather than an error; at the
+HEAD level it is a refusal. A head that returned `true` with zero results would
+be indistinguishable from one that silently dropped rows.
+
+### Files
+
+| file | what |
+|---|---|
+| `include/omniseed/core/batch_gemm.h` | the kernel API + `BatchStats` (NEW) |
+| `src/core/batch_gemm.cpp` | scalar kernel + runtime dispatch (NEW) |
+| `src/core/batch_gemm_avx2.cpp` | AVX2 kernel, `/arch:AVX2` (NEW) |
+| `tests/test_heads_batch.cpp` | **128 checks**, 0 fail, 1 skip, **UNGATED** (NEW) |
+| `docs/BATCH.md` | full write-up (NEW) |
+| `classification_head.{h,cpp}`, `decision_head.{h,cpp}`, `scoring_head.{h,cpp}` | the `*_batch` methods |
+| `CMakeLists.txt` | two sources, the AVX2 flag, the test target |
+| `docs/JEV_FEATURES.md` §6 | batch: NOT STARTED → **DONE** |
+
+The one SKIP is `A6` (explicit Simd on a non-AVX2 machine) — this box *has*
+AVX2, so that path is unreachable here and the test says so rather than passing
+vacuously.
+
+**Full local board: 39/39 passed (3747.40 s).** The board grew **38 → 39**; a
+fresh clone goes **23 → 24**.
+
+### Next
+
+1. **Fit the vision/audio heads** (still the largest verified absence).
+2. **Milestone 3 — dream consolidation** (still skipped).
+3. **Phase 2.2 streaming decisions** — the head-level incremental API.
+4. **Phase 2.3 feedback hooks** — the §34 store persists now; nothing closes the
+   loop from a head's prediction to a recorded outcome.
+5. **Point the backtest at the batched path** — `src/trading/simulate.cpp` still
+   re-derives its readouts bar by bar. The capability and its evidence exist; the
+   consumer does not.
+6. **Fit a head ensemble** so §35's `from_ensemble()` has something to eat
+   (Phase 2.5).

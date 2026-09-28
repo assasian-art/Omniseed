@@ -5,11 +5,12 @@ This document records the **status of each**, with the evidence, and states the
 gaps plainly. A feature list that only contains ticks is not a status report.
 
 > ⚠️ **This is a dated snapshot.** It was written before §32 (head training and
-> calibration), §33 (the multimodal joint), §34 (module coverage) and §35 (the
-> uncertainty split). Where a later milestone changed the answer, the original
-> text is kept and marked **Update (§NN)** below it, so the record of what was
-> believed — and why — survives alongside the correction. Sections carrying an
-> update: **2, 9, 10** and Part 2 (vision/audio).
+> calibration), §33 (the multimodal joint), §34 (module coverage), §35 (the
+> uncertainty split) and §36 (batched head evaluation). Where a later milestone
+> changed the answer, the original text is kept and marked **Update (§NN)** below
+> it, so the record of what was believed — and why — survives alongside the
+> correction. Sections carrying an update: **2, 6, 9, 10** and Part 2
+> (vision/audio).
 
 Legend: **DONE** · **PARTIAL** · **NOT STARTED**
 
@@ -153,12 +154,38 @@ attainable confidence, **no domain can self-route**
 `0.85` is shared by `DecisionHead`, the router's `fast_path_confidence`, and the
 sniper's regime gate, so no two layers can disagree about what "confident" means.
 
-### 6. Batch processing — **NOT STARTED**
+### 6. Batch processing — **DONE at the head level**
+
+> **Update (§36).** The text below was written when no head had a batch API. One
+> now does. Kept for the record; the correction follows it.
 
 Every head takes a single `h[E]`. There is no batched forward pass and no
 `[B, E]` input path. The reason is not oversight: the edge runtime is a
 single-threaded scalar RWKV-7 at ~1.4 tok/s, where a batch would buy latency, not
 throughput. A batch API belongs with the serving path, not with the heads.
+
+**Update (§36):** the *heads* now take a `[B, E]` block —
+`classify_batch` / `decide_batch` / `score_batch`, built on
+`batch_gemm` (`[B, E] × [L, E]ᵀ + bias[L]`). Measured on this box, E = 768,
+Release:
+
+| | per-row | batched | |
+|---|---|---|---|
+| `classify_batch`, 369 real rows | 9.5 µs/row | **1.7 µs/row** | 5.6× |
+| `decide_batch`, 369 real rows | 9.9 µs/row | **2.0 µs/row** | 5.0× |
+| whole stack, 1000 signals | 25.27 ms | **4.50 ms** | **5.62×** |
+
+The reasoning above is still correct about the **backbone**: this tree's RWKV-7 is
+the scalar recurrent form, so 1000 signals still need 1000 sequential forwards.
+Batching applies to the readout, which is a GEMM — and on the *backtest* path the
+forwards are already paid for and cached to `hidden.f32`, so the readout was the
+remaining cost. The claim "one forward pass for 1000 signals" would be false and
+is not made.
+
+The scalar kernel is **bit-identical** to the per-row path; the AVX2 kernel is
+not (eight lanes vs one accumulator) and is held to "the answer does not change"
+instead — 0 top-1, action and routing mismatches over 369 real + 200 synthetic
+rows. Full detail: **`docs/BATCH.md`**.
 
 ### 7. Streaming — **NOT STARTED** (at the head level)
 

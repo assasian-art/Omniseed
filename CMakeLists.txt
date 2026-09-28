@@ -96,6 +96,11 @@ set(OMNISEED_CORE_SOURCES
     # fitted reference (epistemic). Both halves are measured against the real
     # held-out heads — see docs/UNCERTAINTY.md.
     src/core/uncertainty_split.cpp
+    # The BATCH: [B,E] x [L,E]^T + bias, so a backtest loop pays the per-call
+    # head overhead once instead of B times. The scalar kernel is bit-identical
+    # to the per-row path; the AVX2 kernel is not, by construction.
+    src/core/batch_gemm.cpp
+    src/core/batch_gemm_avx2.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
@@ -143,8 +148,12 @@ if((CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)|(e2k)") AND
     if(MSVC)
         set_source_files_properties(src/core/bitlinear_avx2.cpp PROPERTIES
             COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(src/core/batch_gemm_avx2.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
     else()
         set_source_files_properties(src/core/bitlinear_avx2.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mfma")
+        set_source_files_properties(src/core/batch_gemm_avx2.cpp PROPERTIES
             COMPILE_OPTIONS "-mavx2;-mfma")
     endif()
 endif()
@@ -792,6 +801,25 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_uncertainty_split COMMAND omniseed_uncertainty_split
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_uncertainty_split PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # MILESTONE 8 — batched head evaluation. Pure arithmetic plus the committed
+    # h[E] fixtures, so it is UNGATED and runs in CI. The exactness half asserts
+    # `batch == per-row` with `==`, not a tolerance; the AVX2 half asserts a
+    # tolerance and MEASURES the difference, because the two kernels cannot agree
+    # bit-for-bit (eight lanes vs one accumulator).
+    add_executable(omniseed_heads_batch tests/test_heads_batch.cpp)
+    target_include_directories(omniseed_heads_batch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_heads_batch PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_heads_batch PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_heads_batch PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_heads_batch COMMAND omniseed_heads_batch
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_heads_batch PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.

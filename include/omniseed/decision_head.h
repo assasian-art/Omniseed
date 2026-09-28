@@ -39,6 +39,7 @@
 // =============================================================================
 #pragma once
 
+#include "omniseed/core/batch_gemm.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tensor.h"
 
@@ -182,6 +183,30 @@ public:
     DecisionResult decide(const float* hidden) const;
     DecisionResult decide(const Tensor& hidden) const;
 
+    // ---- the batched path ---------------------------------------------------
+    // B decisions in one GEMM, so a backtest loop pays the per-call overhead
+    // once instead of B times. The temperature, the max-subtracted softmax,
+    // the argmax/runner-up scan and the self-routing rules are byte-for-byte
+    // the same code path; with the Scalar kernel the result is BIT-IDENTICAL to
+    // calling decide() B times, and the test asserts equality, not a tolerance.
+    //
+    // FAILS CLOSED: on a not-ready head, a null pointer, or a Tensor whose shape
+    // is not [B, E], returns false and leaves `out` EMPTY — never a partial
+    // batch, because a caller that ignores the return value must not act on
+    // half an answer.
+    //
+    // `DecisionResult::ms` is the BATCH's per-row average, not that row's own
+    // time: a per-row clock read is exactly the overhead the batch removes.
+    // Per-batch totals are in `BatchStats`.
+    bool decide_batch(const float* H, int32_t B, std::vector<DecisionResult>& out,
+                      BatchStats* stats = nullptr) const;
+    bool decide_batch(const Tensor& H, std::vector<DecisionResult>& out,
+                      BatchStats* stats = nullptr) const;
+
+    // Auto (the default) picks Simd when the CPU supports it.
+    void set_batch_kernel(BatchKernel k) { batch_kernel_ = k; }
+    BatchKernel batch_kernel() const { return batch_kernel_; }
+
     // ---- offline fitting hooks ---------------------------------------------
     // Overwrite one action's projection row (E floats) and bias. Counts as one
     // fitted action; trained() only becomes true once EVERY action is fitted,
@@ -242,6 +267,9 @@ private:
     // Reused scratch — mutable so decide() can stay const and allocation-free.
     mutable std::vector<float> logits_;
     mutable double             last_ns_ = 0.0;
+    // Batched scratch [B, A_] and the kernel choice, same reasoning as above.
+    mutable std::vector<float> logits_batch_;
+    BatchKernel                batch_kernel_ = BatchKernel::Auto;
 };
 
 } // namespace omniseed

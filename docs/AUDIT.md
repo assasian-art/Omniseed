@@ -157,11 +157,14 @@ tightening it changes what the model is allowed to emit. Pinned by A8.
 
 ## 6. What is genuinely absent (verified)
 
+> ⚠️ **Two rows below have since been closed.** The table is a §34 snapshot; the
+> **Update** markers record what changed. Do not read a row without its marker.
+
 | mandate item | status |
 |---|---|
-| Phase 2.7 — epistemic vs aleatoric **separation** | **ABSENT.** `core/uncertainty.h` gives Shannon entropy, normalized entropy, and the top-1/top-2 margin — a *total* uncertainty signal. The strings `epistemic` and `aleatoric` appear **nowhere** in `include/` or `src/`. |
+| Phase 2.7 — epistemic vs aleatoric **separation** | **CLOSED in §35.** Was: absent — `core/uncertainty.h` gives Shannon entropy, normalized entropy, and the top-1/top-2 margin, a *total* signal only, and the strings `epistemic`/`aleatoric` appeared **nowhere** in `include/` or `src/`. Now `core/uncertainty_split.h` separates them, measured against the real held-out heads. See `docs/UNCERTAINTY.md`. |
 | Phase 3 — the vision/audio → `h[E]` **joint** | **Was absent; built in §33** (`MultimodalBridge`). |
-| Fitted **vision/audio heads** | **ABSENT.** `vision.scene`, `vision.anomaly`, `audio.wake`, `audio.emotion`, `audio.speaker` have label sets and no weights. Measured: an unfitted `vision.scene` head printed **0.997** confidence. |
+| Fitted **vision/audio heads** | **ABSENT.** `vision.scene`, `vision.anomaly`, `audio.wake`, `audio.emotion`, `audio.speaker` have label sets and no weights. Measured: an unfitted `vision.scene` head printed **0.997** confidence. Still the largest verified absence. |
 | Phase 5 — dream consolidation (Milestone 3) | **Not wired.** `MemoryCrystals::decay_memories` and `SelfImprovement::dream()` exist; no scheduled pass writes `state/dream_log.json`. |
 | Phase 11 — exotic (quantum, fractal, chaos, game theory, RL, federated, differential privacy, homomorphic, ZK) | **ABSENT.** Not started. |
 
@@ -170,6 +173,19 @@ batch processing, streaming decisions, feedback hooks, hierarchical routing
 level 2, and cross-head ensemble voting. Note that `ensemble`/`voting` appear
 only in **trading** files (`regime_engine`, `router`, `sniper`), which is a
 within-domain ensemble — **not** the cross-head vote the mandate describes.
+
+**Update (§36):** **batch processing is now DONE at the head level** —
+`classify_batch` / `decide_batch` / `score_batch` over `batch_gemm`, measured at
+**5.62×** for the whole head stack over 1000 signals. The backbone is still
+sequential (this tree's RWKV-7 is the scalar recurrent form). See `docs/BATCH.md`.
+The remaining four items on that line are still unverified/absent.
+
+**Update (§34, §35):** two further corrections to the row above about
+`ensemble`/`voting`. §34 found the `SelfImprovement` trace cache never persisted
+(a `uint32` magic compared against a string), so the closest thing to a feedback
+store was silently dead — now fixed. §35 built
+`UncertaintyDecomposition::from_ensemble()`, which is the *operator* a cross-head
+vote needs and is tested, but no head ensemble exists to feed it.
 
 ---
 
@@ -181,4 +197,5 @@ within-domain ensemble — **not** the cross-head vote the mandate describes.
   **four real defects**, one of which (5.1) silently disabled a feature for the
   module's entire life.
 - The largest verified absences are the **fitted vision/audio heads** and the
-  **epistemic/aleatoric decomposition**.
+  **dream-consolidation pass**. The epistemic/aleatoric decomposition (§35) and
+  head-level batch processing (§36) have since been closed.

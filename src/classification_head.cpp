@@ -628,4 +628,136 @@ ClassificationResult ClassificationHead::classify(const Tensor& hidden,
     return classify(hidden.f32(), set_name, top_k);
 }
 
+// ---------------------------------------------------------------------------
+// The batched path
+//
+// Mirrors classify() step for step — same temperature resolution, same
+// max-subtracted softmax, same uniform fallback, same partial_sort + margin —
+// because the contract is bit-identical output. tests/test_heads_batch.cpp B1
+// fails if the two drift apart.
+// ---------------------------------------------------------------------------
+bool ClassificationHead::classify_batch(const float* H, int32_t B, int32_t set_index,
+                                        int32_t top_k,
+                                        std::vector<ClassificationResult>& out,
+                                        BatchStats* stats) const {
+    out.clear();
+    if (stats != nullptr) *stats = BatchStats();
+    if (!ready_ || H == nullptr || B <= 0) return false;
+    if (set_index < 0 || set_index >= static_cast<int32_t>(sets_.size())) return false;
+
+    const LabelSet& s = sets_[static_cast<size_t>(set_index)];
+    const int32_t L = static_cast<int32_t>(s.labels.size());
+    if (L <= 0) return false;
+
+    const double t0 = platform::now_ms();
+
+    const float t_raw = (static_cast<size_t>(set_index) < temps_.size())
+                            ? temps_[static_cast<size_t>(set_index)]
+                            : default_temperature_;
+    const float T = sane_temperature(t_raw);
+    const float inv_t = 1.0f / T;
+
+    probs_batch_.resize(static_cast<size_t>(B) * static_cast<size_t>(L));
+    BatchGemmPlan plan;
+    batch_gemm(H, proj_.data() + static_cast<size_t>(s.offset) * static_cast<size_t>(E_),
+               bias_.data() + s.offset, probs_batch_.data(), B, E_, L, inv_t,
+               batch_kernel_, &plan);
+
+    int32_t k = top_k;
+    if (k < 1) k = 1;
+    if (k > L) k = L;
+    order_batch_.resize(static_cast<size_t>(L));
+    out.resize(static_cast<size_t>(B));
+
+    for (int32_t b = 0; b < B; ++b) {
+        float* p = probs_batch_.data() + static_cast<size_t>(b) * static_cast<size_t>(L);
+
+        // --- softmax, max-subtracted (same sentinel init as classify()) ------
+        float max_logit = -3.4e38f;
+        for (int32_t li = 0; li < L; ++li)
+            if (p[li] > max_logit) max_logit = p[li];
+        float sum = 0.0f;
+        for (int32_t li = 0; li < L; ++li) {
+            const float v = std::exp(p[li] - max_logit);
+            p[li] = v;
+            sum += v;
+        }
+
+        ClassificationResult& r = out[static_cast<size_t>(b)];
+        r.domain  = s.name;
+        r.matvecs = L;
+        if (!(sum > 0.0f)) {
+            // Every logit was -inf-ish. Uniform belief, not a fabricated winner.
+            for (int32_t li = 0; li < L; ++li) p[li] = 1.0f / static_cast<float>(L);
+        } else {
+            for (int32_t li = 0; li < L; ++li) p[li] /= sum;
+        }
+
+        // --- top-k: a partial selection, not a full sort ---------------------
+        for (int32_t li = 0; li < L; ++li) order_batch_[static_cast<size_t>(li)] = li;
+        std::partial_sort(order_batch_.begin(), order_batch_.begin() + k,
+                          order_batch_.end(),
+                          [p](int32_t a, int32_t c) { return p[a] > p[c]; });
+
+        r.top_k.reserve(static_cast<size_t>(k));
+        for (int32_t i = 0; i < k; ++i) {
+            const int32_t li = order_batch_[static_cast<size_t>(i)];
+            LabelProb lp;
+            lp.label       = s.labels[static_cast<size_t>(li)];
+            lp.probability = p[li];
+            r.top_k.push_back(lp);
+        }
+        // margin needs the RUNNER-UP, which may be outside the requested top-k.
+        float second = 0.0f;
+        for (int32_t li = 0; li < L; ++li) {
+            if (li == order_batch_[0]) continue;
+            if (p[li] > second) second = p[li];
+        }
+        r.margin = r.top_k.empty() ? 0.0f : (r.top_k[0].probability - second);
+        r.us     = 0.0;   // filled with the batch average below
+    }
+
+    const double us = (platform::now_ms() - t0) * 1000.0;
+    const double per_row = us / static_cast<double>(B);
+    for (ClassificationResult& r : out) r.us = per_row;
+    last_us_ = us;
+
+    if (stats != nullptr) {
+        stats->rows           = B;
+        stats->outputs        = B * L;
+        stats->us_total       = us;
+        stats->us_per_row     = per_row;
+        stats->requested      = plan.requested;
+        stats->used           = plan.used;
+        stats->simd_fell_back = plan.simd_fell_back;
+    }
+    return true;
+}
+
+bool ClassificationHead::classify_batch(const float* H, int32_t B,
+                                        const std::string& set_name, int32_t top_k,
+                                        std::vector<ClassificationResult>& out,
+                                        BatchStats* stats) const {
+    out.clear();
+    if (stats != nullptr) *stats = BatchStats();
+    if (!ready_) return false;
+    const int32_t idx = find_label_set(set_name);
+    if (idx < 0) return false;
+    return classify_batch(H, B, idx, top_k, out, stats);
+}
+
+bool ClassificationHead::classify_batch(const Tensor& H, const std::string& set_name,
+                                        int32_t top_k,
+                                        std::vector<ClassificationResult>& out,
+                                        BatchStats* stats) const {
+    if (H.dtype() != DType::F32 || H.shape().size() != 2 ||
+        H.shape()[1] != static_cast<int64_t>(E_)) {
+        out.clear();
+        if (stats != nullptr) *stats = BatchStats();
+        return false;
+    }
+    return classify_batch(H.f32(), static_cast<int32_t>(H.shape()[0]), set_name, top_k,
+                          out, stats);
+}
+
 } // namespace omniseed

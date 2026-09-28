@@ -331,6 +331,120 @@ DecisionResult DecisionHead::decide(const Tensor& hidden) const {
 }
 
 // ---------------------------------------------------------------------------
+// The batched path
+//
+// Every step below mirrors decide() exactly — same temperature resolution, same
+// max-subtracted softmax, same `sum` fallback, same argmax/runner-up scan, same
+// routing rules — because the contract is bit-identical output, not similar
+// output. If you change one, change the other; tests/test_heads_batch.cpp C1
+// fails if you do not.
+// ---------------------------------------------------------------------------
+bool DecisionHead::decide_batch(const float* H, int32_t B,
+                                std::vector<DecisionResult>& out,
+                                BatchStats* stats) const {
+    out.clear();
+    if (stats != nullptr) *stats = BatchStats();
+    if (!ready_ || H == nullptr || B <= 0 || A_ <= 0) return false;
+
+    const double t0 = platform::now_ms();
+
+    // Same temperature resolution as decide(): a non-finite or <= 0 T falls
+    // back to 1.0 rather than poisoning every row.
+    const float T = (cfg_.temperature > 0.0f && std::isfinite(cfg_.temperature))
+                        ? cfg_.temperature
+                        : 1.0f;
+    const float scale = (T != 1.0f) ? (1.0f / T) : 1.0f;
+
+    logits_batch_.resize(static_cast<size_t>(B) * static_cast<size_t>(A_));
+    BatchGemmPlan plan;
+    batch_gemm(H, proj_.data(), bias_.data(), logits_batch_.data(), B, E_, A_, scale,
+               batch_kernel_, &plan);
+
+    out.resize(static_cast<size_t>(B));
+    for (int32_t b = 0; b < B; ++b) {
+        float* lg =
+            logits_batch_.data() + static_cast<size_t>(b) * static_cast<size_t>(A_);
+        DecisionResult& r = out[static_cast<size_t>(b)];
+
+        // --- softmax over A_ (max-subtracted) -------------------------------
+        float mx = lg[0];
+        for (int32_t a = 1; a < A_; ++a) mx = std::max(mx, lg[a]);
+        float sum = 0.0f;
+        for (int32_t a = 0; a < A_; ++a) {
+            const float e = std::exp(lg[a] - mx);
+            lg[a] = e;
+            sum += e;
+        }
+        if (!(sum > 0.0f) || !std::isfinite(sum)) sum = 1.0f;
+        const float inv = 1.0f / sum;
+        for (int32_t a = 0; a < A_; ++a) lg[a] *= inv;
+
+        // --- argmax + runner-up ---------------------------------------------
+        int32_t best = 0;
+        float   best_p = lg[0];
+        int32_t second = -1;
+        float   second_p = 0.0f;
+        for (int32_t a = 1; a < A_; ++a) {
+            const float p = lg[a];
+            if (p > best_p) {
+                second = best;  second_p = best_p;
+                best = a;       best_p = p;
+            } else if (second < 0 || p > second_p) {
+                second = a;     second_p = p;
+            }
+        }
+
+        r.action_type      = static_cast<DecisionAction>(best);
+        r.confidence_score = best_p;
+        r.margin           = best_p - second_p;
+        r.matvecs          = 1;
+        r.target_asset     = asset_[static_cast<size_t>(best)];
+        r.invalidation     = inval_[static_cast<size_t>(best)];
+
+        // --- self-routing (identical rules) ---------------------------------
+        if (r.action_type == DecisionAction::ABSTAIN) {
+            r.routing = "abstain";
+        } else if (r.action_type == DecisionAction::EXPLAIN) {
+            r.routing = "system2";
+        } else if (r.confidence_score >= cfg_.threshold &&
+                   r.margin >= cfg_.margin_floor) {
+            r.routing   = "self";
+            r.fast_path = true;
+        } else {
+            r.routing = "system2";
+        }
+        r.ms = 0.0;   // filled with the batch average below
+    }
+
+    const double ms_total = platform::now_ms() - t0;
+    const double per_row = ms_total / static_cast<double>(B);
+    for (DecisionResult& r : out) r.ms = per_row;
+    last_ns_ = ms_total * 1e6;
+
+    if (stats != nullptr) {
+        stats->rows           = B;
+        stats->outputs        = B * A_;
+        stats->us_total       = ms_total * 1000.0;
+        stats->us_per_row     = per_row * 1000.0;
+        stats->requested      = plan.requested;
+        stats->used           = plan.used;
+        stats->simd_fell_back = plan.simd_fell_back;
+    }
+    return true;
+}
+
+bool DecisionHead::decide_batch(const Tensor& H, std::vector<DecisionResult>& out,
+                                BatchStats* stats) const {
+    if (H.dtype() != DType::F32 || H.shape().size() != 2 ||
+        H.shape()[1] != static_cast<int64_t>(E_)) {
+        out.clear();
+        if (stats != nullptr) *stats = BatchStats();
+        return false;
+    }
+    return decide_batch(H.f32(), static_cast<int32_t>(H.shape()[0]), out, stats);
+}
+
+// ---------------------------------------------------------------------------
 // Offline fitting
 // ---------------------------------------------------------------------------
 void DecisionHead::set_action(DecisionAction a, const float* row, float bias) {
