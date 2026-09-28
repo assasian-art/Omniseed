@@ -710,6 +710,26 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_soul PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # MILESTONE 4 — the calibration contract. The mechanism half (temperature
+    # scaling, per-set calibration, v2/v3 blob compatibility, provenance) is
+    # registered OUTSIDE any .venv gate on purpose: a gate that never executes
+    # is not a gate. The held-out half is gated on the committed
+    # models/heads/*.bin + tests/fixtures/head_calibration/* pair and prints a
+    # SKIP reason when they are absent.
+    add_executable(omniseed_calibration tests/test_calibration.cpp)
+    target_include_directories(omniseed_calibration PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_calibration PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_calibration PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_calibration PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_calibration COMMAND omniseed_calibration
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_calibration PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
     add_executable(omniseed_regime_dump tests/regime_dump.cpp)
@@ -727,6 +747,22 @@ if(OMNISEED_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(omniseed_strategy_dump PRIVATE omniseed_core)
     target_compile_definitions(omniseed_strategy_dump PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # Data collection for the OFFLINE head trainer (tools/train_heads.py).
+    # Runs the real backbone over the real inputs and writes (h[E], label)
+    # pairs. Not a test itself, and never run by ctest — it needs the 243 MB
+    # GGUF, which CI does not have.
+    add_executable(omniseed_dump_hidden tools/dump_hidden.cpp)
+    target_include_directories(omniseed_dump_hidden PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_dump_hidden PRIVATE omniseed_core)
+    target_compile_definitions(omniseed_dump_hidden PRIVATE _CRT_SECURE_NO_WARNINGS)
+    if(MSVC)
+        target_compile_options(omniseed_dump_hidden PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_dump_hidden PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 # --------------------------------- CLI binary --------------------------------

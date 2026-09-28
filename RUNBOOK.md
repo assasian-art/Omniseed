@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-20 tests on a fresh clone (no `.venv`), **34** in a checkout that has one — see
+21 tests on a fresh clone (no `.venv`), **35** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -130,7 +130,13 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_unified_output.exe   # 267 checks, incl. the fast path
 ./build/bin/omniseed_language_heads.exe   # 614 checks
 ./build/bin/omniseed_soul.exe             # 378 checks, persona + memory + decay
+./build/bin/omniseed_calibration.exe      # 180 checks, fitted heads + ECE
 ```
+
+`omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
+Part C is gated on the committed blobs under `models/heads/` and the fixtures
+under `tests/fixtures/head_calibration/` — if those are missing it skips Part C
+and says so, rather than passing vacuously.
 
 These four print measured latency, so running them is also how you re-measure:
 
@@ -227,6 +233,10 @@ pipe.router().set_config(c.router);        // both, or the fast path sees stale 
 > **`trained()` is false and `provenance()` says `NOT FULLY FITTED` until every
 > row is fitted.** A seeded head emits well-formed but meaningless values. Do not
 > ship a decision on one. See `docs/JEV_FEATURES.md` §2.
+>
+> As of Milestone 4 the committed blobs under `models/heads/` **are** fitted and
+> calibrated — but that is opt-in: a head is only fitted if you `load()` it.
+> See "Loading a calibrated head" below.
 
 ### Turning on the soul
 
@@ -298,6 +308,77 @@ soul.decay_memories();
 > `duplicate_recall_score` (0.98). Both are byte-level-tokenizer values. If you
 > load a real vocabulary, **re-derive them with `omniseed demo-soul`** — the
 > margin is only ~0.10 wide.
+
+### Loading a calibrated head
+
+Fitted heads are committed under `models/heads/` (tens of KB each). Without them
+a fresh clone has only **seeded placeholders** — structurally valid, meaningless.
+
+```cpp
+#include "omniseed/classification_head.h"
+#include "omniseed/decision_head.h"
+using namespace omniseed;
+
+ClassificationHead ch;
+ch.init(768);
+if (!ch.load("models/heads/trading_regime_head.bin")) {
+    // FAIL CLOSED. Do not fall back to a seeded placeholder: it emits a
+    // number that looks like a decision and is not one.
+}
+// load() rebuilds the sets from the file, so look the index up AFTER loading.
+int32_t ri = ch.find_label_set("trading.regime");   // -1 if absent
+// ch.trained() == true
+// ch.temperature(ri)        == 3.250   (temperature() with NO index is the
+//                                       DEFAULT, which is 1.0 here)
+// ch.calibration_error(ri)  == 0.0343  (ECE, lower is better)
+
+DecisionHead dh;
+dh.init(768);
+dh.load("models/heads/trading_head.bin");
+// dh.temperature() == 13.325, dh.calibration_error() == 0.0555
+// dh.provenance() == "... + calibrated (n=369, ece=0.06%)"
+```
+
+`calibration_error()` returns **`< 0` when unmeasured** — never `0.0`, which
+would read as "perfectly calibrated". Check `calibrated()` before trusting a
+confidence, and check `trained()` before trusting the head at all.
+
+| blob | contents |
+|---|---|
+| `models/heads/language_head.bin` | `language.{intent,language,sentiment}`, one T each |
+| `models/heads/trading_regime_head.bin` | `trading.regime` |
+| `models/heads/trading_head.bin` | `DecisionAction` |
+
+⚠️ **A calibrated head can still be a bad head.** The trading action head is
+right **24%** of the time — calibration makes it *safe* (max confidence 0.4966,
+so it self-routes **0/369** rows and escalates everything), not *good*. Read
+`docs/CALIBRATION.md` §6 before using any of these numbers.
+
+### Re-training the heads (offline only)
+
+Training is Python and **never runs in the runtime**. The runtime only loads the
+`.bin`. To reproduce the committed blobs:
+
+```bash
+# 1. Collect h[E]  (needs the backbone; ~1-2 min for the language set)
+./build/bin/omniseed_dump_hidden.exe language \
+    models/rwkv7-0.1B-ternary.gguf tools/data/head_language.tsv build/dump_language
+
+./build/bin/omniseed_dump_hidden.exe market \
+    models/rwkv7-0.1B-ternary.gguf models/market/AAPL_1d.csv build/dump_market --stream
+
+# 2. Fit + calibrate + write blobs and fixtures
+python tools/train_heads.py        # or .venv/Scripts/python.exe tools/train_heads.py
+
+# 3. Verify
+./build/bin/omniseed_calibration.exe
+```
+
+`--dry-run` on the collector prints the plan and writes nothing. `--stream` is
+required for the market path: RWKV is recurrent, so all bars go through **one**
+evolving `RwkvState` — windowed integer-epoch timestamps are out of distribution.
+Full method, split protocol, and the honest accuracy table:
+**`docs/CALIBRATION.md`**.
 
 ---
 

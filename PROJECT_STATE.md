@@ -3123,5 +3123,140 @@ above every true match and below the 1.0 ceiling.
 3. Re-derive `min_relevance` / `duplicate_recall_score` against a real vocabulary
    (the tokenizer is the root cause of the thin margin).
 
+---
+
+## 32. HEAD TRAINING & CALIBRATION — THE CONFIDENCE BECOMES REAL (2026-09-28)
+
+**Milestone 4. Milestone 3 (dream consolidation) was deliberately skipped.**
+
+§28 built the head stack and §30–31 gave it a soul and a memory, but every head
+was still a **seeded placeholder** that emitted a meaningless number. §28's
+router gates the fast path at `0.85`, so a placeholder that is right 24% of the
+time could print `0.92` and self-route. This milestone makes the number mean
+something. Full write-up: **`docs/CALIBRATION.md`**.
+
+### What was built
+
+- `tools/make_head_data.py` — authors `tools/data/head_language.tsv`
+  (**238 rows**, Bengali **in Bengali script**, not romanised; refuses
+  duplicates and embedded tabs/newlines).
+- `tools/dump_hidden.cpp` (new binary `omniseed_dump_hidden`) — collects `h[E]`
+  from ONE RWKV-7 forward pass. Modes `language` and `market`. **Streaming mode**
+  feeds all 1,231 bars through one evolving `RwkvState`, because RWKV is
+  recurrent and constant-memory and integer-epoch timestamps in independent
+  windows would be OOD. Honesty contract: absent backbone or zero-token text ⇒
+  write nothing, exit non-zero. It never synthesises a hidden state.
+- `tools/train_heads.py` (~750 lines) — the offline trainer. Parses the C++
+  vocabulary so there is **one source of truth**; `fit_softmax` (Adam on the
+  L2-regularised multinomial NLL, initialised at class log-priors);
+  `fit_temperature_cv` (**5-fold inside the holdout**, geometric mean of `log T`,
+  out-of-fold ECE); `emit_fixture` (emits the **whole** holdout).
+
+### Format bumps (both backward compatible)
+
+- **`DecisionHead` v2 → v3.** v3 appends a trailer **written last**
+  (`f32 temperature`, `i32 calib_samples`, `f32 calib_error`) so a v2 reader
+  stops cleanly at the bias block. `load()` accepts `2 ≤ version ≤ 3`; **v2 loads
+  with `T = 1.0` and calibration unmeasured**, and **v1 is still rejected** (a
+  v1 blob carried no invalidation). A non-finite or `≤ 0` `T` is normalised to
+  `1.0` rather than stored.
+- **`ClassificationHead` v1 — persistence written from scratch.** It had none.
+  `load()` rebuilds the sets from the file in file order, then overwrites with
+  the stored projection; every failure path sets `ready_ = false` (**fail
+  closed**).
+- `.gitignore` gains `!models/heads/`. `models/*` swallows the whole directory,
+  so the negation has to **name the directory itself** before its contents can be
+  re-included.
+
+### ⚠️ One temperature per label set, not one per head
+
+A single pooled `T` made `language.language` **worse** (ECE 0.172 → 0.194) while
+fixing `language.intent` (0.451 → 0.115): `intent` wants `T ≈ 23`, `language`
+wants `T ≈ 5`. Sets whose logit scales differ by an order of magnitude cannot
+share a scalar. `ClassificationHead` therefore stores a temperature **per set**.
+
+A temperature is a **global soften, not a local patch** — softening the top
+bucket softens every bucket, so a scalar `T` cannot fix bucket-*local*
+miscalibration.
+
+### ⚠️ Fitting `T` on a small slice under-softens every set
+
+Fitting on a 15% slice (~36 rows) gave `T` **1.5–2× too small** against the
+oracle (intent 19.4 vs 28.7; language 3.5 vs 6.5; sentiment 2.5 vs 4.7). Fixed by
+5-fold CV inside the holdout. `shuffle=False` for the trading data — a shuffled
+fold of a time series is not held out.
+
+### Measured results (all held out)
+
+| head | K | n | accuracy | macro-F1 | T | ECE raw → cal |
+|---|---|---|---|---|---|---|
+| `language.language` | 4 | 71 | 0.845 | — | 5.161 | 0.139 → **0.089** |
+| `trading.regime` | 4 | 369 | 0.705 | 0.389 | 3.250 | 0.210 → **0.034** |
+| `language.sentiment` | 3 | 71 | 0.676 | — | 3.583 | 0.248 → **0.087** |
+| `language.intent` | 7 | 71 | 0.634 | — | 23.441 | 0.360 → **0.198** |
+| `DecisionAction` | 7 | 369 | **0.244** | 0.133 | 13.325 | 0.622 → **0.056** |
+
+### ⭐ The payoff: calibration makes the fail-closed gate actually fail closed
+
+```
+DecisionAction  max calibrated confidence 0.4966  <  threshold 0.85
+                => 0/369 held-out rows self-route (fail closed)
+```
+
+The raw softmax on this head claims high confidence routinely; the head is right
+**24%** of the time. After calibration its **maximum** confidence across all 369
+held-out rows is **0.4966** — it never claims to know, so every row escalates to
+System-2. **That is the correct behaviour for a 24%-accurate head, and it was
+invisible before calibration.**
+
+### Honest gaps (do not overclaim)
+
+- **`DecisionAction` accuracy is 0.244 and `CLOSE`/`HEDGE` have zero holdout
+  recall.** Per-class recall `{ABSTAIN 0.20, HOLD 0.015, BUY 0.324, SELL 0.474,
+  CLOSE 0.0, HEDGE 0.0, EXPLAIN 0.026}`. Well-calibrated *and* weak — calibration
+  makes a weak head **safe**, not good.
+- **`trading.regime` never predicts `trend_down`** (8 of 1,231 bars). Quote the
+  macro-F1 0.389, not the 0.705.
+- **`trading.regime`'s `[0.9,1.0]` bucket misses the mandate's ±3% target at
+  3.23%.** The test asserts a 5% quality bar, **always prints the exact gap**,
+  and prints `MISSES the mandate's 3% target`. Reported, not hidden.
+- **The action labels are a rule, not P&L.** `build_action_labels` is a
+  definition (N=5 forward, 1.5% threshold); accuracy measures imitation, and
+  says nothing about profitability.
+- **`assets` / `invalidation` are empty / zero** in the blobs — "unknown", never
+  "no stop".
+- **Mandate discrepancies, reported:** `models/market/paper/AAPL_1d.csv` does not
+  exist (real path `models/market/AAPL_1d.csv`); the CSV has **no `regime`
+  column** (computed in-script by the real `RegimeEngine`); `set_action_row()` /
+  `fitted_rows()` are really `set_action()` / `fitted_actions()`; `n_samples=1255`
+  was an assumption (real: 167/71 language, 862/369 trading).
+
+### Tests
+
+`tests/test_calibration.cpp` — **180 checks, 0 failures**, registered **outside**
+the `.venv` gate. Part A/B are ungated mechanics (v3 round-trip, **v2 still
+loads**, **v1 still rejected**, failed load fails closed, `UNTRAINED` honesty);
+Part C is gated on the committed artifacts and recomputes ECE/accuracy from the
+fixture, asserting they match the stored metrics to 0.005 and that
+`calibrated.ece <= raw.ece`. All six pre-existing head suites re-run clean.
+
+**Full local board: `ctest --test-dir build -C Release` → 35/35 passed**
+(3646 s, `.venv` present, so the 14 venv-gated Python suites ran too). The board
+grew **34 → 35**; a fresh clone goes **20 → 21** (the calibration suite is
+registered outside the gate).
+
+`.gitattributes` is new: it forces `eol=lf` on the fixture `.tsv`/`.json` and
+marks the `.f32`/`.bin` payloads **binary**, because `core.autocrlf=true` would
+otherwise rewrite a `0x0D 0x0A` byte pair inside a float32 on checkout and
+silently drift every metric in the fixture.
+
+### Next
+
+1. **Milestone 3 — dream consolidation** (still skipped; the decay/reinforce
+   primitives exist for it to call).
+2. **Fix the action teacher or replace it with realised outcomes** — 0.244 is a
+   floor set by the rule, not by the head.
+3. Re-derive `min_relevance` / `duplicate_recall_score` against a real vocabulary.
+
 
 

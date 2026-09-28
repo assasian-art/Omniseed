@@ -1,0 +1,3 @@
+column	n	temperature	ece_calibrated	holdout_acc
+trading.regime	369	3.250233	0.034300	0.704610
+DecisionAction	369	13.325159	0.055500	0.243900

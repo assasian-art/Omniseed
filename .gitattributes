@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# Keep this file itself LF: a CRLF .gitattributes risks a trailing \r being
+# read as part of a pattern on some git builds.
+# ---------------------------------------------------------------------------
+.gitattributes                             text eol=lf
+
+# ---------------------------------------------------------------------------
+# Calibration fixtures + fitted heads (Milestone 4).
+#
+# tests/test_calibration.cpp parses the .tsv fixtures with a strict reader. It
+# already strips a trailing \r defensively, but forcing LF keeps a Windows
+# checkout byte-identical to the committed blob and stops CRLF churn from
+# re-writing the fixtures on every checkout.
+#
+# The .f32 / .bin payloads are little-endian BINARY. They must never be touched
+# by an eol conversion: a 0x0D 0x0A byte pair inside a float32 would be silently
+# rewritten to 0x0A and every metric in the fixture would drift.
+# ---------------------------------------------------------------------------
+tests/fixtures/head_calibration/**/*.tsv   text eol=lf
+tests/fixtures/head_calibration/**/*.json  text eol=lf
+tests/fixtures/head_calibration/**/*.f32   binary
+models/heads/*.bin                         binary

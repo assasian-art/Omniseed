@@ -1,0 +1,13 @@
+{
+  "bin_regime": "models/heads/trading_regime_head.bin",
+  "bin_action": "models/heads/trading_head.bin",
+  "fitted_rows_action": 7,
+  "split": "chronological 70/30 + 5-fold CV for T",
+  "action_teacher": "RULE-BASED TEACHER (first match wins), N=5 bars forward, threshold=1.5%: CLOSE if trend_up/trend_down and the forward return opposes the trend by >threshold; HEDGE if high_vol and |r|<=threshold; ABSTAIN if high_vol and |r|>threshold; EXPLAIN if range and |r|<=0.5%; BUY if r>+threshold; SELL if r<-threshold; HOLD otherwise. This is a DEFINITION, not realized P&L: the head learns to imitate this rule, and its accuracy says nothing about profitability.",
+  "E": 768,
+  "n": 369,
+  "columns": [
+    "trading.regime",
+    "DecisionAction"
+  ]
+}

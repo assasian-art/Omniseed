@@ -120,6 +120,15 @@ public:
         // confidence bar but is nearly a coin flip; set > 0 to demand a clear
         // winner. 0 = disabled (confidence alone decides).
         float margin_floor = 0.0f;
+        // Softmax temperature applied to the action logits before the softmax.
+        // 1.0 = raw logits, i.e. NO calibration. Fitted OFFLINE by temperature
+        // scaling on a held-out split: T > 1 softens an over-confident head so
+        // that the reported confidence_score tracks the observed accuracy.
+        //
+        // This is the field that turns `confidence_score` from a number into a
+        // claim. It is persisted in the .bin (format v3) so that a head loaded
+        // from disk is calibrated, not merely fitted.
+        float temperature = 1.0f;
     };
 
     DecisionHead() = default;
@@ -143,6 +152,26 @@ public:
     // Optional floor on p(top) - p(second); 0 disables the check.
     void  set_margin_floor(float m) { cfg_.margin_floor = m; }
     float margin_floor() const { return cfg_.margin_floor; }
+
+    // Softmax temperature. A non-finite or <= 0 value is normalised to 1.0
+    // (no scaling) rather than stored, so a corrupt file cannot turn every
+    // softmax into NaN — the head degrades to its uncalibrated self.
+    void  set_temperature(float t);
+    float temperature() const { return cfg_.temperature; }
+
+    // ---- calibration report ------------------------------------------------
+    // Filled by the OFFLINE trainer through set_calibration() (or read back
+    // from a v3 .bin). `samples` is the size of the held-out calibration split;
+    // `ece` is the Expected Calibration Error in [0, 1].
+    //
+    // A head that was never calibrated reports calibration_error() < 0, i.e.
+    // "not measured". It deliberately does NOT report 0.0, because
+    // "perfectly calibrated" and "never measured" are different claims and
+    // only one of them would be true. Check calibrated() first.
+    void    set_calibration(int32_t samples, float ece);
+    int32_t calibration_samples() const { return calib_samples_; }
+    float   calibration_error() const { return calib_error_; }   // ECE, or < 0
+    bool    calibrated() const { return calib_samples_ > 0 && calib_error_ >= 0.0f; }
 
     // ---- the hot path -------------------------------------------------------
     // ONE matvec + softmax + argmax over the hidden state. No token loop, no
@@ -182,6 +211,12 @@ public:
 
 private:
     void seed_weights(uint32_t seed);
+    // Recomputes provenance_ from (ready_, trained(), fitted_, calib_,
+    // loaded_). One place, so a later set_action()/set_calibration() cannot
+    // leave a stale string behind claiming the head is uncalibrated.
+    void refresh_provenance();
+    // " + calibrated (n=..., ece=...%)", or "" when nothing was measured.
+    std::string calibration_clause() const;
 
     Config      cfg_;
     int32_t     E_ = 0;             // hidden width
@@ -195,6 +230,12 @@ private:
     bool        ready_          = false;
     int32_t     fitted_actions_ = 0;   // rows supplied by set_action()/load()
     std::vector<uint8_t> fitted_;      // [A_] per-action "row came from fitting"
+    // Calibration, fitted offline. samples <= 0 / ece < 0 means "not measured".
+    int32_t     calib_samples_ = 0;
+    float       calib_error_   = -1.0f;
+    // True when the projection came from load(), so provenance() can say
+    // "loaded ..." rather than "fitted ..." without guessing.
+    bool        loaded_        = false;
     std::string provenance_ = "uninitialised";
     std::string error_;
 

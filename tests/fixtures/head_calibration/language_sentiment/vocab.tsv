@@ -1,0 +1,4 @@
+column	index	label
+language.sentiment	0	positive
+language.sentiment	1	negative
+language.sentiment	2	neutral

@@ -76,7 +76,15 @@ constexpr char kMagic[8] = {'O', 'M', 'N', 'I', 'S', 'D', 'H', '1'};
 // v2 added the per-action invalidation levels. A v1 blob is rejected rather
 // than defaulted, because "no invalidation recorded" and "invalidation is
 // zero" are different claims and only one of them is true.
-constexpr int32_t kFormatVersion = 2;
+//
+// v3 appends a calibration trailer: {temperature, calib_samples, calib_error}.
+// It is OPTIONAL on read — a v2 blob loads with T = 1 and calibration reported
+// as "not measured" — because a head that predates calibration is still a
+// valid head, it is simply an uncalibrated one. Refusing it would delete work
+// that is still correct; defaulting the temperature to something other than
+// 1.0 would silently change what an existing blob decides.
+constexpr int32_t kFormatVersion = 3;
+constexpr int32_t kMinReadVersion = 2;
 constexpr int32_t kMaxDim  = 1 << 20;
 constexpr int32_t kMaxStr  = 1 << 12;
 
@@ -143,6 +151,12 @@ bool DecisionHead::init(int32_t n_embd, uint32_t seed) {
     fitted_actions_ = 0;
     fitted_.clear();
     error_.clear();
+    // A fresh init() is a fresh head: it carries no calibration and no
+    // temperature. load() re-applies both after calling this.
+    cfg_.temperature = 1.0f;
+    calib_samples_   = 0;
+    calib_error_     = -1.0f;
+    loaded_          = false;
 
     E_ = n_embd;
     A_ = kActionCount;
@@ -169,8 +183,35 @@ bool DecisionHead::init(int32_t n_embd, uint32_t seed) {
 
     seed_weights(seed);
     ready_      = true;
-    provenance_ = "seeded placeholder (untrained; supply rows via set_action()/load())";
+    refresh_provenance();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Provenance — one composer, so no call site can leave a stale claim behind.
+// ---------------------------------------------------------------------------
+std::string DecisionHead::calibration_clause() const {
+    if (calib_samples_ <= 0 || calib_error_ < 0.0f) return std::string();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), " + calibrated (n=%d, ece=%.2f%%)",
+                  calib_samples_, static_cast<double>(calib_error_ * 100.0f));
+    return std::string(buf);
+}
+
+void DecisionHead::refresh_provenance() {
+    std::string base;
+    if (!ready_) {
+        base = "uninitialised";
+    } else if (loaded_) {
+        base = trained() ? "loaded fitted projection"
+                         : "loaded seeded placeholder (file was untrained)";
+    } else if (fitted_actions_ == 0) {
+        base = "seeded placeholder (untrained; supply rows via set_action()/load())";
+    } else {
+        base = trained() ? "fitted (all action rows supplied)"
+                         : "partially fitted placeholder";
+    }
+    provenance_ = base + calibration_clause();
 }
 
 void DecisionHead::seed_weights(uint32_t seed) {
@@ -207,7 +248,19 @@ DecisionResult DecisionHead::decide(const float* hidden) const {
         logits_[static_cast<size_t>(a)] = acc;
     }
 
-    // ---- 2) softmax over A_ (max-subtracted) -------------------------------
+    // ---- 2) temperature scaling --------------------------------------------
+    // Applied to the LOGITS, before the max/softmax. T == 1.0 is an exact
+    // no-op, so an uncalibrated head takes byte-for-byte the path it always
+    // did. The guard is repeated here (not just in set_temperature) because a
+    // blob written by another tool must not be able to inject a NaN.
+    const float T = (cfg_.temperature > 0.0f &&
+                     std::isfinite(cfg_.temperature)) ? cfg_.temperature : 1.0f;
+    if (T != 1.0f) {
+        const float inv_t = 1.0f / T;
+        for (int32_t a = 0; a < A_; ++a) logits_[static_cast<size_t>(a)] *= inv_t;
+    }
+
+    // ---- 3) softmax over A_ (max-subtracted) -------------------------------
     float mx = logits_[0];
     for (int32_t a = 1; a < A_; ++a)
         mx = std::max(mx, logits_[static_cast<size_t>(a)]);
@@ -221,7 +274,7 @@ DecisionResult DecisionHead::decide(const float* hidden) const {
     const float inv = 1.0f / sum;
     for (int32_t a = 0; a < A_; ++a) logits_[static_cast<size_t>(a)] *= inv;
 
-    // ---- 3) argmax + runner-up --------------------------------------------
+    // ---- 4) argmax + runner-up --------------------------------------------
     int32_t best   = 0;
     float   best_p = logits_[0];
     int32_t second = -1;
@@ -292,8 +345,10 @@ void DecisionHead::set_action(DecisionAction a, const float* row, float bias) {
         fitted_[static_cast<size_t>(idx)] = 1u;
         ++fitted_actions_;
     }
-    provenance_ = trained() ? "fitted (all action rows supplied)"
-                            : "partially fitted placeholder";
+    // The projection is no longer purely what came off disk, so provenance
+    // must stop saying "loaded ...".
+    loaded_ = false;
+    refresh_provenance();
 }
 
 void DecisionHead::set_action_asset(DecisionAction a, const std::string& asset) {
@@ -306,6 +361,32 @@ void DecisionHead::set_action_invalidation(DecisionAction a, float level) {
     const int32_t idx = static_cast<int32_t>(a);
     if (!ready_ || idx < 0 || idx >= A_) return;
     inval_[static_cast<size_t>(idx)] = level;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------
+void DecisionHead::set_temperature(float t) {
+    // Normalise rather than store garbage: a NaN or a non-positive T would
+    // divide every logit into inf/NaN and destroy the distribution. Falling
+    // back to 1.0 degrades the head to its uncalibrated self, which is a
+    // well-defined (if less useful) state.
+    cfg_.temperature = (std::isfinite(t) && t > 0.0f) ? t : 1.0f;
+    refresh_provenance();
+}
+
+void DecisionHead::set_calibration(int32_t samples, float ece) {
+    // `samples` is a count and `ece` an error in [0,1]; anything else is a
+    // caller bug and is recorded as "not measured" rather than clamped into
+    // a number that would look like a real measurement.
+    if (samples <= 0 || !std::isfinite(ece) || ece < 0.0f) {
+        calib_samples_ = 0;
+        calib_error_   = -1.0f;
+    } else {
+        calib_samples_ = samples;
+        calib_error_   = ece;
+    }
+    refresh_provenance();
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +411,13 @@ bool DecisionHead::save(const std::string& path) const {
     if (ok && !bias_.empty())
         ok = std::fwrite(bias_.data(), sizeof(float), bias_.size(), f) == bias_.size();
 
+    // --- v3 trailer: calibration --------------------------------------------
+    // Written last so a v2 reader stops cleanly after the bias block, and a v3
+    // reader on a v2 file hits EOF here and keeps T = 1 / "not measured".
+    ok = ok && wr(f, cfg_.temperature);
+    ok = ok && wr(f, calib_samples_);
+    ok = ok && wr(f, calib_error_);
+
     std::fclose(f);
     return ok;
 }
@@ -346,7 +434,10 @@ bool DecisionHead::load(const std::string& path) {
               std::memcmp(magic, kMagic, 8) == 0;
 
     int32_t version = 0, E = 0, A = 0, fitted_flag = 0;
-    ok = ok && rd(f, version) && version == kFormatVersion;
+    // v3 is the current writer; v2 is still readable (it simply carries no
+    // calibration). v1 stays rejected — see kFormatVersion above.
+    ok = ok && rd(f, version) &&
+         version >= kMinReadVersion && version <= kFormatVersion;
     ok = ok && rd(f, E) && rd(f, A) && rd(f, fitted_flag);
 
     if (!ok || E <= 0 || E > kMaxDim || A <= 0) {
@@ -381,6 +472,24 @@ bool DecisionHead::load(const std::string& path) {
     if (ok)
         ok = std::fread(bias_.data(), sizeof(float), bias_.size(), f) == bias_.size();
 
+    // --- v3 trailer (optional) ----------------------------------------------
+    // Absent in a v2 blob. "Absent" must read as T = 1 and "not measured",
+    // never as a defaulted calibration claim.
+    cfg_.temperature = 1.0f;
+    calib_samples_   = 0;
+    calib_error_     = -1.0f;
+    if (ok && version >= 3) {
+        float   temp = 1.0f;
+        int32_t cs   = 0;
+        float   ce   = -1.0f;
+        ok = ok && rd(f, temp) && rd(f, cs) && rd(f, ce);
+        if (ok) {
+            cfg_.temperature = (std::isfinite(temp) && temp > 0.0f) ? temp : 1.0f;
+            calib_samples_   = cs > 0 ? cs : 0;
+            calib_error_     = (std::isfinite(ce) && ce >= 0.0f) ? ce : -1.0f;
+        }
+    }
+
     if (!ok) {
         std::fclose(f);
         error_ = "decision head: truncated payload in " + path;
@@ -401,9 +510,8 @@ bool DecisionHead::load(const std::string& path) {
     fitted_actions_ = (fitted_flag != 0) ? A : 0;
     fitted_.assign(static_cast<size_t>(A),
                    fitted_flag != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0));
-    provenance_ = (fitted_flag != 0)
-        ? "loaded fitted projection"
-        : "loaded seeded placeholder (file was untrained)";
+    loaded_ = true;
+    refresh_provenance();
     return true;
 }
 

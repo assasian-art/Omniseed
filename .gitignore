@@ -68,3 +68,17 @@ Thumbs.db
 # ---------------------------------------------------------------------------
 !tools/data/rwkv_vocab_v20230424.txt
 !models/rwkv_vocab_v20230424.txt
+
+# ---------------------------------------------------------------------------
+# Committed fitted heads (models/heads/*.bin).
+#
+# These ARE checked in, unlike every other artifact under models/. They are
+# small (tens of KB), self-describing (magic + version + label names + the
+# calibration trailer), and they are the deliverable of the OFFLINE training
+# step: without them a fresh clone has only seeded placeholders, and the
+# calibration test would have nothing to verify. `models/*` ignores the whole
+# directory, so the negation has to name the directory itself before its
+# contents can be re-included.
+# ---------------------------------------------------------------------------
+!models/heads/
+

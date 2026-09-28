@@ -87,6 +87,61 @@ public:
     // ---- offline fitting hooks ---------------------------------------------
     void set_label_row(int32_t set_index, int32_t label_index, const float* row, float bias);
 
+    // ---- calibration --------------------------------------------------------
+    // Softmax temperature applied to the label logits before the softmax.
+    // 1.0 = raw logits (no calibration). A non-finite or <= 0 value is
+    // normalised to 1.0 rather than stored, so a corrupt blob cannot make
+    // every distribution NaN.
+    //
+    // PER SET, not per head. Each label set has its own logit scale — a 7-way
+    // intent set and a 3-way sentiment set fitted on the same h[E] routinely
+    // need temperatures an order of magnitude apart — and a single scalar
+    // fitted on the pooled logits measurably makes the better-scaled sets
+    // WORSE. Measured on the first fit: a pooled T took language.language's
+    // ECE from 0.172 to 0.194 while fixing language.intent. One number cannot
+    // serve both, so the head stores one number per set.
+    //
+    // set_temperature(t) applies t to every set AND to sets registered later;
+    // set_temperature(set_index, t) calibrates one set. temperature() reports
+    // the default, temperature(set_index) the set's own value.
+    void  set_temperature(float t);
+    void  set_temperature(int32_t set_index, float t);
+    float temperature() const { return default_temperature_; }
+    float temperature(int32_t set_index) const;
+
+    // Fitted offline by temperature scaling on a held-out split. A head that
+    // was never calibrated reports calibration_error() < 0 ("not measured"),
+    // never 0.0 — see the same note on DecisionHead.
+    //
+    // The no-index form is the POOLED value: an n-weighted average over the
+    // sets that were measured, which is the right summary for "how calibrated
+    // is this head overall". The indexed form is that set's own ECE.
+    void    set_calibration(int32_t samples, float ece);
+    void    set_calibration(int32_t set_index, int32_t samples, float ece);
+    int32_t calibration_samples() const;
+    int32_t calibration_samples(int32_t set_index) const;
+    float   calibration_error() const;                  // pooled, or < 0
+    float   calibration_error(int32_t set_index) const; // per set, or < 0
+    bool    calibrated() const;
+
+    // ---- persistence --------------------------------------------------------
+    // Self-describing little-endian blob: magic, version, E, the label sets
+    // (name + labels, in registration order), the projection, the bias, the
+    // per-row fitted flags, and the calibration trailer.
+    //
+    // The label sets travel WITH the weights because a [L, E] matrix whose
+    // label order is not recorded is not restorable: the same numbers under a
+    // permuted label list are a different classifier. load() therefore
+    // REBUILDS the sets from the file in file order rather than trusting
+    // whatever the caller had registered, so a restored head is exactly the
+    // head that was saved.
+    //
+    // On failure the head is left NOT READY (fail closed): a caller that
+    // ignores the return value must not end up classifying with a half-read
+    // projection.
+    bool save(const std::string& path) const;
+    bool load(const std::string& path);
+
     // ---- provenance ---------------------------------------------------------
     bool trained() const;
     int32_t fitted_rows() const { return fitted_rows_; }
@@ -95,6 +150,14 @@ public:
 
 private:
     void seed_weights(uint32_t seed);
+    // Recomputes provenance_ from (ready_, sets_, fitted_rows_, calibration).
+    // One composer, so a later set_label_row()/set_calibration() cannot leave
+    // a stale string behind.
+    void refresh_provenance();
+    // " — calibrated (n=..., ece=...%)", or "" when nothing was measured.
+    std::string calibration_clause() const;
+    // How many label sets carry a real (samples > 0, ece >= 0) measurement.
+    int32_t measured_sets() const;
     // Builds a result that carries the failure in `domain` and leaves top_k
     // empty. Every failure path goes through here so none of them can invent a
     // distribution.
@@ -109,6 +172,16 @@ private:
     std::vector<uint8_t>  fitted_; // [total_labels]
     int32_t               total_labels_ = 0;
     int32_t               fitted_rows_  = 0;
+
+    // Calibration, fitted offline. One entry per label set, grown by
+    // add_label_set(). samples <= 0 / ece < 0 means "not measured".
+    float                default_temperature_ = 1.0f;
+    std::vector<float>   temps_;          // [sets_] softmax temperature
+    std::vector<int32_t> calib_samples_;  // [sets_] calibration-set size
+    std::vector<float>   calib_error_;    // [sets_] ECE, or -1
+    // True when the weights came from load(), so provenance() can say
+    // "loaded ..." rather than "fitted ..." without guessing.
+    bool    loaded_        = false;
 
     bool        ready_      = false;
     std::string provenance_ = "uninitialised";

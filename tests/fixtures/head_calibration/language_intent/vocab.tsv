@@ -1,0 +1,8 @@
+column	index	label
+language.intent	0	question
+language.intent	1	statement
+language.intent	2	command
+language.intent	3	greeting
+language.intent	4	farewell
+language.intent	5	thanks
+language.intent	6	unknown

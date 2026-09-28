@@ -1,0 +1,12 @@
+column	index	label
+trading.regime	0	trend_up
+trading.regime	1	trend_down
+trading.regime	2	range
+trading.regime	3	high_vol
+DecisionAction	0	ABSTAIN
+DecisionAction	1	HOLD
+DecisionAction	2	BUY
+DecisionAction	3	SELL
+DecisionAction	4	CLOSE
+DecisionAction	5	HEDGE
+DecisionAction	6	EXPLAIN
