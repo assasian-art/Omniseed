@@ -101,6 +101,10 @@ set(OMNISEED_CORE_SOURCES
     # to the per-row path; the AVX2 kernel is not, by construction.
     src/core/batch_gemm.cpp
     src/core/batch_gemm_avx2.cpp
+    # The STREAM: the temporal filter a single-shot head does not have. Debounce,
+    # hysteresis and release over the head's outputs. It does NOT make the
+    # backbone incremental — RWKV-7 already is. See docs/STREAMING.md.
+    src/streaming_decision.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
@@ -820,6 +824,24 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_heads_batch COMMAND omniseed_heads_batch
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_heads_batch PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # MILESTONE 9 — streaming decisions. Pure state machine plus the committed
+    # h[E] fixtures, so it is UNGATED and runs in CI. The joint half (Part C)
+    # asserts that the BATCH path (§36) and the per-row path produce the same
+    # event stream with `==`, which is what makes one filter usable from either.
+    add_executable(omniseed_streaming_decision tests/test_streaming_decision.cpp)
+    target_include_directories(omniseed_streaming_decision PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_streaming_decision PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_streaming_decision PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_streaming_decision PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_streaming_decision COMMAND omniseed_streaming_decision
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_streaming_decision PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.

@@ -180,6 +180,15 @@ within-domain ensemble — **not** the cross-head vote the mandate describes.
 sequential (this tree's RWKV-7 is the scalar recurrent form). See `docs/BATCH.md`.
 The remaining four items on that line are still unverified/absent.
 
+**Update (§37):** **streaming decisions are now DONE at the head level** —
+`StreamingDecision` (`include/omniseed/streaming_decision.h`) is an incremental
+protocol over the decision head with debounce, hysteresis and release, and
+`push_batch` drives it from the §36 batched readout. It is a *filter over the
+head's outputs*, not an incremental head, and it does **not** make the backbone
+incremental (it already is). Nothing consumes it yet beyond `demo-stream`. See
+`docs/STREAMING.md`. **Feedback hooks, hierarchical routing level 2, and
+cross-head ensemble voting remain unverified/absent.**
+
 **Update (§34, §35):** two further corrections to the row above about
 `ensemble`/`voting`. §34 found the `SelfImprovement` trace cache never persisted
 (a `uint32` magic compared against a string), so the closest thing to a feedback

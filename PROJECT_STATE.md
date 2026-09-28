@@ -3668,3 +3668,128 @@ fresh clone goes **23 → 24**.
    consumer does not.
 6. **Fit a head ensemble** so §35's `from_ensemble()` has something to eat
    (Phase 2.5).
+
+## 37. STREAMING DECISIONS — a filter, not a faster head (2026-09-28)
+
+**Milestone 9. Phase 2.2 of the mandate.** The decision head is single-shot: one
+`h[E]` in, one action out. That is the right primitive for a judgement about one
+situation and the **wrong** primitive for a control loop — a loop that acts on
+every single-shot output acts on noise. This adds the temporal state the head
+deliberately does not have.
+
+Full write-up: **`docs/STREAMING.md`**.
+
+### What this is NOT — stated first
+
+| claim | true? |
+|---|---|
+| It makes the backbone incremental | **No, and it does not need to.** RWKV-7 here is the scalar *recurrent* form: `h_t` is already a function of `(token_t, state_{t-1})` and the state already carries the history. This layer never reads or writes that state. |
+| It makes the head more accurate | **No.** It makes the output **stable**. Stability and accuracy are different claims, and no filter recovers information the head never had. |
+| It invents an action or a distribution | **No.** Every action it emits came from a real head call. It decides *when* to trust one. |
+| It can be driven from the §36 batched path | **Yes** — `push_batch()` runs `decide_batch` once and filters the results in order. |
+
+### Three mechanisms, one state machine
+
+| mechanism | rule | why |
+|---|---|---|
+| **Debounce** | an action is committed only after `confirm_steps` *consecutive agreeing* observations | one blip cannot move the system |
+| **Hysteresis** | keeping needs `min_confidence`; **changing** needs `switch_confidence >= min_confidence` | stops oscillation across a noisy boundary |
+| **Release** | a commitment whose evidence evaporated goes to `ABSTAIN` after `release_after_weak` weak steps | an unbounded hold is a decision the head is no longer making |
+
+Two modes reduce to one `Candidate`, and **one** state machine consumes it, so
+the commit / switch / release rules are written and tested **once**:
+
+* **`Confirm`** — order-sensitive: "is the head saying the same thing, clearly,
+  N times running?" What a live loop wants.
+* **`Window`** — order-insensitive: "over the last W, which action won the
+  vote?" What a backtest wants, evaluated every bar. `confirm_steps` doubles as
+  the vote **quorum**, so there is one knob for "how much evidence is enough".
+
+### The rule that is easy to get wrong: `ABSTAIN` is not a position
+
+A committed filter is **never** in `ABSTAIN`; `committed == true` implies a real
+action. Without that rule a strong run of `ABSTAIN` would "commit", leaving a
+filter reporting `committed = true` while holding nothing, and a `first` event
+with no `changed` event to match it. The identity
+
+```
+changed events  ==  commits + changes + releases
+```
+
+would stop holding. It is pinned over **10,000 sticky random steps** in Part D,
+and it is what lets a consumer treat **every** `changed` event as exactly one
+transition to undo. A quorum of `ABSTAIN` is therefore handled as a **release**
+when something is held, and a no-op when nothing is.
+
+A release costs the **same evidence as a switch** — a quorum of observations —
+so one strong `ABSTAIN` cannot unseat a commitment that took N observations to
+earn. A challenger that fails the switch bar is **gated**, which is *not* the
+same as being weak: it neither switches nor contributes to a release.
+
+### Measured — `omniseed demo-stream` (untrained head, so the ACTIONS are placeholders)
+
+| stream | raw head flips | Confirm: committed changes | Window: committed changes |
+|---|---|---|---|
+| A — 240 real held-out `h[E]` | **0** | 1 (one commit, held) | 1 |
+| B — 240 synthetic, unscaled | 202 | **0** — every step below the bar | **0** |
+| C — the same, scaled ×8 | 205 | **2 → 102.5×** | **18 → 11.4×** |
+
+Stream A is honest about a fact worth recording: on real trading hidden states a
+**seeded** head emits **one constant action** (1 distinct output, 0 flips), so
+there is nothing for the filter to remove. Stream B shows the other fail-safe —
+the head is *confident of nothing* (max p = 0.176), so the filter refuses to act
+at all. Stream C amplifies the same noise so the logits separate and the head
+becomes confident while still flipping every step — the situation the layer
+exists for.
+
+Long-stream invariants (10,000 sticky steps, `confirm_steps = 4`): **161
+commits, 42 switches, 161 releases**, and `changed == commits + changes +
+releases` held exactly. The test **asserts that all three are > 0** — a stream
+that never walks the switch path cannot validate it. (A purely uniform stream
+gave 2 commits and **0 switches** over the same 10,000 steps, which is why the
+generator is sticky.)
+
+### The joint with §36
+
+`push_batch()` is the seam: the batched readout produces B `DecisionResult`s in
+one GEMM and the filter walks them in order. With the **Scalar** kernel
+`decide_batch` is bit-identical to `decide`, so the batch-driven and
+per-row-driven filters produce the **same event stream** — compared field by
+field *and* by `to_json()` string equality over **369 real rows**.
+
+### Fail-closed
+
+A not-ready head, a null pointer, a width mismatch or a wrong dtype records
+**nothing**: `push()` returns `false`, the event says `valid = false` with the
+reason, `steps()` does not advance, and the streak, window and commitment are
+untouched. An unreadable signal is not agreement. A failure **mid-stream**
+therefore cannot disturb a commitment the stream already earned (test C3).
+`push_batch()` clears `out` and returns `false` with `out` **empty** — never a
+partial sequence.
+
+### Files
+
+| file | what |
+|---|---|
+| `include/omniseed/streaming_decision.h` | the API, `StreamingConfig`, `StreamEvent` (NEW) |
+| `src/streaming_decision.cpp` | two reducers + one state machine (NEW) |
+| `tests/test_streaming_decision.cpp` | **861 checks**, 0 fail, 0 skip, **UNGATED** (NEW) |
+| `docs/STREAMING.md` | full write-up (NEW) |
+| `src/cli/main.cpp` | `demo-stream`, model-free, three streams |
+| `CMakeLists.txt` | source + `omniseed_streaming_decision` |
+| `docs/JEV_FEATURES.md` §7 | streaming: **NOT STARTED → DONE at the head level** |
+| `docs/AUDIT.md` §6 | the §37 update marker |
+
+### Next
+
+1. **Nothing consumes it yet.** No trading loop, no agent loop, no backtest calls
+   `StreamingDecision`; the only caller is `demo-stream`. The capability and its
+   evidence exist; the consumer does not — the same recurring gap.
+2. **Phase 2.3 feedback hooks** — the §34 store persists now, and this filter is
+   where a `(prediction, outcome)` pair would naturally be logged.
+3. **Fit the vision/audio heads** (still the largest verified absence).
+4. **Milestone 3 — dream consolidation** (still skipped).
+5. **Point the backtest at the batched path** — `src/trading/simulate.cpp` still
+   re-derives its readouts bar by bar.
+6. **Fit a head ensemble** so §35's `from_ensemble()` has something to eat.
+

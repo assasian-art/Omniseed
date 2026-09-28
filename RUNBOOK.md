@@ -121,10 +121,10 @@ months of commits before anyone noticed.
 
 `omniseed_decision_bridge`, `omniseed_regime_parity`,
 `omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
-`omniseed_agent_modules`, `omniseed_uncertainty_split` and
-`omniseed_heads_batch` are deliberately registered **outside** the gate. The
-last four need only **committed** fixtures (no model, no `.venv`, no network), so
-they run everywhere including CI.
+`omniseed_agent_modules`, `omniseed_uncertainty_split`,
+`omniseed_heads_batch` and `omniseed_streaming_decision` are deliberately
+registered **outside** the gate. The last five need only **committed** fixtures
+(no model, no `.venv`, no network), so they run everywhere including CI.
 
 ### The head stack (fast, fully offline)
 
@@ -139,6 +139,7 @@ they run everywhere including CI.
 ./build/bin/omniseed_agent_modules.exe    # 131 checks, the last 4 uncovered modules
 ./build/bin/omniseed_uncertainty_split.exe # 154 checks, aleatoric vs epistemic
 ./build/bin/omniseed_heads_batch.exe       # 128 checks, batched head readout
+./build/bin/omniseed_streaming_decision.exe # 861 checks, the streaming filter
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
@@ -196,6 +197,7 @@ Related flags:
 ./build/bin/omniseed.exe tools         # list available tools
 ./build/bin/omniseed.exe selftest      # kernel self-test
 ./build/bin/omniseed.exe demo-soul     # persona + memory + recall + decay
+./build/bin/omniseed.exe demo-stream   # streaming decisions: churn reduction
 ./build/bin/omniseed.exe gen --help    # generation options
 ```
 
@@ -204,6 +206,15 @@ the first), prints the recall gloss, then prints the **measured** relevance
 separation that `min_relevance` comes from — each probe labelled `ok` or
 `MISMATCH` — and finishes with a simulated 50-day decay pass. It is the fastest
 way to re-derive the thresholds if you change the tokenizer.
+
+`demo-stream` also needs no model. It runs the streaming filter over **three**
+streams — the real held-out `h[E]` fixture, unscaled synthetic noise, and the
+same noise scaled ×8 — and prints, for `Confirm` and `Window` modes, how often
+the raw head output flipped versus how often the committed action changed. The
+unscaled stream is there on purpose: the filter refuses to act on it at all
+(every step is below the confidence bar), which is the fail-safe working. The
+head is a seeded placeholder, so the **actions are meaningless**; the filter is
+what the demo exercises.
 
 ---
 
@@ -498,6 +509,61 @@ actions and routing decisions across 369 real + 200 synthetic rows.
 ⚠️ **The backbone is NOT batched.** RWKV-7 here is the scalar recurrent form, so
 1000 signals still need 1000 sequential forwards. Batching applies to the
 readout. Full detail: **`docs/BATCH.md`**.
+
+### Stream decisions (debounce + hysteresis + release)
+
+A single-shot head acts on noise: one blip in `h[E]` moves the position.
+`StreamingDecision` is a **filter over the head's outputs** — it does not make the
+head faster or more accurate, it makes its output *stable*.
+
+```cpp
+#include "omniseed/streaming_decision.h"
+
+StreamingConfig cfg;                 // Confirm mode, confirm_steps = 3
+cfg.switch_confidence = 0.60f;       // changing costs MORE than keeping
+StreamingDecision stream;
+stream.set_config(cfg);
+stream.init(head);                   // NON-owning: the head must outlive it
+
+StreamEvent e;
+for (const float* h : stream_of_hidden_states) {
+    if (!stream.push(h, e)) continue;     // no observation — NOT agreement
+    if (e.first || e.changed) {
+        // undo e.previous, apply e.action. Nothing else needs checking.
+    }
+}
+```
+
+Three ways to drive it:
+
+| call | when |
+|---|---|
+| `push(h, e)` | one head call per step |
+| `push_decision(d, e)` | you already have a `DecisionResult` |
+| `push_batch(H, B, ev)` | a whole `[B, E]` dump at once, via §36's `decide_batch` |
+
+With `BatchKernel::Scalar` the batch and per-row paths produce the **same** event
+stream, so either is safe to use.
+
+⚠️ **Two modes.** `StreamMode::Confirm` (default) demands N *consecutive*
+agreeing observations — what a live loop wants. `StreamMode::Window` takes a vote
+over a sliding window — order-insensitive, what a backtest wants. In `Window`,
+`confirm_steps` is the vote **quorum** and `window` is the ring size.
+
+⚠️ **`ABSTAIN` is never a commitment.** `committed == true` implies a real
+action. A quorum of `ABSTAIN` **releases** when something is held and is a no-op
+when nothing is. That is what makes `changed events == commits + changes +
+releases` hold, so every `changed` event is exactly one transition to undo.
+
+See it run:
+
+```bash
+./build/bin/omniseed.exe demo-stream    # model-free; three streams, churn reduction
+```
+
+Measured on stream C (untrained head, so the *actions* are placeholders): **205
+raw head flips → 2 committed changes (102.5×)** in `Confirm` mode, **18 (11.4×)**
+in `Window` mode. Full detail: **`docs/STREAMING.md`**.
 
 ---
 

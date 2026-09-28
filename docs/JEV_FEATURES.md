@@ -6,11 +6,11 @@ gaps plainly. A feature list that only contains ticks is not a status report.
 
 > ⚠️ **This is a dated snapshot.** It was written before §32 (head training and
 > calibration), §33 (the multimodal joint), §34 (module coverage), §35 (the
-> uncertainty split) and §36 (batched head evaluation). Where a later milestone
-> changed the answer, the original text is kept and marked **Update (§NN)** below
-> it, so the record of what was believed — and why — survives alongside the
-> correction. Sections carrying an update: **2, 6, 9, 10** and Part 2
-> (vision/audio).
+> uncertainty split), §36 (batched head evaluation) and §37 (streaming
+> decisions). Where a later milestone changed the answer, the original text is
+> kept and marked **Update (§NN)** below it, so the record of what was believed —
+> and why — survives alongside the correction. Sections carrying an update:
+> **2, 6, 7, 9, 10** and Part 2 (vision/audio).
 
 Legend: **DONE** · **PARTIAL** · **NOT STARTED**
 
@@ -187,12 +187,39 @@ not (eight lanes vs one accumulator) and is held to "the answer does not change"
 instead — 0 top-1, action and routing mismatches over 369 real + 200 synthetic
 rows. Full detail: **`docs/BATCH.md`**.
 
-### 7. Streaming — **NOT STARTED** (at the head level)
+### 7. Streaming — **DONE at the head level**
+
+> **Update (§37).** The text below was written when no streaming decision API
+> existed. One now does. Kept for the record; the correction follows it.
 
 The **token** head streams tokens — that is what the existing generator does. The
 decision, classification and scoring heads are single-shot by construction: one
 matvec, one answer. There is no incremental/streaming decision API, and no
 partial-result protocol.
+
+**Update (§37):** `StreamingDecision` (`include/omniseed/streaming_decision.h`)
+now provides exactly that — an incremental protocol over the decision head, with
+debounce (N-of-M), hysteresis (asymmetric switch cost), and release. It is
+`push(h)` / `push_decision(d)` / `push_batch(H, B)`, each returning a
+`StreamEvent` that carries the committed action, whether it changed, what it
+replaced, and the evidence behind it.
+
+Two things it is **not**, and the header says so at the top:
+
+* it does **not** make the backbone incremental — the backbone already is
+  (RWKV-7 here is the recurrent form, so `h_t` comes from
+  `(token_t, state_{t-1})`); this layer never touches that state;
+* it does **not** make the head more accurate. It makes its output *stable*, and
+  stability and accuracy are different claims.
+
+It is a **filter over the head's outputs**: one state machine, two reducers
+(`Confirm` — order-sensitive consecutive agreement; `Window` — an
+order-insensitive vote). The joint with §36 is real: `push_batch` runs
+`decide_batch` once and filters the results in order, and the batch-driven and
+per-row-driven filters are asserted to produce the **same** event stream.
+
+Nothing consumes it yet — no trading loop, no agent loop, no backtest. The only
+caller is `omniseed demo-stream`. Full detail: **`docs/STREAMING.md`**.
 
 ### 8. Hierarchical routing — **PARTIAL (one level)**
 

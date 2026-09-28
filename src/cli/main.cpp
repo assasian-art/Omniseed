@@ -30,12 +30,14 @@
 #include "omniseed/core/platform.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tokenizer.h"
+#include "omniseed/decision_head.h"
 #include "omniseed/memory/memory.h"
 #include "omniseed/runtime/emotional.h"
 #include "omniseed/runtime/sensory.h"
 #include "omniseed/runtime/swarm.h"
 #include "omniseed/runtime/token_bus.h"
 #include "omniseed/soul.h"
+#include "omniseed/streaming_decision.h"
 #include "omniseed/vision/vision.h"
 #include "omniseed/vision/vision_tasks.h"
 
@@ -75,6 +77,7 @@ void print_usage() {
         "  demo-swarm                  Collaborative Swarm Protocol\n"
         "  demo-memory                 1M-token window + Memory Crystals\n"
         "  demo-soul                   persona + memory + recall + decay\n"
+        "  demo-stream                 streaming decisions (debounce+hysteresis)\n"
         "  demo-audio F.wav            sound events / scene / wake word\n"
         "  demo-vision                 pointer grounding + spatial map\n"
         "  dream                       Dream-State consolidation pass\n"
@@ -487,6 +490,195 @@ int cmd_demo_soul() {
         std::printf("\nEvery other memory of the same age is gone. That is the whole\n"
                     "mechanism: being recalled and used is what resets the clock.\n");
     }
+    std::printf("peak RSS: %.2f MB\n",
+                static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
+    return 0;
+}
+
+// ===========================================================================
+// Demo: streaming decisions (Milestone 9, Phase 2.2)
+//
+// MODEL-FREE ON PURPOSE. The filter's job is to make a head's output STABLE,
+// and whether it does that is a property of the FILTER, not of the head. Using
+// a seeded head keeps this runnable on a fresh clone with no GGUF — and the
+// output says plainly that an untrained head's actions mean nothing, so nobody
+// reads the numbers as a judgement.
+//
+// The headline number is the CHURN REDUCTION: how often the raw head output
+// flips, versus how often the committed action flips. That is the whole point
+// of the layer.
+// ===========================================================================
+int cmd_demo_stream() {
+    DecisionHead head;
+    if (!head.init(768, 4242u)) {
+        std::printf("decision head init failed: %s\n", head.error().c_str());
+        return 1;
+    }
+
+    std::printf("=== STREAMING DECISIONS: debounce + hysteresis + release ===\n\n");
+    std::printf("head   : %s\n", head.provenance().c_str());
+    std::printf("NOTE   : an UNTRAINED head's actions are meaningless. This demo\n");
+    std::printf("         exercises the filter, not the judgement.\n\n");
+
+    // --- the stream: the real held-out h[E] if present ----------------------
+    // Read through <fstream> rather than std::fopen: this translation unit does
+    // not define _CRT_SECURE_NO_WARNINGS, and it should not have to gain it for
+    // one demo.
+    std::vector<float> H;
+    int32_t n = 0;
+    const char* kFixture = "tests/fixtures/head_calibration/trading/hidden.f32";
+    {
+        std::ifstream in(kFixture, std::ios::binary | std::ios::ate);
+        if (in) {
+            const std::streamoff sz = in.tellg();
+            if (sz > 0 && (sz % 4) == 0) {
+                H.resize(static_cast<size_t>(sz) / sizeof(float));
+                in.seekg(0, std::ios::beg);
+                in.read(reinterpret_cast<char*>(H.data()),
+                        static_cast<std::streamsize>(sz));
+                H.resize(static_cast<size_t>(in.gcount()) / sizeof(float));
+                n = static_cast<int32_t>(H.size() / 768u);
+            }
+        }
+    }
+    const bool real = n > 0;
+    const int32_t B = real ? (n < 240 ? n : 240) : 0;
+
+    // A second, deliberately varied stream.
+    //
+    // The real held-out h[E] is the honest input, but an UNTRAINED head can be
+    // nearly CONSTANT on it — in which case there is no churn to remove and the
+    // filter has nothing to demonstrate. Both streams are reported, so the demo
+    // never looks better than it is.
+    //
+    // Stream C is the same noise amplified. A random h[E] lands near the centre
+    // of the seeded projection, so the logits barely separate and the head
+    // reports LOW confidence — which the filter correctly refuses to act on.
+    // Scaling the vector up widens the logit spread, so the same untrained head
+    // becomes CONFIDENT while still changing its mind every step. That is the
+    // exact situation the filter exists for.
+    std::vector<float> synth(static_cast<size_t>(240) * 768u, 0.0f);
+    {
+        uint64_t s = 0xC0FFEEull;
+        for (size_t i = 0; i < synth.size(); ++i) {
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            synth[i] = static_cast<float>((s >> 40) & 0xFFFFu) / 65536.0f - 0.5f;
+        }
+    }
+    std::vector<float> loud(synth.size(), 0.0f);
+    for (size_t i = 0; i < synth.size(); ++i) loud[i] = synth[i] * 8.0f;
+
+    std::printf("stream A: %d step(s) from %s\n", B,
+                real ? kFixture : "(fixture not found — skipped)");
+    std::printf("stream B: 240 step(s) of synthetic hidden states\n");
+    std::printf("stream C: the same 240 step(s), scaled x8 (confident but churning)\n\n");
+
+    // --- the two filter configurations --------------------------------------
+    StreamingConfig cc;
+    cc.mode          = StreamMode::Confirm;
+    cc.confirm_steps = 3;
+
+    StreamingConfig cw;
+    cw.mode          = StreamMode::Window;
+    cw.window        = 5;
+    cw.confirm_steps = 3;   // the vote quorum
+
+    // The Scalar kernel makes the batch path bit-identical to the per-row path
+    // (§36), so the numbers below do not depend on which path produced them.
+    head.set_batch_kernel(BatchKernel::Scalar);
+
+    // How often the RAW head output flips — the churn the filter exists to
+    // remove. Counted from the events, not assumed.
+    auto raw_churn = [](const std::vector<StreamEvent>& ev) {
+        int64_t c = 0;
+        for (size_t i = 1; i < ev.size(); ++i)
+            if (ev[i].observed_action != ev[i - 1].observed_action) ++c;
+        return c;
+    };
+    auto committed_churn = [](const std::vector<StreamEvent>& ev) {
+        int64_t c = 0;
+        for (const StreamEvent& e : ev) if (e.changed) ++c;
+        return c;
+    };
+
+    auto report = [&](const char* label, const std::vector<StreamEvent>& ev,
+                      const StreamingDecision& f) {
+        std::printf("--- %s ---\n", label);
+        std::printf("  %s\n", f.config().to_json().c_str());
+        const int64_t raw = raw_churn(ev);
+        const int64_t com = committed_churn(ev);
+        std::printf("  raw head output flipped %lld time(s); the committed action "
+                    "changed %lld time(s)\n",
+                    static_cast<long long>(raw), static_cast<long long>(com));
+        if (raw == 0)
+            std::printf("  churn reduction: n/a — the head never changed its mind\n");
+        else if (com == 0)
+            std::printf("  churn reduction: the head flipped %lld time(s) and the filter "
+                        "committed NOTHING\n", static_cast<long long>(raw));
+        else
+            std::printf("  churn reduction: %.1fx\n",
+                        static_cast<double>(raw) / static_cast<double>(com));
+        std::printf("  commits %lld, switches %lld, releases %lld, weak steps %lld\n",
+                    static_cast<long long>(f.commits()),
+                    static_cast<long long>(f.changes()),
+                    static_cast<long long>(f.releases()),
+                    static_cast<long long>(f.weak()));
+
+        int shown = 0;
+        int64_t total = 0;
+        for (const StreamEvent& e : ev) if (e.changed) ++total;
+        for (const StreamEvent& e : ev) {
+            if (!e.changed) continue;
+            if (shown >= 8) break;
+            std::printf("    step %3lld  %-8s -> %-8s  (evidence %d)\n",
+                        static_cast<long long>(e.step),
+                        decision_action_name(e.previous),
+                        decision_action_name(e.action),
+                        e.strength);
+            ++shown;
+        }
+        if (total > shown)
+            std::printf("    ... and %lld more\n", static_cast<long long>(total - shown));
+        if (!ev.empty())
+            std::printf("  last event: %s\n", ev.back().to_json().c_str());
+        std::printf("  final: %s\n", f.to_json().c_str());
+        std::printf("\n");
+    };
+
+    auto run = [&](const char* label, const std::vector<float>* data, int32_t count) {
+        std::printf("### %s\n", label);
+        if (data == nullptr || count <= 0) {
+            std::printf("  skipped: no data\n\n");
+            return;
+        }
+        StreamingDecision fc, fw;
+        fc.set_config(cc);
+        fw.set_config(cw);
+        fc.init(head);
+        fw.init(head);
+
+        std::vector<StreamEvent> ec, ew;
+        BatchStats stats;
+        if (!fc.push_batch(data->data(), count, ec, &stats)) {
+            std::printf("  push_batch failed: %s\n\n", fc.error().c_str());
+            return;
+        }
+        if (!fw.push_batch(data->data(), count, ew, nullptr)) {
+            std::printf("  push_batch failed: %s\n\n", fw.error().c_str());
+            return;
+        }
+        report("Confirm mode: N consecutive agreeing observations", ec, fc);
+        report("Window mode: a vote over a sliding window", ew, fw);
+    };
+
+    run("stream A — the real held-out h[E]", real ? &H : nullptr, B);
+    run("stream B — synthetic hidden states", &synth, 240);
+    run("stream C — synthetic, scaled x8 (confident but churning)", &loud, 240);
+
+    std::printf("What this shows: the same head, the same hidden states, and a\n");
+    std::printf("committed action that moves far less often than the raw output.\n");
+    std::printf("What it does NOT show: any judgement. The head is UNTRAINED, so\n");
+    std::printf("the ACTIONS above are placeholders. The FILTER is real.\n");
     std::printf("peak RSS: %.2f MB\n",
                 static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
     return 0;
@@ -1071,6 +1263,7 @@ int main(int argc, char** argv) {
     if (cmd == "demo-swarm")    { return cmd_demo_swarm(); }
     if (cmd == "demo-memory")   { return cmd_demo_memory(); }
     if (cmd == "demo-soul")     { return cmd_demo_soul(); }
+    if (cmd == "demo-stream")   { return cmd_demo_stream(); }
     if (cmd == "demo-vision")   { return cmd_demo_vision(); }
     if (cmd == "dream")         { return cmd_dream(); }
     if (cmd == "demo-audio")    {
