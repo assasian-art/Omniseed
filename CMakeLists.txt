@@ -753,6 +753,23 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_multimodal PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # MILESTONE 6 — HARD RULE 5 coverage for the four modules that had none
+    # (GrammarDecoder, ComputeThrottle, SelfImprovement, FocalCodec). All four
+    # are pure and model-free, so the whole suite is UNGATED and runs in CI.
+    add_executable(omniseed_agent_modules tests/test_agent_modules.cpp)
+    target_include_directories(omniseed_agent_modules PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_agent_modules PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_agent_modules PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_agent_modules PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_agent_modules COMMAND omniseed_agent_modules
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_agent_modules PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
     add_executable(omniseed_regime_dump tests/regime_dump.cpp)

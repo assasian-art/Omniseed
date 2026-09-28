@@ -3373,5 +3373,66 @@ suites re-run clean, so the new `rwkv.h` accessors broke nothing.
 3. **Coverage for the four untested modules** — `ComputeThrottle`,
    `SelfImprovement`, `GrammarDecoder`, `FocalCodec` (HARD RULE 5).
 
+---
+
+## 34. FULL MODULE COVERAGE — AND THE FOUR DEFECTS IT FOUND (2026-09-28)
+
+**Milestone 6. HARD RULE 5: "every new module gets tests".** §33 left four
+classes with no coverage at all, checked by CLASS NAME. This milestone closes
+that, and writing the tests immediately found **four real defects**.
+
+Full write-up: **`docs/AUDIT.md`** (which also records the mandate-vs-reality
+audit, since that is itself a deliverable).
+
+### ⚠️ The worst one: a feature that silently never worked
+
+`SelfImprovement::save()` wrote a `uint32_t` magic `0x54524953`;
+`load()` compared against the **string** `"SRIT"`. Little-endian, `0x54524953`
+is the bytes `'S','I','R','T'` — so the comparison **always failed**. `load()`
+rejected every file `save()` wrote.
+
+The failure was invisible: **an unreadable cache is indistinguishable from an
+empty one.** `src/cli/main.cpp` calls `imp.load("./state/improve.bin")` and has
+always got `false`, so the self-improvement trace cache **has never persisted
+across runs**. Fixed with one shared `kMagic` constant; pinned by C9.
+
+### The other three
+
+| defect | status | pin |
+|---|---|---|
+| `load()` read `klen`/`ns`/`sl` straight from the file and never bounds-checked them against the mapping — a truncated `state/improve.bin` walked off the end of the mmap | **FIXED** (`need()` before every read, a trace-count cap so a 12-byte file cannot drive a 4-billion `reserve()`, and a local vector swapped in only on full success so a failed load keeps the previous traces) | C7 |
+| `task_key()` did not trim **leading** whitespace (`last_ws` started `false`, and the trim loop only strips the END), so `"  read a file"` and `"read a file"` were two different keys and the exact-match replay lookup missed | **FIXED** (`last_ws = true`) | C1 |
+| `FocalCodec::encode()` computes a 4-bit bucket per band and then keeps **only its low bit** (`q & 1u`), discarding 3 of every 4 — the code is a 24-bit sign pattern, not the quantizer its comment describes | **PINNED** (changing it changes every emitted code; a fitted audio head would need retraining) | D6 |
+| `ComputeThrottle::classify()` matches Fast keywords by **substring**, so `"hi"` fires inside `"which"` — `classify("which stock should i buy today")` returns **Fast** and a real trading question gets 48 tokens / 0 thinking tokens | **PINNED** (thresholds are a tuned heuristic) | B6 |
+| `GrammarDecoder::accepts()` allows content after a complete object: `accepts("x")` is true on a decoder holding `{}`, and `feed("x")` reports `complete()` on the invalid `"{}x"` | **PINNED** (it gates constrained generation) | A8 |
+
+**Why three are pinned rather than fixed:** each has a behavioural contract
+that something downstream depends on. Changing what a codec emits, what a
+classifier returns, or what a generation loop is allowed to produce is a
+decision for the owner, not a silent edit. They are asserted so they cannot
+drift, and reported here so the cost is visible.
+
+### Tests
+
+`omniseed_agent_modules` — **131 checks, 0 failures, 0 skipped**, fully
+**UNGATED** (all four modules are pure and model-free, so the suite runs in CI).
+Part A `GrammarDecoder`, Part B `ComputeThrottle`, Part C `SelfImprovement`
+(including five distinct malformed-file shapes), Part D `FocalCodec`.
+
+**Full local board: 37/37 passed.** The board grew **36 → 37**; a fresh clone
+goes **22 → 23**. No pre-existing suite depends on the old `task_key` behaviour.
+
+### Coverage after this milestone
+
+**Every class in `src/` is referenced by at least one test.**
+
+### Next
+
+1. **Fit the vision/audio heads** (the largest verified absence).
+2. **Milestone 3 — dream consolidation** (still skipped).
+3. **Epistemic/aleatoric separation** — `core/uncertainty.h` gives entropy and
+   margin (a *total* uncertainty signal); the decomposition the mandate asks for
+   is absent, and the words appear nowhere in `include/` or `src/`.
+
 
 

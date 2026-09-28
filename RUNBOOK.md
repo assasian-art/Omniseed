@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-21 tests on a fresh clone (no `.venv`), **36** in a checkout that has one — see
+22 tests on a fresh clone (no `.venv`), **37** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -132,6 +132,7 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_soul.exe             # 378 checks, persona + memory + decay
 ./build/bin/omniseed_calibration.exe      # 180 checks, fitted heads + ECE
 ./build/bin/omniseed_multimodal.exe       # 110 checks, TokenBus + the joint
+./build/bin/omniseed_agent_modules.exe    # 131 checks, the last 4 uncovered modules
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
