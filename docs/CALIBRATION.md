@@ -195,6 +195,96 @@ closed.**
 
 ---
 
+## 4.4 `min_confidence` is DERIVED, not chosen — DECISION 1 (2026-09-29)
+
+The standing question after §39 was: `0.4966` sits 0.0034 below the filter's
+`0.50` bar, and that margin was a coincidence of two independently chosen
+numbers. §39 left it alone and printed the finding, which was the right call but
+not an answer. **DECISION 1 replaces the coincidence with a rule.**
+
+### The rule
+
+```
+chance = 1 / K                        K = 7 DecisionActions -> 0.142857
+accept a threshold iff               cumulative pool (conf >= T) has
+                                     accuracy >= 2 * chance  AND  n >= 30
+min_confidence = the LOWEST such threshold
+                  else  keep 0.50 fail-closed
+```
+
+Two clarifications that a naive reading gets wrong, both recorded because they
+change the answer:
+
+1. **The pool is cumulative, not per-bucket.** Rows below a threshold are not
+   discarded, they are *abstained* — and an abstain is a non-decision. What must
+   clear 2× chance is the pool the filter actually acts on: every row at or above
+   the threshold. The per-bucket table is printed too, but it is evidence, not
+   the criterion.
+2. **The scan refuses thresholds below `chance`.** A bar at or under 1/7 would
+   commit on rows the head admits it knows nothing about — the opposite of a
+   confidence gate. This floor was not in the first version of the scan, and the
+   DECISION-1 control test immediately caught it choosing `T = 0.0` for a
+   confidently-correct synthetic pool. A rule that can only ever return its own
+   fallback is not a rule, so the control exists to prove it *can* say yes.
+
+### The measured curve (held out, calibrated)
+
+```
+fixture  tests/fixtures/head_calibration/trading   369 rows (train 258 / holdout 111)
+T = 20.0427      holdout acc 0.1441      ECE 0.0687      chance 0.1429
+accept bar = 2/7 = 0.285714
+
+confidence bucket      n     emp.acc   mean.conf
+[0.15, 0.20)          41     0.1463     0.1861
+[0.20, 0.25)          59     0.1525     0.2186
+[0.25, 0.30)           8     0.1250     0.2704
+[0.30, 0.35)           3     0.0000     0.3117
+```
+
+**The entire holdout confidence range is 0.15 – 0.3117.** The two buckets with
+`n >= 30` reach 0.1463 and 0.1525 against a 0.2857 bar. The best cumulative pool
+of `n >= 30` (43 rows) reaches **0.1923**. Nothing comes within 0.09 of the bar.
+
+### The derived value
+
+```
+DERIVED min_confidence = 0.500000
+because: NO threshold satisfies both conditions (>= 2x chance on the cumulative
+         pool AND n >= 30). Keeping the fail-closed default 0.50 — that is a
+         valid outcome, not a failure.
+```
+
+**`min_confidence` stays 0.50, fail-closed, and it is now a derived conclusion
+rather than a retained default.** The stronger finding: the trading action head
+has **no usable confidence signal at all** — its accuracy (0.1441) is
+statistically indistinguishable from chance (0.1429), so *no* threshold could have
+been principled. §39's "reported, not tuned" was the honest interim answer;
+DECISION 1 is the proof that there was nothing to tune to.
+
+### Paper only (L0)
+
+This threshold gates **paper commits**. It does not gate, loosen or inform any
+live-money path — that gate is separate and C++-enforced (mandate rule 4).
+
+### Reproducing and gating
+
+```bash
+.venv/Scripts/python.exe tools/derive_threshold.py      # writes tools/threshold_curve.json
+./build/bin/omniseed_threshold_derivation.exe           # re-derives from the BLOB
+```
+
+Both paths must agree. The Python tool reproduces the fit from the fixture
+(`chronological_split` + `fit_one(shuffle=False)`, deterministic — two runs give
+byte-identical JSON). The C++ test re-derives the curve from the **committed
+blob** through `DecisionHead::decide()`, applying the same rule, and asserts the
+result equals this documented value: **23 checks, 0 fail, 0 skip.** It also
+asserts the answer is the *fallback reached because nothing passed* — not a
+threshold that happened to equal 0.50 — and it carries three controls proving the
+rule can accept a good pool, reject a confident-wrong one, and reject a
+below-chance one.
+
+---
+
 ## 5. Findings worth keeping
 
 1. **One temperature per label set, not one per head.** A single pooled `T`

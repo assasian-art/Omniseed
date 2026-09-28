@@ -869,6 +869,28 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_feedback_hook PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # DECISION 1 — the min_confidence threshold is DERIVED from the fitted
+    # head's calibration curve, never hand-picked. This test re-derives it from
+    # the committed blob on every run and asserts it equals the value
+    # documented in docs/CALIBRATION.md. It also asserts the rule CAN say "yes"
+    # (a confidently-correct synthetic pool passes, a confidently-wrong one
+    # does not), because a rule that can only ever return the fallback is not a
+    # rule. Gated on the fixture + blob: absent inputs SKIP with a visible
+    # reason rather than passing vacuously.
+    add_executable(omniseed_threshold_derivation tests/test_threshold_derivation.cpp)
+    target_include_directories(omniseed_threshold_derivation PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_threshold_derivation PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_threshold_derivation PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_threshold_derivation PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_threshold_derivation COMMAND omniseed_threshold_derivation
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_threshold_derivation PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
     add_executable(omniseed_regime_dump tests/regime_dump.cpp)

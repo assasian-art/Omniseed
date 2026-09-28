@@ -512,6 +512,15 @@ int cmd_demo_soul() {
 // ===========================================================================
 static const char* const kFittedDecisionHead = "models/heads/trading_head.bin";
 
+// The value DERIVED by DECISION 1 (tools/derive_threshold.py + the gated test
+// omniseed_threshold_derivation). It is the fail-closed default 0.50, and it is
+// 0.50 because the rule found no threshold whose cumulative pool reached twice
+// chance — NOT because someone liked 0.50. See docs/CALIBRATION.md §4.4.
+//
+// PAPER ONLY (L0): this bar gates PAPER commits. Live money is gated separately
+// and that gate is C++-enforced; nothing here loosens it.
+static constexpr float kDerivedMinConfidence = 0.50f;
+
 // Returns true when a FITTED head is in place. `head` is always ready.
 static bool load_decision_head(DecisionHead& head) {
     if (!head.init(768, 4242u)) return false;
@@ -526,6 +535,16 @@ static bool load_decision_head(DecisionHead& head) {
                     "actions below are placeholders.\n");
     }
     return head.trained();
+}
+
+// Build the filter config the demos share: the DECISION 1 threshold, with the
+// head's own calibrated max as the switch bar's companion. Kept in one place so
+// demo-stream and demo-feedback cannot drift apart on the number that decides
+// whether anything is ever committed.
+static StreamingConfig demo_filter_config() {
+    StreamingConfig c;
+    c.min_confidence = kDerivedMinConfidence;
+    return c;
 }
 
 // ===========================================================================
@@ -552,6 +571,12 @@ int cmd_demo_stream() {
     if (!fitted)
         std::printf("NOTE   : an UNTRAINED head's actions are meaningless. This demo\n"
                     "         exercises the filter, not the judgement.\n");
+    // State the bar and WHY it is what it is, so a reader never has to guess
+    // whether 0.50 was chosen or computed.
+    std::printf("filter : min_confidence=%.2f — DERIVED (DECISION 1), not chosen;\n"
+                "         no threshold's pool reached 2x chance, so it stays "
+                "fail-closed\n",
+                kDerivedMinConfidence);
     std::printf("\n");
 
     // --- the stream: the real held-out h[E] if present ----------------------
@@ -608,11 +633,13 @@ int cmd_demo_stream() {
     std::printf("stream C: the same 240 step(s), scaled x8 (confident but churning)\n\n");
 
     // --- the two filter configurations --------------------------------------
-    StreamingConfig cc;
+    // min_confidence comes from demo_filter_config() so that the number the
+    // filter commits behind is the DECISION-1 derived value in ONE place.
+    StreamingConfig cc = demo_filter_config();
     cc.mode          = StreamMode::Confirm;
     cc.confirm_steps = 3;
 
-    StreamingConfig cw;
+    StreamingConfig cw = demo_filter_config();
     cw.mode          = StreamMode::Window;
     cw.window        = 5;
     cw.confirm_steps = 3;   // the vote quorum
@@ -864,6 +891,9 @@ int cmd_demo_feedback() {
         c.mode = r.mode;
         c.confirm_steps = 3;
         c.window = 5;
+        // DECISION 1: the bar is DERIVED from the calibration curve, not chosen.
+        // See demo_filter_config() and docs/CALIBRATION.md §4.4.
+        c.min_confidence = kDerivedMinConfidence;
         f.set_config(c);
 
         std::vector<StreamEvent> ev;
