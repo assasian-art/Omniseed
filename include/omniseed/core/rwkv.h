@@ -201,6 +201,18 @@ private:
     // Used to load the embedded tokenizer without reopening the file.
     const GgufLoader& gguf_store() const { return store_; }
 
+    // The token embedding matrix [n_vocab, n_embd], F16.
+    //
+    // Exposed so the multimodal bridge can quantize a CONTINUOUS modality
+    // embedding (vision/audio features, which the encoders already project to
+    // n_embd) to the nearest vocabulary token id — the codebook IS the
+    // embedding matrix, so no second copy of the weights is needed and the
+    // modality lands in the same discrete space the core already reasons in.
+    // A non-owning view: it dies with the model.
+    const Tensor& token_embeddings() const { return emb_; }
+    int32_t vocab_size() const { return cfg_.n_vocab; }
+    int32_t n_embd()     const { return cfg_.n_embd; }
+
     // Owns the mmap the ternary/f16 tensor views point into. MUST outlive
     // every view: a local GgufLoader in load() unmaps on return and the
     // first forward() segfaults.

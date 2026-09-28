@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-21 tests on a fresh clone (no `.venv`), **35** in a checkout that has one — see
+21 tests on a fresh clone (no `.venv`), **36** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -131,6 +131,7 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_language_heads.exe   # 614 checks
 ./build/bin/omniseed_soul.exe             # 378 checks, persona + memory + decay
 ./build/bin/omniseed_calibration.exe      # 180 checks, fitted heads + ECE
+./build/bin/omniseed_multimodal.exe       # 110 checks, TokenBus + the joint
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
@@ -353,6 +354,46 @@ confidence, and check `trained()` before trusting the head at all.
 right **24%** of the time — calibration makes it *safe* (max confidence 0.4966,
 so it self-routes **0/369** rows and escalates everything), not *good*. Read
 `docs/CALIBRATION.md` §6 before using any of these numbers.
+
+### Multi-modal — an image becomes h[E]
+
+The vision and audio encoders were always real; nothing joined them to the head
+stack. `MultimodalBridge` is that join, and it is small on purpose.
+
+```cpp
+#include "omniseed/multimodal.h"
+using namespace omniseed;
+
+MultimodalBridge bridge;
+bridge.init(model.config().n_embd, tok);          // tok must outlive the bridge
+bridge.set_codebook(model.token_embeddings());    // non-owning: the model owns it
+
+// vision_rows is an encoder's output, row-major [M, n_embd]. audio_codes come
+// from FocalCodec/WhisperTiny and are already ids, so they pass straight through.
+auto f = bridge.fuse("describe the chart", vision_rows, audio_codes);
+if (!f.ok) {
+    // FAIL CLOSED. A failed fusion is NOT an empty one — read f.error.
+}
+
+// Run the fused stream through the backbone, then let a head read the h[E].
+RwkvState st; model.init_state(st);
+Tensor logits("logits", {model.vocab_size()}, DType::F32);
+Tensor hidden("hidden", {model.config().n_embd}, DType::F32);
+for (int32_t id : f.ids) model.forward(id, st, logits, &hidden);
+
+auto r = pipe.classifier().classify(hidden.f32(), "vision.scene");
+```
+
+The codebook **is** the model's token embedding matrix, so the modality lands in
+the discrete space `forward()` accepts with no training and no extra RAM.
+
+⚠️ **The vision/audio heads are UNFITTED.** They report the base rate — or, worse,
+a confident-looking seeded number (measured: `vision.scene` printed **0.997** on
+a seeded projection). The joint works; the heads behind it do not yet know
+anything. See `docs/MULTIMODAL.md` §5.
+
+`codebook_stride` is a **real accuracy/speed dial**: with `stride = 2`, a token
+whose nearest embedding row has an odd index is unreachable.
 
 ### Re-training the heads (offline only)
 

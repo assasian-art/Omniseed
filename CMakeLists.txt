@@ -58,6 +58,10 @@ set(OMNISEED_CORE_SOURCES
     src/scoring_head.cpp
     src/domain_decision.cpp
     src/unified_output.cpp
+    # THE JOINT: joins the vision/audio encoders and the TokenBus to the head
+    # stack. Everything it composes already existed; nothing turned an image or
+    # a recording into the h[E] the heads read. This is that join.
+    src/multimodal.cpp
     # The soul: persona + emotional resonance + honest self-report. Composes
     # runtime/emotional and runtime/introspection, which existed but had no
     # caller, into something the unified document can carry.
@@ -729,6 +733,25 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_calibration COMMAND omniseed_calibration
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_calibration PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # MILESTONE 5 — the multimodal joint. Part A/B (TokenBus + MultimodalBridge)
+    # are UNGATED: they build a minimal tokenizer and a synthetic codebook, so
+    # they run everywhere including CI. TokenBus had zero tests before this.
+    # Part C is gated on models/rwkv7-0.1B-ternary.gguf and prints a SKIP reason
+    # when it is absent.
+    add_executable(omniseed_multimodal tests/test_multimodal.cpp)
+    target_include_directories(omniseed_multimodal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_multimodal PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_multimodal PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_multimodal PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_multimodal COMMAND omniseed_multimodal
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_multimodal PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.

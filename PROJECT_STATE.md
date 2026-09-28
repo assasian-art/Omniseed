@@ -3258,5 +3258,120 @@ silently drift every metric in the fixture.
    floor set by the rule, not by the head.
 3. Re-derive `min_relevance` / `duplicate_recall_score` against a real vocabulary.
 
+---
+
+## 33. THE MULTIMODAL JOINT — AN IMAGE BECOMES h[E] (2026-09-28)
+
+**Milestone 5.** §32 numbered this section §32, so the next is §33 — the
+"MASTER EXHAUSTIVE BUILD MANDATE" predicted §34 because it assumed §33 was
+already spent. It was not.
+
+### The audit that changed the plan
+
+The mandate listed ~60 capabilities as missing. **Most already existed.** An
+audit before building found `src/vision/` (659 lines), `src/audio/` (1,626 lines
+incl. a 1,082-line Whisper-tiny), `runtime/{token_bus,emotional,sensory,swarm,
+introspection,cloud_bridge}`, `memory/{memory_crystals,prefix_cache,
+streaming_llm}`, `agent/{sub_agents,flash_skills,agent_loop,agent_intel,
+self_improvement,grammar_decoder,tool_registry,compute_throttle}`, and
+`core/uncertainty.h` — **all real, all in `OMNISEED_CORE_SOURCES`, zero orphans
+in `src/`.** Vision already had `PointerPerception`, `SpatialContextMapper`,
+`MotionTracker`, `GestureRecognizer`. Audio already had `WhisperTiny`,
+`FocalCodec`, `SoundEventDetector`, and `WakeWordDetector::enroll()` — the
+mandate's "voice enroll for owner identity".
+
+`TokenBus` even documented its own job as *"fuses text, vision and audio token
+streams into ONE unified sequence for the RWKV core"* — and had **zero tests**.
+Nothing anywhere turned an image into the `h[E]` the heads read. **As in §30 and
+§31, the gap was the joint, not the capability.**
+
+### The impedance mismatch, and the fix
+
+```
+VisionEncoder::encode()  -> Tensor [M, n_embd]    CONTINUOUS
+FocalCodec::encode()     -> vector<int32_t>       ids
+TokenBus::fuse()         -> wants vector<int32_t> for EVERY modality
+RwkvModel::forward()     -> takes int32_t token
+```
+
+Audio already fit; **vision did not**. `MultimodalBridge`
+(`include/omniseed/multimodal.h`, `src/multimodal.cpp`) closes that one gap by
+quantizing a vision embedding to the **nearest vocabulary token using the
+model's own embedding matrix as the codebook**. No training, no extra RAM (one
+new accessor, `RwkvModel::token_embeddings()`, a non-owning view), and the
+modality lands in the discrete space `forward()` accepts. It re-implements no
+encoder, tokenizer or bus.
+
+### Two bugs the tests exist to prevent
+
+1. **The early-out needs a flag.** Abandoning a candidate row when its partial
+   sum exceeds the best-so-far is what makes a 65,536-row scan affordable — but
+   the partial sum then compares as *smaller* than `best_d`, so without a
+   `worse` flag the row is accepted **precisely because it was cut short**.
+2. **A NaN must not win.** Every comparison against NaN is false, so a NaN query
+   would be "nearest" to the first row examined. The query is finiteness-checked
+   before the scan.
+
+Two design rules, both tested: **a modality that was supplied is never silently
+dropped** (vision with no codebook FAILS with a reason rather than answering
+from text alone), and **a failed fusion is not an empty one** (`ok == false`
+always carries an `error`).
+
+### ⭐ The finding: the joint works, and the head still lies
+
+C1 runs the real chain against `models/rwkv7-0.1B-ternary.gguf`:
+
+```
+fused 10 tokens (text 3, vision 4, audio 0)
+vision.scene top1 = urban (0.997)   <- head is UNFITTED
+```
+
+An image became 4 vocabulary ids, wrapped in `<|vision|> … </|vision|>`, ran
+through the backbone, and its `h[E]` was read by a head. **And that unfitted
+head printed 0.997.** This is §32's entire argument restated on a new modality:
+a seeded projection emits a confident number with no knowledge behind it.
+
+### Tests
+
+`omniseed_multimodal` — **110 checks, 0 failures, 0 skipped**, registered
+**outside** the `.venv` gate. Part A is the **first test `TokenBus` has ever
+had** (7 checks). Part B is ungated (a minimal tokenizer + a synthetic basis
+codebook, so it runs in CI). Part C is gated on the model and prints a SKIP
+reason without it. `codebook_stride` is pinned as a **real accuracy dial**: with
+`stride = 2` a token whose nearest row has an odd index is unreachable.
+
+**Full local board: `ctest --test-dir build -C Release` → 36/36 passed**
+(3381 s). The board grew **35 → 36**; a fresh clone goes **21 → 22** (the
+multimodal suite is registered outside the gate). All six pre-existing head
+suites re-run clean, so the new `rwkv.h` accessors broke nothing.
+
+### Honest gaps (do not overclaim)
+
+- **`vision.scene`, `vision.anomaly`, `audio.wake`, `audio.emotion`,
+  `audio.speaker` are UNFITTED.** They have label sets and no weights. This
+  milestone built the pipe, not the water — they need exactly the §32 treatment.
+- **The codebook is untrained and lossy.** It is not a learned modality adapter.
+- **The audio joint is untested at real-weights level.** `FocalCodec`/`Whisper`
+  produce ids that fit the bus directly, but no test runs a wav through the
+  whole chain.
+- **`VisionEncoder` is not called in C1** — it needs `models/vision-proj.gguf`
+  and has its own suite; C1 isolates the join with synthetic `[M, E]` rows.
+- **Still zero coverage — four modules**, checked by CLASS NAME, not filename:
+  `ComputeThrottle`, `SelfImprovement`, `GrammarDecoder`, `FocalCodec`. A
+  filename grep is a proxy and it lied: `VisionEncoder`/`UniCompress`
+  (`test_sides.cpp`), `WhisperTiny`/`SoundEventDetector`/`WakeWordDetector`
+  (`test_platform.cpp`), `StreamingLlm` (`test_platform.cpp:933`),
+  `ToolRegistry` and `AgentLoop` are all already exercised. HARD RULE 5 ("every
+  new module gets tests") remains unmet for those four.
+- **No `demo-multimodal` CLI**; the bridge is reachable from C++ and the test.
+
+### Next
+
+1. **Fit the vision/audio heads** — collect `h[E]` with `tools/dump_hidden.cpp`,
+   extend `tools/train_heads.py`, calibrate, store `models/heads/vision_head.bin`.
+2. **Milestone 3 — dream consolidation** (still skipped).
+3. **Coverage for the four untested modules** — `ComputeThrottle`,
+   `SelfImprovement`, `GrammarDecoder`, `FocalCodec` (HARD RULE 5).
+
 
 
