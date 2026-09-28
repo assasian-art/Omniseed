@@ -3918,8 +3918,10 @@ in CI. A fresh clone goes **24 → 25**.
      `vision.anomaly` {normal, unusual}, `audio.wake` {yes, no},  
      `audio.emotion` {happy, sad, angry, neutral},  
      `audio.speaker` {known, unknown}.
-   - No labelled corpus exists for any of them, and there is no committed  
-     image/audio fixture. Both are prerequisites.
+   - No labelled corpus exists for any of them. **Corrected in §40:** a committed
+     *audio* fixture DOES exist (`tests/fixtures/*.wav`, 3 LibriSpeech clips with
+     transcripts) — it is simply not labelled for any of the three audio sets.
+     No image exists at all.
    - The backbone is present (`models/rwkv7-0.1B-ternary.gguf`, 243 MB) and so  
      are the encoders (`models/vision-proj.gguf`, `models/whisper-tiny-encoder.gguf`).
    - ⚠️ **§39's lesson applies:** before building a trainer, check whether the  
@@ -3932,3 +3934,54 @@ in CI. A fresh clone goes **24 → 25**.
 4. **Point the backtest at the batched path** — `src/trading/simulate.cpp` still  
    re-derives its readouts bar by bar.
 5. **Fit a head ensemble** so §35's `from_ensemble()` has something to eat.
+
+## 40. VISION/AUDIO RECONNAISSANCE — the absence is the DATA (2026-09-28)
+
+**A reconnaissance milestone. No code, and it says so.** Step 3 of the reorder is
+"vision/audio head fitting". Before building a trainer, §39's lesson says to check
+whether the missing thing is the *weights* or the *joint* — and to check the
+premises, because this project has now mistaken one for the other four times.
+
+### What the audit found
+
+| premise                                          | verdict                                                                                                                                     |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| The joint exists                                 | **TRUE.** `MultimodalBridge` (`src/multimodal.cpp`) turns a continuous modality embedding into the discrete token space; it is **already tested** (`tests/test_multimodal.cpp`). §33 built it. |
+| The encoders exist                               | **TRUE.** `models/vision-proj.gguf` (40 KB), `models/whisper-tiny-encoder.gguf` (76 MB), backbone `models/rwkv7-0.1B-ternary.gguf` (243 MB). |
+| The label sets exist                             | **TRUE.** 13 sets; **5 fitted** (§32), **8 unfitted**.                                                                                       |
+| The dump path exists                             | **FALSE.** `tools/dump_hidden.cpp` supports only `language` and `market`. A `vision`/`audio` mode is genuinely missing code.                 |
+| A labelled vision corpus exists                  | **FALSE.** Zero images anywhere in the tree.                                                                                                 |
+| A labelled audio corpus exists                   | **FALSE — but a fixture does.** 3 LibriSpeech `.wav` clips are committed, **with transcripts** (`manifest.txt`: `expected_text=Experience proves this.`). They are ASR fixtures: they label *what was said*, not `audio.wake`/`audio.emotion`/`audio.speaker`. |
+
+### The 8 unfitted label sets, and what each actually needs
+
+| label set          | labels                            | what a corpus would need                              |
+| ------------------ | --------------------------------- | ----------------------------------------------------- |
+| `language.task`    | answer, chat, search, execute     | derivable from text — **the only one buildable today** |
+| `vision.scene`     | indoor, outdoor, nature, urban    | a labelled image set (none present)                    |
+| `vision.anomaly`   | normal, unusual                   | a labelled anomaly set (none present)                  |
+| `audio.wake`       | yes, no                           | wake-word recordings (3 read-speech clips are not it)  |
+| `audio.emotion`    | happy, sad, angry, neutral        | an emotional-speech set                                |
+| `audio.speaker`    | known, unknown                    | speaker-annotated recordings                           |
+| `general.routing`  | trading, language, vision, audio  | derivable from the other domains' labels               |
+| `general.priority` | urgent, normal, low               | a judgement call — no objective label exists           |
+
+### Verdict
+
+> **The vision/audio absence is the DATA, not the code — with one code exception.**
+> The joint exists and is tested; the encoders exist; the label sets exist. What is
+> missing is (a) the `vision`/`audio` dump mode and (b) a labelled corpus for 6 of
+> the 8 unfitted sets. Building a trainer now would produce a head that *looks*
+> trained and is meaningless — the exact invisible failure `dump_hidden.cpp`'s own
+> honesty contract forbids ("a missing file is a visible failure, a fake fit is an
+> invisible one").
+
+So step 3 splits into what can be done honestly and what cannot:
+
+1. **Buildable now:** the `vision`/`audio` dump modes (routed through
+   `MultimodalBridge` so the dumped `h[E]` is the *same* `h[E]` the runtime
+   produces), and `language.task` + `general.routing`, which are derivable from
+   data already in the tree.
+2. **Blocked on data:** `vision.scene`, `vision.anomaly`, `audio.wake`,
+   `audio.emotion`, `audio.speaker`, `general.priority`. These need a real
+   dataset. **Reported, not faked.**
