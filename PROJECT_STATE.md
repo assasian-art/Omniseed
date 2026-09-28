@@ -3985,3 +3985,83 @@ So step 3 splits into what can be done honestly and what cannot:
 2. **Blocked on data:** `vision.scene`, `vision.anomaly`, `audio.wake`,
    `audio.emotion`, `audio.speaker`, `general.priority`. These need a real
    dataset. **Reported, not faked.**
+
+## 42. DECISION 2 — MODALITY DATA ACQUISITION, and one real bug it found (2026-09-29)
+
+**Step 3's data half.** §40 said the vision/audio absence is the DATA. This is the
+acquisition plan, as runnable code, plus whatever could be fetched honestly.
+
+### What was fetched
+
+| set | source | licence | size | result |
+| --- | ------ | ------- | ---- | ------ |
+| `audio.emotion` | RAVDESS | CC BY-NC-SA (research) | 199 MB | ✅ **672 clips** installed, 768 dropped |
+
+```
+  angry 192    happy 192    sad 192    neutral 96        (24 actors, 48 kHz)
+```
+
+Two properties of the real data that a fitter must know, both measured:
+
+- **Class imbalance 2:2:2:1** — RAVDESS records two statements per emotion but
+  only one neutral. A fitter that ignores this over-predicts.
+- **48 kHz, not 16 kHz** — see the bug below.
+
+`vision.scene` (CIFAR-10) was **attempted and abandoned**: the Toronto mirror
+stalled for 23 minutes on 163 MB and was stopped. No partial landed. The tool has
+no stall-timeout, which is a **known gap** — recorded, not hidden.
+
+### What was NOT fetched, and why (the honest half)
+
+| set | verdict |
+| --- | ------- |
+| `audio.wake` | Speech Commands v2 is a **2.26 GB monolithic archive**; per-clip URLs return **403** and the bucket forbids anonymous listing, so there is no subset fetch. **Preferred route: `omniseed enroll-audio`.** |
+| `audio.speaker` | The 3 in-tree LibriSpeech clips are **ASR fixtures** (they label *what was said*, not *who*). `unknown` needs other speakers and is **not solved** — recorded as partial. |
+| `vision.anomaly` | Needs no corpus: the label **is** the transform. Deferred until scene images exist. |
+| `general.priority` | **No objective label exists.** Stays unfitted permanently; inventing one would mean reporting our own fabrication back to ourselves. |
+
+### `omniseed enroll-audio` — the owner-voice path (new)
+
+Takes a directory of WAVs named `<label>_<anything>.wav`, writes `labels.tsv`,
+and **reports+skips** unreadable or misnamed files rather than folding them into
+a label — a mislabelled enrolment sample is a permanently wrong head.
+
+**Why files and not a microphone:** there is no capture code in this tree and
+adding WASAPI would be a platform dependency the project avoids (`wsl.exe`/
+`cmd.exe` blacklisted, plain MSVC+CMake). A file-based enrolment is also
+**reproducible** — the exact WAVs are named, so the fit re-runs identically.
+
+Smoke-tested on 5 valid + 2 bad files: `no 3 / yes 2`, both bad files named,
+manifest written.
+
+### ⚠️ A real bug this milestone found — the silent 48 kHz mel
+
+`PcmAudio::load_wav` faithfully recorded the file's own `sample_rate` (48 kHz for
+RAVDESS) but **nothing converted it**, while `WhisperTiny`'s log-mel filterbank is
+built for 16 kHz. A 48 kHz file would therefore have produced a spectrogram whose
+bins mean something else — **silently, with no error**. That is the §34
+silent-failure shape exactly (an unreadable input ≡ a valid one).
+
+Fixed in `src/audio/whisper_tiny.cpp`: `load_wav_bytes` now resamples to 16 kHz
+and **logs the conversion** (`"resampled 48000 Hz -> 16000 Hz (180980 -> 60326
+samples)"`). Linear interpolation rather than a windowed sinc, with the reason
+recorded in the code: at 3× decimation the aliasing difference is far below the
+mel filterbank's own resolution, and a resampler needing its own test suite would
+be a second thing to get wrong.
+
+### Files
+
+| file | what |
+| ---- | ---- |
+| `tools/get_modality_data.py` | the plan + fetch, with a hard size budget (NEW) |
+| `docs/VISION_AUDIO_DATA.md` | the full write-up (NEW) |
+| `src/cli/main.cpp` | `enroll-audio` (NEW command) |
+| `src/audio/whisper_tiny.cpp` | the 48 kHz → 16 kHz resampler (BUG FIX) |
+
+### Next
+
+1. Fetch `vision.scene` from a working mirror; add a **stall timeout** to the tool.
+2. `vision`/`audio` modes in `dump_hidden.cpp` via `MultimodalBridge`.
+3. Fit `language.task` + `general.routing` (no external data needed).
+4. Re-run §35 so `provenance()` flips to TRAINED per set — and stays visibly
+   unfitted for `general.priority` and the `indoor`/`urban` labels.

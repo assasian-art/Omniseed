@@ -50,6 +50,8 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -81,6 +83,7 @@ void print_usage() {
         "  demo-stream                 streaming decisions (debounce+hysteresis)\n"
         "  demo-feedback               prediction -> outcome -> persisted record\n"
         "  demo-audio F.wav            sound events / scene / wake word\n"
+        "  enroll-audio D set          build an owner-voice dataset from D/*.wav\n"
         "  demo-vision                 pointer grounding + spatial map\n"
         "  dream                       Dream-State consolidation pass\n"
         "\n"
@@ -1027,6 +1030,118 @@ int cmd_demo_audio(const std::string& path) {
 }
 
 // ===========================================================================
+// enroll-audio — the OWNER-VOICE dataset builder (DECISION 2)
+//
+// WHY THIS EXISTS INSTEAD OF A DOWNLOAD. Two of the three audio label sets
+// (audio.wake, audio.speaker) are fitted on a voice, and the useful voice is the
+// owner's: a wake head fitted on 3,000 strangers from a 2017 corpus is fitted on
+// the wrong distribution, and a speaker head can only "know" a speaker it has
+// heard. Both are also licence-free by construction.
+//
+// WHY IT TAKES FILES AND NOT A MICROPHONE. There is no capture code in this tree
+// and adding WASAPI would be a platform dependency this project has deliberately
+// avoided (wsl.exe/cmd.exe are blacklisted; the build is plain MSVC + CMake).
+// More importantly, a file-based enrolment is REPRODUCIBLE: the owner records
+// with any tool, the exact WAVs are named in the manifest, and the fit can be
+// re-run byte-identically. A microphone path would make the dataset a side
+// effect of one afternoon's room noise.
+//
+// THE CONTRACT. <dir> contains a flat set of WAVs whose FILENAME carries the
+// label, in the form  <label>_<anything>.wav  (e.g. yes_01.wav, known_a.wav).
+// Files that do not parse are REPORTED and skipped — never silently folded into
+// a label, because a mislabelled enrolment sample is a permanently wrong head.
+// ===========================================================================
+int cmd_enroll_audio(const std::string& dir, const std::string& set_name) {
+    namespace fs = std::filesystem;
+
+    std::printf("=== ENROL AUDIO: building the '%s' dataset (owner voice) ===\n\n",
+                set_name.c_str());
+
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        std::printf("not a directory: %s\n", dir.c_str());
+        std::printf("record some WAVs (16-bit mono; any rate is resampled) named\n"
+                    "  <label>_<n>.wav   e.g. yes_01.wav  no_01.wav\n"
+                    "and put them in a folder, then re-run.\n");
+        return 1;
+    }
+
+    std::vector<std::string> files;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file()) continue;
+        std::string p = e.path().string();
+        std::string low = p;
+        for (char& c : low)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (low.size() > 4 && low.compare(low.size() - 4, 4, ".wav") == 0)
+            files.push_back(p);
+    }
+    std::sort(files.begin(), files.end());   // deterministic manifest order
+    if (files.empty()) {
+        std::printf("no .wav files in %s\n", dir.c_str());
+        return 1;
+    }
+
+    std::map<std::string, int> per_label;
+    std::vector<std::string> rows;
+    int skipped = 0;
+    for (const std::string& p : files) {
+        const std::string base = fs::path(p).filename().string();
+        const size_t us = base.find('_');
+        if (us == std::string::npos || us == 0) {
+            std::printf("  SKIP  %-30s (no '<label>_' prefix)\n", base.c_str());
+            ++skipped;
+            continue;
+        }
+        const std::string label = base.substr(0, us);
+        PcmAudio a;
+        if (!PcmAudio::load_wav(p, a) || !a.valid()) {
+            std::printf("  SKIP  %-30s (unreadable WAV)\n", base.c_str());
+            ++skipped;
+            continue;
+        }
+        ++per_label[label];
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "%s\t%s\towner\t%d\t%zu", base.c_str(),
+                      label.c_str(), a.sample_rate, a.samples.size());
+        rows.push_back(buf);
+    }
+
+    if (rows.empty()) {
+        std::printf("\nno usable clips — nothing written.\n");
+        return 1;
+    }
+
+    std::printf("\n  clips by label:\n");
+    for (const auto& kv : per_label)
+        std::printf("    %-12s %d\n", kv.first.c_str(), kv.second);
+    std::printf("  skipped %d\n", skipped);
+
+    // WARN, but do not fail: a single-sample class cannot be split, so the
+    // fitter will report it unfitted. Saying so here saves a confusing run.
+    for (const auto& kv : per_label) {
+        if (kv.second < 2)
+            std::printf("  WARNING: label '%s' has ONE clip — it cannot be split "
+                        "and will fit as UNFITTED\n", kv.first.c_str());
+    }
+
+    const std::string mpath = (fs::path(dir) / "labels.tsv").string();
+    std::ofstream mf(mpath, std::ios::binary);
+    if (!mf) {
+        std::printf("cannot write %s\n", mpath.c_str());
+        return 1;
+    }
+    mf << "file\t" << set_name << "\tgroup\tsample_rate\tn_samples\n";
+    for (const std::string& r : rows) mf << r << "\n";
+    mf.close();
+    std::printf("\n  wrote %s (%zu row(s))\n", mpath.c_str(), rows.size());
+    std::printf("  every clip is reported at its LOADED rate; the loader resamples\n"
+                "  to 16000 and says so, so a 48 kHz recording is not silently "
+                "mis-melled.\n");
+    return 0;
+}
+
+// ===========================================================================
 // Demo: vision tasks (features #2, #54, #61, #66, #69)
 // ===========================================================================
 int cmd_demo_vision() {
@@ -1568,6 +1683,15 @@ int main(int argc, char** argv) {
     if (cmd == "demo-audio")    {
         if (argc < 3) { std::printf("usage: omniseed demo-audio F.wav\n"); return 1; }
         return cmd_demo_audio(argv[2]);
+    }
+    if (cmd == "enroll-audio")  {
+        if (argc < 3) {
+            std::printf("usage: omniseed enroll-audio <dir> [label-set]\n"
+                        "  <dir> must hold WAVs named <label>_<anything>.wav\n"
+                        "  [label-set] defaults to audio.wake\n");
+            return 1;
+        }
+        return cmd_enroll_audio(argv[2], argc >= 4 ? argv[3] : "audio.wake");
     }
     if (cmd == "gen")      { if (s.prompt.empty()) { print_usage(); return 1; }
                              return cmd_gen(s); }

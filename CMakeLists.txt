@@ -891,6 +891,23 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_threshold_derivation PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper
+    # log-mel filterbank is built for 16 kHz; before the fix a 48 kHz file
+    # produced a spectrogram whose bins meant something else, SILENTLY. This
+    # pins the properties: 16 kHz is untouched, 48 kHz converts to the right
+    # length, and a 440 Hz tone stays 440 Hz (the assertion that catches an
+    # upside-down ratio). Stdlib-only, so it sits OUTSIDE the .venv gate and
+    # runs in CI.
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_audio_resample
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_resample.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_audio_resample PROPERTIES TIMEOUT 300)
+    endif()
+
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
     add_executable(omniseed_regime_dump tests/regime_dump.cpp)

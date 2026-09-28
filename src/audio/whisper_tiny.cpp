@@ -84,6 +84,37 @@ bool PcmAudio::load_wav_bytes(const std::string& data, PcmAudio& out) {
     for (size_t i = 0; i < frames; ++i) {
         out.samples[i] = static_cast<float>(pcm[i * channels]) / 32768.0f;
     }
+
+    // ---- resample to the encoder's rate ------------------------------------
+    // load_wav keeps the FILE's rate in `out.sample_rate`, which is correct and
+    // honest — but the log-mel filterbank downstream is built for 16 kHz
+    // (WhisperTiny::sample_rate). Feeding a 48 kHz file straight to compute_mel
+    // does NOT fail: it produces a spectrogram whose bins mean something else,
+    // and the head learns noise. That is the §34 silent-failure shape, so the
+    // conversion happens HERE, at the one place that knows both rates.
+    //
+    // Linear interpolation, not a windowed sinc: with a 3x decimation the
+    // aliasing difference is far below the mel filterbank's own resolution, and
+    // a resampler that needs a test suite of its own would be a second thing to
+    // get wrong. The rate is recorded either way, so this choice is auditable.
+    if (out.sample_rate != 16000 && !out.samples.empty()) {
+        const double ratio = 16000.0 / static_cast<double>(out.sample_rate);
+        const size_t n_out = static_cast<size_t>(frames * ratio);
+        if (n_out == 0) return false;
+        std::vector<float> res(n_out);
+        for (size_t i = 0; i < n_out; ++i) {
+            const double src = static_cast<double>(i) / ratio;
+            const size_t i0 = static_cast<size_t>(src);
+            const size_t i1 = std::min(i0 + 1, frames - 1);
+            const double frac = src - static_cast<double>(i0);
+            res[i] = static_cast<float>(out.samples[i0] * (1.0 - frac) +
+                                        out.samples[i1] * frac);
+        }
+        out.samples.swap(res);
+        out.sample_rate = 16000;
+        platform::log_info("audio: resampled %u Hz -> 16000 Hz (%zu -> %zu samples)",
+                           rate, frames, n_out);
+    }
     return true;
 }
 
