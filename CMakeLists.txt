@@ -91,6 +91,11 @@ set(OMNISEED_CORE_SOURCES
     src/memory/memory_crystals.cpp
     src/memory/prefix_cache.cpp
     src/core/uncertainty.cpp
+    # The SPLIT: uncertainty.h answers "how unsure"; this answers "why", by
+    # separating data ambiguity (aleatoric) from an input that lies outside the
+    # fitted reference (epistemic). Both halves are measured against the real
+    # held-out heads — see docs/UNCERTAINTY.md.
+    src/core/uncertainty_split.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
@@ -769,6 +774,24 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_agent_modules COMMAND omniseed_agent_modules
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_agent_modules PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # MILESTONE 7 — the uncertainty SPLIT. Pure arithmetic plus the committed
+    # held-out h[E] fixtures, so the whole suite is UNGATED and runs in CI. The
+    # cross-domain half (Part E) is the real-data validation: a reference fitted
+    # on one domain must call every vector of another domain out-of-distribution.
+    add_executable(omniseed_uncertainty_split tests/test_uncertainty_split.cpp)
+    target_include_directories(omniseed_uncertainty_split PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_uncertainty_split PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_uncertainty_split PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_uncertainty_split PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_uncertainty_split COMMAND omniseed_uncertainty_split
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_uncertainty_split PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.

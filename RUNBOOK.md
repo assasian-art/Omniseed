@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-22 tests on a fresh clone (no `.venv`), **37** in a checkout that has one — see
+23 tests on a fresh clone (no `.venv`), **38** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -119,8 +119,11 @@ This matters: a venv-gated suite that never runs **will** silently drift.
 `test_paper_reports` carried an assertion contradicting a later mandate for
 months of commits before anyone noticed.
 
-`omniseed_decision_bridge`, `omniseed_regime_parity` and
-`omniseed_strategy_parity` are deliberately registered **outside** the gate.
+`omniseed_decision_bridge`, `omniseed_regime_parity`,
+`omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
+`omniseed_agent_modules` and `omniseed_uncertainty_split` are deliberately
+registered **outside** the gate. The last three need only **committed** fixtures
+(no model, no `.venv`, no network), so they run everywhere including CI.
 
 ### The head stack (fast, fully offline)
 
@@ -133,6 +136,7 @@ months of commits before anyone noticed.
 ./build/bin/omniseed_calibration.exe      # 180 checks, fitted heads + ECE
 ./build/bin/omniseed_multimodal.exe       # 110 checks, TokenBus + the joint
 ./build/bin/omniseed_agent_modules.exe    # 131 checks, the last 4 uncovered modules
+./build/bin/omniseed_uncertainty_split.exe # 154 checks, aleatoric vs epistemic
 ```
 
 `omniseed_calibration` is registered **outside** the `.venv` gate on purpose. Its
@@ -421,6 +425,44 @@ required for the market path: RWKV is recurrent, so all bars go through **one**
 evolving `RwkvState` — windowed integer-epoch timestamps are out of distribution.
 Full method, split protocol, and the honest accuracy table:
 **`docs/CALIBRATION.md`**.
+
+### Why am I unsure? (aleatoric vs epistemic)
+
+`core/uncertainty.h` gives a *total* uncertainty signal (entropy, margin).
+`core/uncertainty_split.h` splits it into the two causes that need opposite
+responses — data ambiguity (stay out) vs an input outside the fitted reference
+(go and learn):
+
+```cpp
+#include "omniseed/core/uncertainty_split.h"
+
+UncertaintyDecomposition ud;
+ud.fit(hidden_rows, n, E);                    // any [n, E] block of h[E]
+
+// `probs` must be the head's CALIBRATED softmax output (temperature applied).
+UncertaintySplit s = ud.split(h, probs, K);
+if (s.recommend_abstain)
+    log("abstain: %s (a=%.2f e=%.2f)", s.reason.c_str(), s.aleatoric, s.epistemic);
+```
+
+Measured on the shipped held-out heads (reproduce with
+`python tools/uncertainty_audit.py`):
+
+* **aleatoric** (calibrated entropy) is monotone in the observed error rate for
+  **4 of the 5** fitted heads — `trading.regime` 0.120 → 0.452 across entropy
+  quartiles, `language.sentiment` 0.059 → 0.500.
+* **epistemic** (h-space distance) has **no within-domain** error signal — and
+  that is the correct result, not a defect: inside one domain there is nothing
+  to find.
+* **epistemic separates domains completely** — a reference fitted on trading
+  flags **71/71** language vectors, and the reverse flags **369/369** past the
+  language p90.
+
+⚠️ The epistemic half is a **covariate-shift detector**, not a parameter
+posterior. `from_ensemble()` implements the rigorous Depeweg decomposition and
+is tested, but nothing can feed it yet (no head ensemble has been fitted).
+Full detail, the quartile tables, the fail-closed policy and the blob format:
+**`docs/UNCERTAINTY.md`**.
 
 ---
 

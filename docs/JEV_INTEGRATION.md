@@ -252,6 +252,12 @@ body.
 
 ## 6. Honest limitations — read this before trusting an output
 
+> ⚠️ **Two claims below are now out of date for the trading head**, which §32
+> fitted and calibrated. They are kept as written and corrected in place with
+> **Update (§32)** markers, because "the shipped head is untrained" was the
+> correct description of this tree for most of its life and is still correct for
+> every head except the ones listed in `docs/CALIBRATION.md`.
+
 **The shipped head is untrained.** `DecisionHead::init()` seeds the projection
 deterministically (SplitMix64, scaled by `1/sqrt(E)`) so tests and CI are
 reproducible. That projection has **no learned meaning**. A seeded head will
@@ -274,6 +280,16 @@ is a raw, uncalibrated score. A threshold of 0.85 does not mean "85% likely to
 be correct"; it is a tuned operating point. Do not present it as a probability
 of success.
 
+**Update (§32):** the *trading* `DecisionHead` now loads from
+`models/heads/trading_head.bin` with `trained() == true` and a fitted
+temperature `T = 13.325`, and its confidence **is** calibrated — measured ECE
+0.622 → 0.056 on 369 held-out bars. Read that carefully, though: calibration
+fixes the *number*, not the *judgement*. The same head is only **0.244 accurate
+over 7 actions** (near chance), so its maximum calibrated confidence is
+**0.4966**, below the 0.85 gate, and it **self-routes 0/369**. A well-calibrated
+bad head is a bad head that knows it. The remaining heads are still uncalibrated
+and the paragraph above still applies to them verbatim. See `docs/CALIBRATION.md`.
+
 **`target_asset` is empty unless mapped.** Call `set_action_asset()` (or fit a
 projection that carries asset identity) before reading that field.
 
@@ -281,9 +297,10 @@ projection that carries asset identity) before reading that field.
 `R^E -> R^A`, so it can be fitted offline from `(hidden_state, correct_action)`
 pairs collected by running the backbone over labelled episodes, with a
 cross-entropy loss — and, to get calibration, an asymmetric penalty on
-overconfident errors in the RLCD spirit. **None of that is implemented here.**
-`set_action()` and `save()`/`load()` are the interface for it; the training
-script is not part of this milestone.
+overconfident errors in the RLCD spirit. **This is now implemented** as
+`tools/train_heads.py` (§32) for the language and trading heads, via plain
+cross-entropy plus post-hoc temperature scaling rather than an asymmetric RLCD
+penalty. `set_action()` and `save()`/`load()` remain the runtime interface.
 
 **`to_json()` being valid JSON does not mean the decision is correct.** Same
 distinction TypeSafe draws between schema conformance and semantic accuracy.

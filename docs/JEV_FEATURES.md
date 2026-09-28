@@ -4,6 +4,13 @@ The mandate lists ten core decision capabilities and five domain head families.
 This document records the **status of each**, with the evidence, and states the
 gaps plainly. A feature list that only contains ticks is not a status report.
 
+> ⚠️ **This is a dated snapshot.** It was written before §32 (head training and
+> calibration), §33 (the multimodal joint), §34 (module coverage) and §35 (the
+> uncertainty split). Where a later milestone changed the answer, the original
+> text is kept and marked **Update (§NN)** below it, so the record of what was
+> believed — and why — survives alongside the correction. Sections carrying an
+> update: **2, 9, 10** and Part 2 (vision/audio).
+
 Legend: **DONE** · **PARTIAL** · **NOT STARTED**
 
 ---
@@ -39,33 +46,54 @@ arithmetic-bound. The returned `ActivationPlan` owns a `heads` vector and a
 `plan()` reserves both, which took it from 19.4 us to 15.3 us. Anything further
 means changing the return type.
 
-### 2. Calibrated confidence — **NOT STARTED** (the honest gap)
+### 2. Calibrated confidence — **DONE for 5 heads, NOT STARTED for the rest**
 
-**Nothing in this tree is calibrated, and this document will not pretend
-otherwise.** Concretely:
+> **Superseded in part by §32 (Milestone 4).** This section was written when
+> *nothing* in the tree was fitted. It is kept for the record, and the current
+> status is stated below it. Full detail: **`docs/CALIBRATION.md`** and
+> `PROJECT_STATE.md` §32.
 
-* Every head's projection is a **seeded placeholder**. `softmax` over an untrained
-  projection produces a number in [0,1] that looks like a probability and is
-  not one. Every head exposes `trained()` / `provenance()`, and
-  `UnifiedPipeline::provenance()` reports `NOT FULLY FITTED (placeholder)`.
-* The language heads' `confidence` is documented — in the header and in the code
-  — as a **heuristic strength**: how many independent cues agreed. It is
-  explicitly *not* a calibrated probability, and the header says that calling it
-  "92% confident" would be a lie of exactly the kind the calibration requirement
-  exists to prevent.
-* Temperature scaling is **not implemented**, because temperature scaling needs
-  (a) labelled data, (b) a fitted projection, and (c) a held-out split. None of
-  the three exists yet. Implementing the scalar without the data would produce a
-  calibrated-looking number with no justification — worse than the current honest
-  placeholder.
+**What was true then, and is still true of the unfitted heads:** every head's
+projection starts as a **seeded placeholder**. `softmax` over an untrained
+projection produces a number in [0,1] that looks like a probability and is not
+one. Every head exposes `trained()` / `provenance()`, and
+`UnifiedPipeline::provenance()` reports `NOT FULLY FITTED (placeholder)`.
 
-What *is* in place is the machinery a calibration pass would need: per-head
-fitting hooks (`set_action_row`, `set_label_row`, `set_row`, `set_head_gate`,
-`set_domain_probe`), `fitted_rows()` counters, `trained()` gates, and a
-`margin` on every distribution so a caller can at least see that a call was a
-coin flip.
+**What changed in §32:** temperature scaling **is now implemented and measured**,
+for the heads that have labelled data. `tools/train_heads.py` fits a projection
+offline on a held-out split, fits one temperature **per label set** by 5-fold CV,
+and measures ECE before and after. The results are real and modest:
 
-**Do not ship a decision on an untrained head's confidence.**
+| head | K | n | accuracy | T | ECE → calibrated |
+|---|---|---|---|---|---|
+| `language.language` | 4 | 71 | 0.845 | 5.161 | 0.139 → 0.089 |
+| `trading.regime` | 4 | 369 | 0.705 | 3.250 | 0.210 → 0.034 |
+| `language.sentiment` | 3 | 71 | 0.676 | 3.583 | 0.248 → 0.087 |
+| `language.intent` | 7 | 71 | 0.634 | 23.441 | 0.360 → 0.198 |
+| `DecisionAction` | 7 | 369 | **0.244** | 13.325 | 0.622 → 0.056 |
+
+Two findings worth carrying forward, both measured rather than assumed:
+
+* **A temperature is per-set, not per-head.** A single pooled T made
+  `language.language` *worse* (ECE 0.172 → 0.194) while fixing
+  `language.intent` (0.451 → 0.115), because the two sets want T ≈ 5 and T ≈ 23.
+* **Calibration does not create accuracy.** `DecisionAction` is calibrated to
+  ECE 0.056 and is still 0.244 accurate over 7 classes — near chance. A
+  well-calibrated bad head is a bad head that knows it. Its maximum calibrated
+  confidence is 0.4966, below the 0.85 gate, so it **self-routes 0/369**.
+
+**Still NOT STARTED:** the vision and audio heads, and the `DecisionAction` head's
+*accuracy* (as opposed to its calibration). The language heads' `confidence`
+remains a documented **heuristic strength** — how many independent cues agreed —
+and is explicitly not the calibrated `DecisionHead::confidence_score`.
+
+The machinery a further calibration pass would need is in place: per-head fitting
+hooks (`set_action_row`, `set_label_row`, `set_row`, `set_head_gate`,
+`set_domain_probe`), `fitted_rows()` counters, `trained()` gates, and a `margin`
+on every distribution so a caller can see that a call was a coin flip.
+
+**Do not ship a decision on an untrained head's confidence.** `trained()` is how
+you tell.
 
 ### 3. Multi-class classification — **DONE**
 
@@ -160,14 +188,34 @@ There is **no general ensemble across heads** — nothing combines the decision
 head's action with the classification head's label and the scoring head's
 priority into a vote. That would be a natural next step and is not built.
 
-### 10. Feedback hooks — **NOT STARTED**
+**Update (§35):** the *operator* a cross-head ensemble needs now exists.
+`UncertaintyDecomposition::from_ensemble()` implements the rigorous
+Depeweg 2018 decomposition (`total = H(mean p)`, `aleatoric = mean H(p)`,
+`epistemic = total − aleatoric ≥ 0 by Jensen`) and is tested. **Nothing can feed
+it** — no head ensemble has been fitted, so there is no `q(θ)`. As elsewhere in
+this tree, the gap is the *joint*, not the capability. See `docs/UNCERTAINTY.md`.
 
-No mechanism records an outcome and feeds it back. What exists is the *plumbing* a
-feedback loop would write through — the per-head fitting hooks and their
-`fitted_rows()` accounting — but nothing drives them, and there is no journal of
-(prediction, outcome) pairs. Note that the trading path does have a frozen entry
-journal (`tools/decision_bridge.py` re-reads it), which is the closest thing in
-the tree to the substrate this would need.
+### 10. Feedback hooks — **PARTIAL**
+
+No mechanism records an outcome and feeds it back **into a head**. What exists is
+the *plumbing* a feedback loop would write through — the per-head fitting hooks
+and their `fitted_rows()` accounting — but nothing drives them, and there is no
+journal of (prediction, outcome) pairs. Note that the trading path does have a
+frozen entry journal (`tools/decision_bridge.py` re-reads it), which is the
+closest thing in the tree to the substrate this would need.
+
+**Update (§34):** there *is* a feedback substrate, and it was broken.
+`SelfImprovement` (`src/agent/self_improvement.*`) records a task-keyed trace with
+a success/fail count, an average duration and a last-used stamp, and replays the
+best known step list for a matching task. That is a real (prediction, outcome)
+store. But its `save()` wrote a `uint32` magic `0x54524953` while `load()`
+compared the **string** `"SRIT"` — little-endian those bytes are `'S','I','R','T'`
+— so `load()` rejected every file `save()` wrote and **the trace cache never
+persisted**. Silent, because an unreadable cache is indistinguishable from an
+empty one. Fixed in §34 with one shared `kMagic`, and pinned by test C9.
+
+So the honest status is: the store exists and now persists, but nothing yet
+closes the loop from a *head's* prediction to a *recorded market outcome*.
 
 ---
 
@@ -183,8 +231,16 @@ the tree to the substrate this would need.
 
 The vision and audio rows are the honest ones: their action spaces and label sets
 are **registered**, so a fitted projection would light them up immediately — but
-nothing produces a vision or audio feature vector into `h[E]` yet. Registering
-the label space is not the same as having the capability, and the table says so.
+no projection has been fitted for either, because neither has labelled data.
+
+**Update (§33):** the *pipe* now exists even though the water does not.
+`MultimodalBridge` (`include/omniseed/multimodal.h`) turns a
+`VisionEncoder` output and `FocalCodec` codes into the discrete token space
+`RwkvModel::forward()` accepts, by nearest-neighbour quantisation against the
+model's own token-embedding matrix (no training, no extra RAM). So an image now
+becomes an `h[E]` the heads can read. What is still missing is the fitted
+vision/audio **projection**: the heads run and print a label, but with
+`trained() == false` that label is meaningless. See `docs/MULTIMODAL.md`.
 
 The trading action space mirrors `DecisionHead`'s exactly (lower-cased), so the
 two heads cannot drift into disagreeing about what actions exist. That is asserted
@@ -194,7 +250,9 @@ in `tests/test_heads.cpp` D6.
 
 ## Part 3 — Known limitations, stated once
 
-1. **Nothing is trained.** Every projection is a deterministic placeholder. See
+1. **Nothing is trained *except* the heads listed in §32.** Every remaining
+   projection is a deterministic placeholder — the vision and audio heads in
+   particular. `trained()` / `provenance()` is how you tell them apart; see
    capability 2.
 2. **Romanised Bengali reads as English.** Language detection is by **script**.
    `"ami bhalo achi"` is pure ASCII and is therefore indistinguishable from

@@ -3430,9 +3430,136 @@ goes **22 → 23**. No pre-existing suite depends on the old `task_key` behaviou
 
 1. **Fit the vision/audio heads** (the largest verified absence).
 2. **Milestone 3 — dream consolidation** (still skipped).
-3. **Epistemic/aleatoric separation** — `core/uncertainty.h` gives entropy and
-   margin (a *total* uncertainty signal); the decomposition the mandate asks for
-   is absent, and the words appear nowhere in `include/` or `src/`.
+3. ~~Epistemic/aleatoric separation~~ — **done in §35.** `core/uncertainty.h`
+   gives entropy and margin (a *total* signal); the split is now built and
+   measured against the real held-out heads.
+
+---
+
+## 35. UNCERTAINTY, SPLIT — WHY am I unsure? (2026-09-28)
+
+**Milestone 7.** `core/uncertainty.h` answers *how* unsure a distribution is,
+with one number. It cannot say **why**, and the two reasons call for opposite
+responses: **aleatoric** doubt means the classes overlap and more data will not
+help (stay out); **epistemic** doubt means the input is outside the fitted
+region and more data *would* help (go and learn).
+
+Full write-up: **`docs/UNCERTAINTY.md`**. Reproduce every number below with
+`python tools/uncertainty_audit.py`.
+
+### The audit that shaped the design (run BEFORE building)
+
+`h[E]` is post-`ln_out`, so the obvious worry was that row norms are constant
+and a Euclidean distance is meaningless. Probed on the committed holdout:
+
+| fixture | row-norm sd/mean | cos(h, mean) |
+|---|---|---|
+| trading (369×768) | **0.0198** — near-isotropic | 0.9928 ± 0.0025 |
+| language.intent (71×768) | 0.1394 | 0.6960 ± 0.1027 |
+
+So the concern was real for trading. Two consequences: the distance is
+**normalised per dimension by σ** (a diagonal Mahalanobis, not a raw norm), and
+a dimension whose σ is unmeasurably small is **floored at 10% of the typical
+σ** rather than at an epsilon — otherwise one dead dimension dominates the
+whole distance (measured: without the floor a 1.0 deviation in a constant
+dimension yields a distance in the hundreds of thousands; with it, 4.29).
+
+The probe also produced the finding that shaped the whole milestone: the
+distance **does not** track error within a domain, and **does** separate
+domains completely. Both are asserted as tests.
+
+### Aleatoric is real: monotone in the error rate for 4 of 5 heads
+
+Error rate per quartile of **calibrated** normalised entropy, real holdout:
+
+| head | K | n | acc | err by entropy quartile | |
+|---|---|---|---|---|---|
+| `trading.regime` | 4 | 369 | 0.705 | 0.120 → 0.196 → 0.413 → 0.452 | **monotone** |
+| `language.sentiment` | 3 | 71 | 0.676 | 0.059 → 0.353 → 0.353 → 0.500 | **monotone** |
+| `language.language` | 4 | 71 | 0.845 | 0.000 → 0.000 → 0.235 → 0.350 | **monotone** |
+| `language.intent` | 7 | 71 | 0.634 | 0.235 → 0.235 → 0.353 → 0.600 | **monotone** |
+| `DecisionAction` | 7 | 369 | **0.244** | 0.772 → 0.804 → 0.685 → 0.763 | no signal |
+
+The fifth is honest, not a defect: at 0.244 accuracy over 7 classes the head is
+near chance (0.143), so nothing predicts its errors and the tool prints
+`no signal` instead of inventing a trend. This is §32's finding restated.
+
+### Epistemic has NO within-domain signal — and that is the correct result
+
+Ordered by `h[E]` distance, the same quartile error rates are non-monotone and
+sometimes **inverted** (`language.language`: 0.294 → 0.118 → 0.235 → 0.000).
+This is what theory predicts: inside one domain every input is in-distribution,
+so there is no epistemic uncertainty to find and the top decile is noise. A
+module that found a signal here would be one firing on noise.
+
+### Epistemic DOES separate domains, completely
+
+| reference | scored | in-domain d (mean / p90 / max) | out d (mean / min) | below in-domain p90 |
+|---|---|---|---|---|
+| trading | language.intent | 0.990 / 1.169 / 1.614 | 6.699 / **5.129** | **0 / 71** |
+| language.intent | trading | 0.981 / 1.198 / 1.683 | 1.719 / 1.482 | **0 / 369** |
+
+The first direction is a clean 5× jump — the *minimum* out-of-domain distance
+is 3× the *maximum* in-domain distance. The reverse is weaker (n=71 makes a
+coarse CDF) but every trading vector is still past the language reference's
+p90, and 249/369 saturate at 1.0. The gap is total because the domains differ
+in **both** statistics: trading has the larger row norm (262 vs 152) and the
+**smaller** per-dimension σ (0.93 vs 3.05) — a 3.3× gap, in the *unintuitive*
+direction, which is why the test asserts the magnitude of the gap and not its
+sign.
+
+### The rigorous operator exists; the ensemble to feed it does not
+
+`from_ensemble()` implements the Depeweg 2018 decomposition **exactly** —
+`total = H(mean p)`, `aleatoric = mean H(p)`, `epistemic = total − aleatoric ≥ 0`
+by Jensen — and is tested (identical members → 0; two disjoint point masses →
+`ln2 / 0 / ln2`). **Nothing can feed it**: no head ensemble has been fitted, so
+there is no `q(θ)`. As in §30, §31 and §33, the gap is the **joint**, not the
+capability. `split()` therefore uses the two *measured* proxies and the docs say
+so rather than implying a Bayesian decomposition it cannot perform.
+
+### Fail-closed policy
+
+Every failure resolves to **maximum doubt**, never to confidence: no reference,
+a non-finite `h`, or a width mismatch ⇒ `epistemic() == 1.0`; a vector that is
+not a distribution (negative, all-zero, NaN) ⇒ `aleatoric() == 1.0`. `load()`
+clears the object **before** reading, so a caller that ignores the return value
+cannot keep a stale reference alive. `distance()` returns `−1.0` ("not
+measured") rather than 0.0, because a distance is a measurement.
+
+### Files
+
+| file | what |
+|---|---|
+| `include/omniseed/core/uncertainty_split.h` | the module (NEW) |
+| `src/core/uncertainty_split.cpp` | the implementation (NEW) |
+| `tests/test_uncertainty_split.cpp` | **154 checks**, 0 fail, 0 skip, **UNGATED** (NEW) |
+| `docs/UNCERTAINTY.md` | full write-up (NEW) |
+| `tools/uncertainty_audit.py` | the oracle behind the tables (NEW) |
+| `CMakeLists.txt` | source + `omniseed_uncertainty_split` test target |
+
+The test is ungated because it needs only the **committed** `h[E]` fixtures —
+no model, no `.venv`, no network. Part E is the real-data validation and it
+asserts the **cross-domain positive** (100% flagged) and the **in-domain
+negative control** (≤ 20% flagged) *together*: a detector that flags everything
+passes one and fails the other, and a detector that flags nothing does the
+reverse.
+
+**Full local board: 38/38 passed.** The board grew **37 → 38**; a fresh clone
+goes **22 → 23**.
+
+### Next
+
+1. **Fit the vision/audio heads** (still the largest verified absence).
+2. **Milestone 3 — dream consolidation** (still skipped).
+3. **Wire the split into the router's fast path** — a `Both` verdict is a
+   strictly better reason to escalate to System-2 than a bare confidence floor.
+   The module and its evidence exist; the consumer does not.
+4. **Fit a head ensemble** so `from_ensemble()` has something to eat — that is
+   the prerequisite for the *rigorous* decomposition, and for Phase 2.5
+   (cross-head ensemble voting).
+5. **Calibrate the two thresholds** (0.5 / 0.90 are interpretable defaults, not
+   fitted). §2 of `docs/UNCERTAINTY.md` provides the data to do it.
 
 
 
