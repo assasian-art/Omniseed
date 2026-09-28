@@ -4065,3 +4065,19 @@ be a second thing to get wrong.
 3. Fit `language.task` + `general.routing` (no external data needed).
 4. Re-run §35 so `provenance()` flips to TRAINED per set — and stays visibly
    unfitted for `general.priority` and the `indoor`/`urban` labels.
+
+### Board
+
+**Full local board: 42/42 passed (3788.79 s)** at the time of this milestone, then
+reconfigured to **43 registered tests** — `omniseed_audio_resample` (#43) was
+registered after that run and confirmed green on its own plus with
+`omniseed_sides` (#3, the real end-to-end ASR test that exercises the resampler
+against actual WAVs), `omniseed_multimodal`, `omniseed_feedback_hook` and
+`omniseed_threshold_derivation`: **5/5 passed (21.72 s)**.
+
+The board grew **41 → 43** (§41 `omniseed_threshold_derivation`, §42
+`omniseed_audio_resample`). A fresh clone goes **25 → 27**.
+
+Note: the `ctest` wrapper reported a non-zero exit from a sandbox file-read
+denial during teardown (`KERNEL32.DLL.mui`), *after* `100% tests passed`. That is
+a sandbox artifact, not a test failure — the pass line is authoritative.
