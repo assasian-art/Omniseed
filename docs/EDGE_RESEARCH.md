@@ -189,9 +189,12 @@ Stated so the reasoning can be attacked directly:
   own holdout, so the bar is not far off; the four tracks exist to see if anything
   closes it honestly.
 - **If §41's threshold is ever re-derived from a clean fit** (see
-  `docs/HOLDOUT_DEFECT.md` §"What is owed"), the 0.50 value may move — it is
-  currently derived from a contaminated refit, and although nothing clears 2x
-  there either, a clean derivation is the number to publish.
+  `docs/HOLDOUT_DEFECT.md` §"What was owed"), the 0.50 value may move. **RESOLVED
+  (§44): it was re-derived from the shipped blob and the real dump, and the answer
+  did not move — `min_confidence = 0.50`, the reached fallback.** The tracked
+  numbers are now the blob's own (`T=13.325159`, `acc=0.243900`); the contaminated
+  refit is history. The baseline row below is unchanged, only now verified by the
+  tool as well as by the fixture.
 - **If the rule-based engines are shown to be unprofitable in paper**, the
   "edge source" claim in §2.3 is wrong regardless of what the heads do. Their
   parity tests prove they *compute what they claim*; they do not prove the claim

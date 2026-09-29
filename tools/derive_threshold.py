@@ -22,11 +22,15 @@
 #     test the CUMULATIVE pool from each threshold upward. The bucket table is
 #     also printed, because the curve is the evidence either way.
 #
-#  2. We do NOT re-derive the projection. It is opaque and lives in the blob.
-#     Instead the fit is REPRODUCED from the fixture: the same
-#     chronological_split + fit_one(shuffle=False) that tools/train_heads.py
-#     used. That is deterministic, so re-running this script gives byte-equal
-#     numbers — which is what makes the gated C++ test able to check them.
+#  2. The head is READ FROM THE SHIPPED BLOB, not re-fitted here. An earlier
+#     version re-fitted from `tests/fixtures/head_calibration/trading`, whose 369
+#     rows ARE the holdout the shipped blob was calibrated on — so it trained on
+#     258 holdout rows and reported THAT refit's T and accuracy as if they were
+#     the shipped head's (0.1441 / T=20.0427 vs the blob's 0.2439 / T=13.325159).
+#     See docs/HOLDOUT_DEFECT.md §"The real defect". The fix: load the blob, load
+#     the REAL dump (`build/head_data/trading`, 1,231 rows), rebuild the action
+#     teacher the same way `train_heads.py` does, and score the BLOB on the same
+#     369-row holdout. No second model, no contamination.
 #
 #  Output: tools/threshold_curve.json  (+ a human table on stdout)
 # =============================================================================
@@ -40,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np  # noqa: E402
 
 import train_heads as th  # noqa: E402
+from uncertainty_audit import load_decision  # noqa: E402
 
 # The rule's constants, named so a reader can see them and the test can cite them.
 CHANCE_MULTIPLE = 2.0
@@ -55,21 +60,28 @@ N_BINS = 20              # curve resolution: 0.05-wide lower bins, then finer
 THRESHOLD_FLOOR = 1.0 / 7.0
 
 
-def action_curve(H, ya, actions, tr, hold):
-    """Reproduce the action-head fit and return calibrated holdout probabilities.
+def blob_holdout_probs(blob, H, ya, tr, hold):
+    """Score the SHIPPED blob on the holdout rows (no refit).
 
-    Returns (probs, y, temperature, fit_report) where probs is [n_hold, K].
+    `blob` is the dict `uncertainty_audit.load_decision` returns. Its `proj` is
+    flat [A*E] row-major and its `bias` is [A]; the softmax uses the blob's own
+    stored temperature, so these are the numbers the runtime would produce.
     """
-    K = len(actions)
-    r = th.fit_one(H, ya, K, tr, hold, shuffle=False, seed=1234)
-    raw = r["_raw_logits"]
-    y = r["_y"]
-    ti = r["_test_idx"]
-    if len(ti) == 0:                     # fixture too small: fall back to train
-        ti = tr
-    T = r["temperature"]
-    probs = th.softmax(raw[ti] / T)
-    return probs, y[ti], T, r
+    E, A = blob["E"], blob["A"]
+    if H.shape[1] != E:
+        raise SystemExit("dump E=%d but blob E=%d" % (H.shape[1], E))
+    proj = np.asarray(blob["proj"], dtype=np.float64).reshape(A, E)
+    bias = np.asarray(blob["bias"], dtype=np.float64)
+    T = float(blob["temp"])
+
+    idx = np.asarray(hold, dtype=int)
+    logits = H[idx] @ proj.T + bias            # [n_hold, A]
+    # softmax with the blob's temperature, numerically stable
+    z = logits / T
+    z = z - z.max(axis=1, keepdims=True)
+    ex = np.exp(z)
+    probs = ex / ex.sum(axis=1, keepdims=True)
+    return probs, ya[idx], T
 
 
 def bucket_table(probs, y):
@@ -140,32 +152,57 @@ def derive(probs, y, chance):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Derive min_confidence from the fitted head's calibration "
+        description="Derive min_confidence from the SHIPPED head's calibration "
                     "curve on held-out data (DECISION 1).")
-    ap.add_argument("--fixture", default="tests/fixtures/head_calibration/trading")
+    ap.add_argument("--dump", default="build/head_data/trading",
+                    help="the REAL dump train_heads.py fitted from (all rows, "
+                         "not the holdout fixture)")
+    ap.add_argument("--blob", default="models/heads/trading_head.bin",
+                    help="the shipped DecisionHead to score (read, not re-fitted)")
+    ap.add_argument("--bars", default="models/market/AAPL_1d.csv",
+                    help="bars, for rebuilding the SAME action teacher")
+    ap.add_argument("--fixture",
+                    default="tests/fixtures/head_calibration/trading",
+                    help="only used to CROSS-CHECK the dump-derived holdout "
+                         "against the committed fixture (optional)")
     ap.add_argument("--actions", default="include/omniseed/decision_head.h",
                     help="source of the DecisionAction enum (single source of truth)")
     ap.add_argument("--out", default="tools/threshold_curve.json")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    meta, H, ids, colnames, labels = th.load_dump(args.fixture)
-    if labels and len(labels[0]) >= 2:
-        pass
-    if "DecisionAction" not in colnames:
-        raise SystemExit("fixture has no DecisionAction column: %r" % (colnames,))
-    ci = colnames.index("DecisionAction")
+    # ---- 1. the dataset (ALL rows) and the action teacher -------------------
+    meta, H, ids, colnames, labels = th.load_dump(args.dump)
+    if "trading.regime" not in colnames:
+        raise SystemExit("dump has no trading.regime column: %r" % (colnames,))
+    regime = [r[colnames.index("trading.regime")] for r in labels]
+    closes, _ = th.read_closes(args.bars)
+
     actions = th.parse_decision_actions(args.actions)
     vocab = {v: i for i, v in enumerate(actions)}
-    try:
-        ya = np.array([vocab[r[ci]] for r in labels], dtype=np.int64)
-    except KeyError as e:
-        raise SystemExit("label %r is not in the DecisionAction enum %r" % (e, actions))
+    ya, action_names, _detail = th.build_action_labels(ids, regime, closes)
+    if action_names != actions:
+        raise SystemExit("action order %r != C++ enum order %r"
+                         % (action_names, actions))
+    n_dataset = len(ya)
 
     K = len(actions)
     chance = 1.0 / K
-    tr, hold = th.chronological_split(len(ya))
-    probs, y, T, r = action_curve(H, ya, actions, tr, hold)
+    tr, hold = th.chronological_split(n_dataset)
+
+    # ---- 2. the SHIPPED blob, scored on the holdout (no refit) --------------
+    blob = load_decision(args.blob)
+    probs, y, T = blob_holdout_probs(blob, H, ya, tr, hold)
+
+    # ---- 2b. cross-check: the same holdout the committed fixture holds ------
+    # The fixture holds exactly the holdout rows. If the dump's holdout slice and
+    # the fixture disagree on row count, one of them is stale — say so, do not
+    # silently pick one. This is the assertion that would have caught §41.
+    fixture_n = None
+    fx_meta = os.path.join(args.fixture, "meta.json")
+    if os.path.isfile(fx_meta):
+        with open(fx_meta, encoding="utf-8") as f:
+            fixture_n = int(json.load(f)["n"])
 
     buckets = bucket_table(probs, y)
     chosen, reason, scan, bar = derive(probs, y, chance)
@@ -176,10 +213,18 @@ def main():
         "gated_on": "paper-only (L0). This threshold gates PAPER commits and "
                     "NEVER live money; the live-money gate is C++-enforced.",
         "column": "DecisionAction",
-        "fixture": args.fixture,
-        "n_total": int(len(ya)),
+        "method": "READ THE SHIPPED BLOB; score it on the real dump's holdout. "
+                  "No refit (the pre-§44 version refitted inside the holdout — "
+                  "found in §43, fixed here).",
+        "dump": args.dump,
+        "blob": args.blob,
+        "bars": args.bars,
+        "n_dataset": n_dataset,      # ALL rows the blob was fitted on
         "n_train": int(len(tr)),
         "n_holdout": int(len(y)),
+        "fixture_n_holdout": fixture_n,
+        "holdout_matches_fixture": (
+            None if fixture_n is None else (len(y) == fixture_n)),
         "K": K,
         "actions": actions,
         "chance": round(chance, 6),
@@ -189,7 +234,8 @@ def main():
         "min_pool_n": MIN_POOL_N,
         "temperature": round(float(T), 6),
         "holdout_acc": round(float((probs.argmax(axis=1) == y).mean()), 4),
-        "ece_calibrated": round(float(r["ece_calibrated"]), 5),
+        "blob_calib_samples": int(blob["cal_n"]),
+        "blob_calib_ece": round(float(blob["cal_ece"]), 5),
         "derived_min_confidence": round(float(chosen), 6),
         "reason": reason,
         "curve": buckets,
@@ -198,15 +244,21 @@ def main():
 
     if not args.quiet:
         print("=" * 78)
-        print("DECISION 1 — threshold derived from the calibration curve")
+        print("DECISION 1 — threshold derived from the SHIPPED head's curve")
         print("=" * 78)
-        print("  fixture      %s  (%d rows, train %d / holdout %d)"
-              % (args.fixture, result["n_total"], len(tr), len(y)))
+        print("  dump         %s  (%d rows: train %d / holdout %d)"
+              % (args.dump, n_dataset, len(tr), len(y)))
+        print("  blob         %s  (T=%.4f, calib n=%d, ece=%.4f)"
+              % (args.blob, T, blob["cal_n"], blob["cal_ece"]))
+        if fixture_n is not None:
+            mark = "OK" if len(y) == fixture_n else "** MISMATCH **"
+            print("  fixture      %s  (holdout n=%d)  %s"
+                  % (args.fixture, fixture_n, mark))
         print("  actions      K=%d  %s" % (K, " ".join(actions)))
         print("  chance       1/%d = %.6f   ->  accept bar %.6f (2x)"
               % (K, chance, bar))
-        print("  T            %.4f      holdout acc %.4f      ECE %.4f"
-              % (T, result["holdout_acc"], result["ece_calibrated"]))
+        print("  holdout acc  %.4f  (the SHIPPED head, not a refit)"
+              % result["holdout_acc"])
         print()
         print("  confidence bucket      n     emp.acc   mean.conf")
         print("  " + "-" * 56)

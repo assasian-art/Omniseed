@@ -4254,3 +4254,112 @@ assertions without changing its count. Full local board **44/44 passed
 its own (3.99 s) ⇒ **45 registered**. Run the full local board before pushing (see
 §42's note on the `ctest` teardown exit code).
 
+
+## 44. THE §41 DEFECT, FIXED — the tool now reads the shipped head (2026-09-29)
+
+**Task 1 of the owner's post-§43 directive, paid.** §43 found — while chasing a
+phantom — that `tools/derive_threshold.py` refitted a head *inside* the 369-row
+holdout and reported that refit's `T=20.042676` / `holdout_acc=0.1441` as the
+shipped head's. §41 recorded it as owed. §44 fixes it. The **DECISION 1 answer does
+not move** (`min_confidence = 0.50`, fail-closed) — the *reason* improves.
+
+### 44.1 What was wrong (restated in one line)
+
+The tool loaded `tests/fixtures/head_calibration/trading` — whose 369 rows **are**
+the §32 holdout — and called `chronological_split(369)`, fitting on **258 of the
+holdout's own rows**. So its temperature and accuracy described a contaminated
+refit, not `models/heads/trading_head.bin`, and `n_total = 369` presented the
+fixture size as the dataset total, which hid it. Full record: `docs/HOLDOUT_DEFECT.md`.
+
+### 44.2 The fix — one fit, one split, one provenance
+
+`tools/derive_threshold.py` was rewritten to **read, never fit**:
+
+1. the **shipped blob** `models/heads/trading_head.bin` via
+   `uncertainty_audit.load_decision` (the v3 `OMNISDH1` reader);
+2. the **real dump** `build/head_data/trading` (`n=1231`, `E=768`, mode `market`);
+3. the action teacher rebuilt with the **same** `train_heads.py::build_action_labels`
+   (`n_forward=5, threshold=0.015, dead=0.005`) — the order is asserted equal to the
+   C++ `DecisionAction` enum read from `include/omniseed/decision_head.h`;
+4. a chronological split of the **dump** (862 train / 369 holdout), then **scoring
+   the blob on the 369-row holdout**. No second model exists in the tool.
+
+The JSON is relabelled: `n_total` → **`n_dataset`** (1,231), plus `n_train`,
+`n_holdout`, `fixture_n_holdout`, `holdout_matches_fixture`, `blob_calib_samples`,
+`blob_calib_ece`; `ece_calibrated` → **`blob_calib_ece`** (read from the blob, not
+measured on a refit). The tool **cross-checks** its dump-derived holdout size against
+the committed fixture and prints `OK` / `** MISMATCH **`.
+
+### 44.3 The corrected curve, and why the answer is unchanged
+
+```
+dump  build/head_data/trading   1,231 rows (train 862 / holdout 369)
+blob  models/heads/trading_head.bin  T=13.325159  acc=0.2439  ECE=0.0555
+bar   = 2/7 = 0.285714
+```
+
+Per-bucket, `[0.20,0.25)` passes (acc **0.2991**, n=107). **The cumulative pool
+never does** — 369 rows at **0.2439**, rising only to a max of **0.2500**
+(`T≈0.2257`). This is precisely the §41 rule shape: rows below a threshold are
+*abstained*, not discarded, so a per-bucket reading would wrongly pick `T=0.20`.
+The rule refuses; `min_confidence = 0.500000`, the **reached** fallback.
+
+**What changed honestly:** the shipped head is **1.71× chance** (0.2439), not the
+contaminated refit's 1.01× (0.1441) — still short of the 2× bar, so the conclusion
+is unchanged, but the reported number is now the real one.
+
+### 44.4 The gates — two directions, both proven non-vacuous
+
+**Python (`tests/test_threshold_derivation_gate.py`, `omniseed_threshold_gate`).**
+Ties the tool's output to the artifact's **own** record: `temperature`,
+`holdout_acc`, `blob_calib_samples`, `blob_calib_ece` must equal
+`tests/fixtures/head_calibration/trading/metrics.tsv`'s `DecisionAction` row
+(`T=13.325159`, `acc=0.243900`, `n=369`, `ece=0.055500`); the mislabel `n_total`
+must be **absent**; `n_dataset == n_train + n_holdout == 1231`; the fallback must be
+*reached*; the old defect's signature (`T=20.042676`, `0.1441`) must **not** appear.
+Direction A (committed JSON) is stdlib-only ⇒ runs in CI; direction B **re-runs the
+tool** (numpy-gated, skips visibly) so the file is provably its output. **28 checks,
+0 fail** under `.venv`; **19 passed, 0 failed, 1 skipped** under system Python (A
+only). Corruption-proof: setting `temperature = 20.042676` ⇒ **3 fails** (A, A-old,
+B); setting `holdout_acc = 0.1441` ⇒ **3 fails**; restore ⇒ green.
+
+**C++ (`tests/test_threshold_derivation.cpp`).** It always loaded the blob, so it
+was never wrong — but it never **checked** the blob was the one `metrics.tsv`
+records. **T7** now does: `head.temperature()` must equal `metrics.tsv`'s
+`13.325159`; `acc` is pinned to `0.243900`; `metrics.tsv`'s `n` equals the fixture's
+row count; and the calibration scalar must be `> 1.0` (not the default). **23 → 28
+checks, 0 fail.** A near-miss here is instructive: the first T7 used
+`head.threshold()` — which is **0.85**, the *self-routing confidence gate*, not the
+calibration scalar — and failed `0.85 vs 13.325159`. That `DecisionHead` exposes
+**two** differently-meaning "thresholds" is exactly the wrong-number class §41 was
+about, so the accessor choice is now commented in the test.
+
+### 44.5 Files
+
+- `tools/derive_threshold.py` — rewritten: reads blob + real dump; no refit;
+  relabelled; fixture cross-check.
+- `tools/threshold_curve.json` — regenerated (1,231-row dataset; `T=13.325159`;
+  `acc=0.2439`; `blob_calib_*`).
+- `tests/test_threshold_derivation_gate.py` — **new**, the §44 gate (stdlib A +
+  numpy B).
+- `tests/test_threshold_derivation.cpp` — **T7 added**, blob-vs-`metrics.tsv`; 23 →
+  28 checks. `cl /Zs /W4` clean.
+- `docs/CALIBRATION.md` — §4.4 curve/dash rewritten as the **shipped** head; §4.6
+  retitled **FIXED**, with the fix and the gate; §4.1 note corrected.
+- `docs/HOLDOUT_DEFECT.md` — the "What is owed" section marked **PAID**; the
+  follow-up note that quoting `holdout_acc` is now safe.
+- `RUNBOOK.md` — ungated list gains `omniseed_threshold_gate` (fresh clone 24 → 25,
+  venv checkout 39 → 46).
+- `CMakeLists.txt` — `omniseed_threshold_gate` registered **outside** the `.venv`
+  guard.
+
+### 44.6 Board
+
+Board **45 → 46**: `omniseed_threshold_gate` (#44). `omniseed_threshold_derivation`
+stays at #41's slot with **28 checks, 0 fail** (was 23). Full local board run before
+pushing (see §42's `ctest` teardown-exit-code note: check the pass line, not the
+exit code).
+
+**Not done in §44 (explicitly deferred, next milestones):** the audio→E adapter
+(task 2), the four edge tracks of `docs/EDGE_RESEARCH.md` (task 3, all still
+**NOT RUN**), Milestone 3 (dream consolidation), and the rest of the master mandate.

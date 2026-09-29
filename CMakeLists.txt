@@ -905,6 +905,23 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_threshold_derivation PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # §44 — the §41 FIX's gate. tools/derive_threshold.py used to refit INSIDE the
+    # 369-row holdout (the fixture) and report that refit's T=20.042676/acc=0.1441
+    # as the shipped head's; the shipped head's own numbers are in metrics.tsv
+    # (T=13.325159, acc=0.243900). This test ties the tool's output to BOTH the
+    # artifact's recorded metrics AND the rule's reached-fallback answer, and
+    # additionally re-runs the tool so the committed JSON is provably its output.
+    # Half A is stdlib-only so it runs in CI; half B needs numpy and skips visibly.
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_threshold_gate
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_threshold_derivation_gate.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_threshold_gate PROPERTIES TIMEOUT 300)
+    endif()
+
     # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper
     # log-mel filterbank is built for 16 kHz; before the fix a 48 kHz file
     # produced a spectrogram whose bins meant something else, SILENTLY. This

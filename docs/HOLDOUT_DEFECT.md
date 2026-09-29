@@ -4,6 +4,10 @@
 **Severity of the retraction: high** — a false accusation was published against a
 committed metric before it was verified. The verification is below.
 
+**Follow-up (§44): the genuine §41 defect found *by* this investigation is now FIXED.**
+`tools/derive_threshold.py` reads the shipped blob and the real dump instead of
+refitting inside the holdout; see §"What was owed — PAID in §44" below.
+
 This file originally read *"`holdout_acc` is not a holdout number — every published
 accuracy for a fitted head is an in-sample figure wearing a holdout label."*
 **That is false.** It is kept, rather than deleted, because the way it was reached
@@ -100,26 +104,49 @@ then scans on the remaining 111. Therefore:
   Neither clears 2×, so `min_confidence = 0.50` stands for the right reason.
   DECISION 1 is **not** invalidated.
 
-### What is owed (its own milestone)
+### What was owed (its own milestone) — **PAID in §44**
 
-`derive_threshold.py` should read the **real dump** (`state/trading`, 1,231 rows
-from `train_heads.py`), fit one model on the 862 training rows, and derive the
-threshold from *its own* 369-row holdout — one fit, one split, one provenance. That
-also means **regenerating `tools/threshold_curve.json`** and the C++
-`omniseed_threshold_derivation` test that pins its value, which is why it is not
-patched inside a modality milestone. It is a fix to a committed number with a
-gated test attached. Recorded, not drive-by'd.
+`derive_threshold.py` had to read the **real dump** (`build/head_data/trading`,
+1,231 rows from `train_heads.py`) and the **shipped blob**, score the blob on its own
+369-row holdout — one fit, one split, one provenance — and regenerate
+`tools/threshold_curve.json`. That also meant the C++ `omniseed_threshold_derivation`
+test's pinned values.
 
-Until then: **do not quote `threshold_curve.json`'s `holdout_acc` as the shipped
-head's accuracy.** The shipped head's held-out accuracy is **0.2439**.
+**§44 landed the fix.** The tool now:
+
+- reads `models/heads/trading_head.bin` (via `uncertainty_audit.load_decision`) —
+  **no model is fitted in the tool at all**, so there is no second head to conflate;
+- loads the real dump (1,231 rows), rebuilds the action teacher with the same
+  `train_heads.py::build_action_labels`, splits 862/369, and scores the blob on the
+  369-row holdout;
+- relabels `n_total` → `n_dataset` (1,231) and adds `n_train`/`n_holdout`/
+  `fixture_n_holdout`/`holdout_matches_fixture`/`blob_calib_samples`/`blob_calib_ece`;
+- cross-checks its holdout size against the committed fixture and prints `OK` /
+  `** MISMATCH **`.
+
+`tools/threshold_curve.json` now reads `T = 13.325159`, `holdout acc 0.2439` — the
+shipped head's own numbers — and the answer is still `0.500000`, the **reached**
+fallback. `tests/test_threshold_derivation_gate.py` (`omniseed_threshold_gate`, §44)
+ties the tool's output to `metrics.tsv`'s `DecisionAction` row to the digit and
+asserts the old defect's signature (`T=20.042676`, `0.1441`) is **absent**; both
+directions were proven to fail when corrupted. C++ `omniseed_threshold_derivation`
+still passes **23 checks, 0 fail** (it always loaded the blob).
+
+**A follow-up worth noting:** the §44 fix did *not* change the §4.4 answer (`0.50`),
+but it changed the *reason* favourably — the shipped head is **1.71×** chance
+(0.2439), not the contaminated refit's 1.01×. Quoting `threshold_curve.json`'s
+`holdout_acc` is now safe: it **is** the shipped head's accuracy.
 
 ## What changes, restated honestly
 
 1. **§32's 0.2439 is correct and held out.** No correction to `metrics.tsv` is
    owed; no correction ever was. `docs/CALIBRATION.md` §4.1 keeps the number and
    §4.5 now states that the held-out status was **verified, not assumed**.
-2. **§41's T / 0.1441 provenance** is now marked in `docs/CALIBRATION.md` §4.4 and
-   §4.6 as belonging to a refit inside the holdout. The value 0.50 is unchanged.
+2. **§41's T / 0.1441 provenance** was marked in `docs/CALIBRATION.md` §4.4 and
+   §4.6 as belonging to a refit inside the holdout, and is now **fixed (§44)** — the
+   tool reads the shipped blob, so `threshold_curve.json` carries `T = 13.325159` /
+   `acc 0.2439` and the tool's output is gated against `metrics.tsv`. The value 0.50
+   is unchanged.
 3. **`tools/signal_audit.py`** does **not** carry an in-sample warning — it would
    have been false. It reports `accuracy_is_held_out: True`, with the four-way
    verification above cited.

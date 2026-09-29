@@ -376,6 +376,74 @@ int main() {
     check_close(kThresholdFloor, 1.0f / 7.0f, 1e-8f,
                 "T5 the candidate scan refuses thresholds below chance");
 
+    // ---- T7: the blob is THE blob metrics.tsv records (§44) -------------------
+    // The §41 defect was that the Python tool described a DIFFERENT head (a refit
+    // inside the holdout) while the doc implied one head had two temperatures.
+    // This C++ path always loaded the shipped blob, so it was never wrong — but it
+    // never CHECKED that the blob it loaded is the one the fixture's own
+    // `metrics.tsv` records. Now it does: the `temperature` field is written into
+    // the blob at fit time and copied into metrics.tsv, so they must agree to the
+    // digits printed, and the shipped value is 13.325159.
+    {
+        // metrics.tsv: column  n  temperature  ece_calibrated  holdout_acc
+        const std::string ts = "tests/fixtures/head_calibration/trading/metrics.tsv";
+        std::ifstream mf(ts);
+        if (!mf) {
+            skip("T7 metrics.tsv unavailable: " + ts);
+        } else {
+            std::string line;
+            std::getline(mf, line);                 // header
+            float m_t = 0.0f, m_acc = 0.0f;
+            int   m_n = 0;
+            bool  found = false;
+            while (std::getline(mf, line)) {
+                line = trim(line);
+                if (line.empty()) continue;
+                // tab-split: [0]column [1]n [2]temperature [3]ece [4]holdout_acc
+                std::vector<std::string> f;
+                for (size_t s = 0;;) {
+                    const size_t tab = line.find('\t', s);
+                    f.push_back(line.substr(s, tab == std::string::npos
+                                                  ? std::string::npos : tab - s));
+                    if (tab == std::string::npos) break;
+                    s = tab + 1;
+                }
+                if (f.size() < 5 || f[0] != "DecisionAction") continue;
+                m_n   = std::atoi(f[1].c_str());
+                m_t   = static_cast<float>(std::atof(f[2].c_str()));
+                m_acc = static_cast<float>(std::atof(f[4].c_str()));
+                found = true;
+                break;
+            }
+            if (!found) {
+                skip("T7 metrics.tsv has no DecisionAction row");
+            } else {
+                std::printf("  metrics.tsv: n=%d T=%.6f acc=%.6f\n", m_n, m_t, m_acc);
+                // NOTE: `head.temperature()` is the CALIBRATION scalar stored in
+                // the blob; it is NOT `head.threshold()` (0.85), which is the
+                // self-routing confidence gate. Conflating the two would have made
+                // this check compare 0.85 against 13.325159 — the wrong-number
+                // class this very milestone (§41) was about.
+                check_close(head.temperature(), m_t, 5e-7f,
+                            "T7 the BLOB's stored temperature equals the value "
+                            "metrics.tsv records for DecisionAction (a mismatch "
+                            "means the wrong head was loaded — the §41 signature)");
+                check(head.temperature() > 1.0f,
+                      "T7 the calibration temperature is a real fitted scalar "
+                      "(> 1.0), not the untouched default 1.0");
+                check(m_n == fx.n,
+                      "T7 metrics.tsv's holdout n equals the fixture's row count");
+                // The documented shipped temperature, pinned so a silent re-fit
+                // moving it is caught here as well as in the §44 Python gate.
+                check_close(m_t, 13.325159f, 5e-7f,
+                            "T7 metrics.tsv still records the shipped T=13.325159");
+                check_close(m_acc, 0.243900f, 5e-7f,
+                            "T7 metrics.tsv still records the shipped acc=0.2439 "
+                            "(not the contaminated refit's 0.1441)");
+            }
+        }
+    }
+
     // ---- T6: the fallback is fail-CLOSED -------------------------------------
     check(kFallback >= 0.50f, "T6 the fallback does not lower the bar");
     check(head.threshold() >= kFallback,

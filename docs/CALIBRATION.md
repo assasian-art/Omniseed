@@ -170,9 +170,10 @@ in §43).
 | `language.intent` | 7 | 71 | **0.634** | — | 23.441 |
 | `DecisionAction` | 7 | 369 | **0.244** | 0.133 | 13.325 |
 
-⚠️ **`T` here is the shipped blob's temperature.** Do not confuse it with §41's
-`T = 20.0427`, which belongs to a *different* head §41 refitted inside the holdout
-— see §4.6.
+⚠️ **`T` here is the shipped blob's temperature — the only `T`.** Until §44 the
+threshold-derivation tool reported a different head's `T = 20.0427` because it
+refitted *inside* the holdout; §44 fixed the tool to read this blob, so that number
+is gone and the gate now fails if it reappears — see §4.6.
 
 ### 4.2 Calibration (ECE, lower is better)
 
@@ -236,30 +237,40 @@ change the answer:
    confidently-correct synthetic pool. A rule that can only ever return its own
    fallback is not a rule, so the control exists to prove it *can* say yes.
 
-### The measured curve (held out, calibrated)
+### The measured curve (held out, calibrated) — the SHIPPED head
 
-⚠️ **Whose head is this?** The curve is computed by `derive_threshold.py`, which
-refits a head *inside the fixture* (258 of the 369 **holdout** rows) before
-scanning. So `T = 20.0427` and `acc 0.1441` describe **that refit**, not the
-shipped `trading_head.bin` (`T = 13.325159`, holdout acc **0.2439**, §4.1). See
-§4.6 — the provenance is contaminated in the conservative direction and the
-conclusion below is unaffected, but the two heads must not be conflated.
+**Whose head is this? The shipped one, and this is now enforced.** Until §44 this
+curve came from `derive_threshold.py` refitting a head *inside the fixture* (258 of
+the 369 **holdout** rows) before scanning; `T = 20.0427` / `acc 0.1441` described
+**that refit**, not `trading_head.bin`. §44 fixed the tool to READ the shipped blob
+and score it on the real dump's holdout — **no refit**. The numbers below are the
+blob's, and `tests/test_threshold_derivation_gate.py` now fails if the tool ever
+again reports a temperature or accuracy that is not what `metrics.tsv` records.
+§4.6 keeps the defect record.
 
 ```
-fixture  tests/fixtures/head_calibration/trading   369 rows (train 258 / holdout 111)
-T = 20.0427      holdout acc 0.1441      ECE 0.0687      chance 0.1429
+dump     build/head_data/trading      1,231 rows (train 862 / holdout 369)
+blob     models/heads/trading_head.bin
+T = 13.325159    holdout acc 0.2439    calib ECE 0.0555    chance 0.1429
 accept bar = 2/7 = 0.285714
 
 confidence bucket      n     emp.acc   mean.conf
-[0.15, 0.20)          41     0.1463     0.1861
-[0.20, 0.25)          59     0.1525     0.2186
-[0.25, 0.30)           8     0.1250     0.2704
-[0.30, 0.35)           3     0.0000     0.3117
+[0.15, 0.20)           7     0.0000     0.1942
+[0.20, 0.25)         107     0.2991     0.2289   <== clears 2x & n>=30
+[0.25, 0.30)         140     0.2429     0.2735
+[0.30, 0.35)          71     0.1972     0.3192
+[0.35, 0.40)          32     0.2500     0.3742
+[0.40, 0.45)           8     0.1250     0.4156
+[0.45, 0.50)           4     0.2500     0.4835
 ```
 
-**The entire holdout confidence range is 0.15 – 0.3117.** The two buckets with
-`n >= 30` reach 0.1463 and 0.1525 against a 0.2857 bar. The best cumulative pool
-of `n >= 30` (43 rows) reaches **0.1923**. Nothing comes within 0.09 of the bar.
+**The shape is a trap, and the rule avoids it.** One *per-bucket* row —
+`[0.20,0.25)`, acc **0.2991 ≥ 0.2857**, n = 107 — would pass if the rule were read
+as "the lowest bucket boundary that passes". It is not: rows below a threshold are
+*abstained*, not discarded, so what must clear the bar is the **cumulative pool**.
+Every such pool fails — the pool at `T=0.15` is 369 rows at **0.2439**, and it rises
+only to a maximum of **0.2500** (at `T≈0.2257`), still short of 0.2857. The filter
+therefore commits nothing, which is the correct conservative answer.
 
 ### The derived value
 
@@ -272,10 +283,11 @@ because: NO threshold satisfies both conditions (>= 2x chance on the cumulative
 
 **`min_confidence` stays 0.50, fail-closed, and it is now a derived conclusion
 rather than a retained default.** The stronger finding: the trading action head
-has **no usable confidence signal at all** — its accuracy (0.1441) is
-statistically indistinguishable from chance (0.1429), so *no* threshold could have
-been principled. §39's "reported, not tuned" was the honest interim answer;
-DECISION 1 is the proof that there was nothing to tune to.
+is **close to, but not at, chance** — its accuracy (0.2439) is **1.71× chance**
+(0.1429), which is real but below the **2×** bar this rule requires, and its max
+calibrated confidence (0.4966) never reaches the `0.50` self-routing threshold, so
+it routes 0 of 369 rows. §39's "reported, not tuned" was the honest interim answer;
+DECISION 1 is the proof that, under a 2× bar, there is nothing to tune to.
 
 ### Paper only (L0)
 
@@ -287,23 +299,22 @@ live-money path — that gate is separate and C++-enforced (mandate rule 4).
 ```bash
 .venv/Scripts/python.exe tools/derive_threshold.py      # writes tools/threshold_curve.json
 ./build/bin/omniseed_threshold_derivation.exe           # re-derives from the BLOB
+.venv/Scripts/python.exe tests/test_threshold_derivation_gate.py   # §44 gate
 ```
 
-⚠️ **The two paths do NOT describe the same fit** (§4.6): the Python tool refits
-*inside the fixture* (258 of the holdout's own rows) while the C++ test loads the
-**shipped blob**. They agree on the **decision** (`0.500000`, the fallback) but
-their `T`/accuracy belong to different heads, so they must not be compared
-number-for-number.
+**Both paths now describe the same head — the shipped blob** (§44). The Python tool
+reads the blob and the real dump (1,231 rows) and scores the blob on the same
+369-row holdout; the C++ test loads the **shipped blob** and re-derives the curve
+through `DecisionHead::decide()`. They agree on the **decision** (`0.500000`, the
+fallback) *and* on the head, so their `T`/accuracy are now comparable — and the
+Python gate asserts they equal `metrics.tsv`'s `DecisionAction` row to the digit
+(`T = 13.325159`, `acc = 0.243900`).
 
-The Python tool reproduces a fit from the fixture
-(`chronological_split` + `fit_one(shuffle=False)`, deterministic — two runs give
-byte-identical JSON). The C++ test re-derives the curve from the **committed
-blob** through `DecisionHead::decide()`, applying the same rule, and asserts the
-result equals this documented value: **23 checks, 0 fail, 0 skip.** It also
-asserts the answer is the *fallback reached because nothing passed* — not a
-threshold that happened to equal 0.50 — and it carries three controls proving the
-rule can accept a good pool, reject a confident-wrong one, and reject a
-below-chance one.
+The C++ test re-derives the curve from the **committed blob** and asserts the result
+equals this documented value: **23 checks, 0 fail, 0 skip.** It also asserts the
+answer is the *fallback reached because nothing passed* — not a threshold that
+happened to equal 0.50 — and it carries three controls proving the rule can accept a
+good pool, reject a confident-wrong one, and reject a below-chance one.
 
 ---
 
@@ -365,12 +376,13 @@ of landing silently.
 
 ---
 
-## 4.6 The §41 threshold was derived from a head fitted on holdout rows
+## 4.6 The §41 threshold was derived from a head fitted on holdout rows — **FIXED (§44)**
 
-This is the genuine defect that the §43 investigation ended up finding, and it is
-**not** about `metrics.tsv`. It is about `tools/derive_threshold.py`.
+This is the genuine defect the §43 investigation ended up finding, and it is **not**
+about `metrics.tsv`. It is about `tools/derive_threshold.py`. **It was fixed in
+§44**; this section keeps the record of what was wrong and how it was corrected.
 
-`threshold_curve.json` records `n_total = 369, n_train = 258, n_holdout = 111`.
+`threshold_curve.json` used to record `n_total = 369, n_train = 258, n_holdout = 111`.
 That reads as "369 rows, split 258/111". But 369 is the **fixture** — the §32
 **holdout** — and the script did precisely this:
 
@@ -390,27 +402,43 @@ scored the remaining 111. Consequences:
 - `n_total` is a **mislabel**: it is the fixture size, and calling it the total
   makes the contamination invisible.
 
-**The conclusion is unaffected and in fact conservative.** A head trained partly on
-holdout rows beat chance by only 1.008×; a head that never saw them (the shipped
-one) still reads 1.707× as recorded, and *nothing* clears the 2× bar either way —
-so `min_confidence` stays 0.50 for the right reason. §41's DECISION 1 stands.
+**The conclusion was unaffected and in fact conservative.** A head trained partly on
+holdout rows beat chance by only 1.008×; the shipped head — which never saw them —
+reads **1.707×** (0.2439), and *nothing* clears the 2× bar either way — so
+`min_confidence` stays 0.50 for the right reason. §41's DECISION 1 stands
+unchanged, and the fix **strengthened** it: the head is `1.71×` chance, not
+`1.01×`, and the honest record now says so.
 
-**What is owed.** `derive_threshold.py` should read the **real dump**
-(`state/trading`, 1,231 rows from `train_heads.py`), which fits a clean model and
-then derives the threshold from *its own* holdout — one fit, one split, one
-provenance. Recorded here as a follow-up with its own milestone, **not** patched
-mid-flight: it changes a committed number and the C++ re-derivation test that
-pins it. Both are named in `docs/HOLDOUT_DEFECT.md` §"What is owed".
+### The fix (§44)
 
-**The C++ half is already clean.** `omniseed_threshold_derivation` does *not* use
-the Python path — it loads the **shipped blob** and re-derives:
-`head: loaded fitted projection + calibrated (n=369, ece=5.55%)`,
-`derived=0.500000`, `max_conf=0.4966`, **23 checks, 0 fail**. So the *conclusion*
-(`min_confidence = 0.50`) is confirmed against the real head by a gated test; only
-the Python tool's `T`/`0.1441` provenance is contaminated.
+`derive_threshold.py` now:
 
-⚠️ **Do not read `threshold_curve.json`'s `holdout_acc` as the shipped head's
-accuracy.** The shipped head's held-out accuracy is **0.2439** (§4.1, correct).
+1. **reads the shipped blob** `models/heads/trading_head.bin` via
+   `uncertainty_audit.load_decision` (no model is fitted here at all);
+2. loads the **real dump** `build/head_data/trading` (1,231 rows) and rebuilds the
+   action teacher with the *same* `train_heads.py::build_action_labels`;
+3. splits the dump chronologically (862 train / 369 holdout) and **scores the blob
+   on the 369-row holdout** — one fit, one split, one provenance;
+4. **relabels** `n_total` → `n_dataset` (the real 1,231) and adds `n_train`,
+   `n_holdout`, `fixture_n_holdout`, `holdout_matches_fixture`, `blob_calib_samples`,
+   `blob_calib_ece`; `ece_calibrated` is now `blob_calib_ece` (read from the blob,
+   not measured on a refit);
+5. **cross-checks** its dump-derived holdout size against the committed fixture and
+   reports `OK` / `** MISMATCH **`.
+
+The curve now reads `T = 13.325159`, `holdout acc 0.2439` — **the shipped head's own
+numbers** — and the answer is still `0.500000`, the reached fallback.
+
+**The gate.** `tests/test_threshold_derivation_gate.py` (`omniseed_threshold_gate`)
+asserts the tool's output against the artifact's **own** recorded metrics: its
+`temperature`/`holdout_acc`/`blob_calib_samples`/`blob_calib_ece` must equal
+`tests/fixtures/head_calibration/trading/metrics.tsv`'s `DecisionAction` row to the
+digit, the mislabel `n_total` must be absent, and the fallback must be *reached*.
+Direction A (committed JSON) is stdlib-only so it runs in CI; direction B re-runs
+the tool (numpy-gated) so the file is provably its output. Both halves were shown to
+fail when the temperature or the accuracy was corrupted to the old refit's values
+and to pass when restored. The old defect's signature (`T=20.042676`, `0.1441`) is
+asserted *absent*.
 
 ---
 
