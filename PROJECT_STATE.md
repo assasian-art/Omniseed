@@ -3800,6 +3800,12 @@ them. **One prediction, one score** — re-resolving a row is refused.
 | max calibrated confidence | —           | **0.4966**      | —             |
 | filter verdicts           | 367         | **0**           | —             |
 
+> **The `hit_rate` / `metrics.tsv` 0.2439 figure is a genuine HELD-OUT number and
+> is NOT corrected.** An earlier draft of §43 asserted this column was in-sample;
+> that was wrong and is retracted — `f.n()` is the fixture size and the fixture
+> holds only the holdout rows. Verified four ways in `docs/HOLDOUT_DEFECT.md`. The
+> historical record above is left intact.
+
 The fitted head is **richly varying and the filter still commits nothing** —  
 every calibrated confidence sits below `min_confidence = 0.50`. That is  
 fail-closed working as §32 predicted, and it is a better result than a filter  
@@ -4081,3 +4087,157 @@ The board grew **41 → 43** (§41 `omniseed_threshold_derivation`, §42
 Note: the `ctest` wrapper reported a non-zero exit from a sandbox file-read
 denial during teardown (`KERNEL32.DLL.mui`), *after* `100% tests passed`. That is
 a sandbox artifact, not a test failure — the pass line is authoritative.
+
+## 43. MODALITY DUMP MODES, D1/D2/D3 — and a retraction (2026-10-01)
+
+**Step 3's code half, plus the owner's three directives, plus one correction of my
+own.** The headline finding of this milestone was **wrong**, and undoing it is
+part of the deliverable.
+
+### 43.1 `omniseed_dump_hidden` gained `vision` and `audio` modes
+
+Usage: `omniseed_dump_hidden.exe <vision|audio> <model.gguf> <rows.tsv> <out_dir>
+[--codec focal]`. (It is the **separate** `omniseed_dump_hidden.exe` binary, and
+the model path is a **positional** argument — not `omniseed.exe dump-hidden
+--mode …`.)
+
+Both go **through `MultimodalBridge`**, not around it, so a dumped modality row is
+assembled by exactly the production fusion path (`tests/test_modality_dump.cpp`
+proves the path logic; the modes were run end-to-end on real files).
+
+- **vision**: `load_image` (netpbm P6 + 24-bit BMP, strict header reader) →
+  `VisionEncoder::encode` → `[M,768]` → `bridge.fuse("image", flat, {})` →
+  `collector.feed_and_capture(...)`. Proven on two test PPMs: `n=2 E=768` stride=1,
+  `hidden.f32` 6144 B = 2×768×4, two distinct finite rows, `labels.tsv`
+  `img0@49 → indoor` / `img1@49 → outdoor` (49 = the 7×7 `UniCompress` target).
+- **audio**: `--codec focal` → `FocalCodec::encode` → `bridge.fuse("audio", {},
+  ids)`. Proven on all 12 RAVDESS clips, **`rate=16000`** — proving §42's
+  resampler fired on the 48 kHz input — 9216 floats = 12 rows, all finite, all
+  distinct, balanced `{angry 3, happy 3, neutral 3, sad 3}`.
+- **`--codec mel` is REFUSED, by design.** `WhisperTiny::encode` emits `[T/2, 384]`
+  and there is **no audio→E (384→768) projection in this tree** (vision has
+  `models/vision-proj.gguf`; audio has nothing). Zero-padding or a random
+  projection would fit a head to a fabrication, so the mode dies with the reason
+  and records `"no_audio_projection": "TRUE"` in `meta.json`. **This is the real
+  blocker on `audio.emotion`** — it is a missing adapter, not missing data.
+- `dump_hidden.cpp` keeps its honesty contract: if the backbone is absent, or a
+  text encodes to zero tokens, it writes **nothing** and exits non-zero; it never
+  synthesises a hidden state. The `--whisper` flag was **removed** (it would have
+  been write-only dead code).
+
+### 43.2 ⭐ RETRACTION — the "in-sample `holdout_acc`" finding was FALSE
+
+An earlier draft of this milestone claimed every published accuracy was in-sample.
+**It was wrong.** The chain: `test_calibration.cpp::score_decision()` loops
+`f.n()` rows, and `f.n()` was read as the *dataset* size (1,231); it is the
+**fixture** size (369), and `train_heads.py::emit_fixture()` writes **only the
+holdout rows** (`idx = rr["_test_idx"] = hold_used = hold`). So scoring every
+fixture row scores only the 30% the fit never saw. **`holdout_acc = 0.2439` is a
+genuine held-out number and no correction to `metrics.tsv` was ever owed.**
+
+Verified four ways: fixture `hidden.f32` rows == `labels.tsv` rows ==
+`metrics.tsv` `n` (71/71/71 and 369/369/369); 1,231 × 0.30 ≈ 369; `emit_fixture`
+writes `H[idx]`; and the shipped blob's own header records `calib_samples = 369`.
+
+The "second discrepancy" (fixture cannot reproduce the blob, T 13.325 vs 20.043)
+was also a **non-sequitur** — refitting on 369 holdout rows cannot reproduce a
+head fitted on 862 other rows. Withdrawn.
+
+**Lesson recorded** (`docs/HOLDOUT_DEFECT.md`): *before accusing a committed
+artifact of being wrong, establish what the artifact's inputs actually are.* The
+§38 F3 shape ("a test must not share the definition it checks") is intact, but the
+failure here was in the **auditor**, not the system.
+
+### 43.3 The REAL defect the investigation found — in §41, not §32
+
+`tools/derive_threshold.py` (`threshold_curve.json`) records
+`n_total = 369, n_train = 258, n_holdout = 111` — but 369 is the **fixture**, i.e.
+the §32 holdout, and the script does `chronological_split` on *it*:
+
+```python
+meta, H, ids, colnames, labels = th.load_dump(args.fixture)   # the FIXTURE (369)
+tr, hold = th.chronological_split(len(ya))                    # 258 / 111
+```
+
+- Its `temperature = 20.042676` / `holdout_acc = 0.1441` belong to **that refit**,
+  not the shipped `trading_head.bin` (**T = 13.325159, held-out acc 0.2439**).
+- `0.1441` is **optimistically biased** (258 of its eligible rows were in its own
+  training set).
+- `n_total` is a **mislabel** — the fixture size presented as the total, which is
+  what hid the contamination.
+- **DECISION 1's conclusion is unaffected and conservative**: a head *helped* by
+  seeing 258 holdout rows reached only 1.008× chance; the clean head reads
+  1.707×. Neither clears 2×, so `min_confidence = 0.50` stands for the right
+  reason. **§41 is NOT invalidated.**
+
+**Owed (own milestone):** point `derive_threshold.py` at the real dump
+(`state/trading`, 1,231 rows), fit one model, derive from its own holdout — one
+fit, one split, one provenance. That regenerates a committed number *and* the
+gated C++ test that pins it, so it is not patched mid-flight.
+
+### 43.4 D1 — per-head signal audit (`tools/signal_audit.py`)
+
+Publishes, from the committed fixtures, whether each fitted head carries signal:
+
+| set | n_holdout | accuracy | chance | ratio | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `language.intent` | 71 | 0.6338 | 0.1429 | 4.44x | SIGNAL |
+| `language.language` | 71 | 0.8451 | 0.2500 | 3.38x | SIGNAL |
+| `trading.regime` | 369 | 0.7046 | 0.3333 | 2.11x | SIGNAL |
+| `language.sentiment` | 71 | 0.6761 | 0.3333 | 2.03x | SIGNAL |
+| `DecisionAction` | 369 | 0.2439 | 0.1429 | 1.71x | **NO-SIGNAL** |
+
+8 sets unfitted, listed with reasons so absence is not read as success. The bar is
+DECISION 1's (`>= 2x chance` AND `n >= 30`), reused not reinvented. **§32's 0.2439
+is the shipped head's held-out accuracy; §41's 0.1441 is a contaminated refit.**
+
+### 43.5 D2 — strategic pivot (`docs/EDGE_RESEARCH.md`)
+
+- `trading.action` → **VETO/ABSTAIN filter only; it may only REMOVE exposure, never
+  originate a position.**
+- `trading.regime` → **load-bearing regime classifier** (2.11× chance, n=369);
+  may gate strategies.
+- Rule-based engines (regime, strategy zoo, sniper, risk) stay the **edge source**
+  — parity-tested, interpretable; their parity tests prove what they *compute*,
+  **not** that it is profitable.
+- Four **pre-registered** research tracks — all marked **NOT RUN**: (A) longer
+  horizons 5/10/21d, (B) monster features as inputs, (C) multi-asset pooled
+  training, (D) rank/quantile targets. Adoption bar: `>= 2x chance` on a genuine
+  holdout with `n >= 30`. Rejection log started, empty. Baseline to beat: the
+  shipped blob's **0.2439 (1.71×)**.
+
+### 43.6 D3 — owner-voice path (`RUNBOOK.md` §5)
+
+A guide for `omniseed enroll-audio <dir> [audio.wake|audio.speaker]`: the exact
+command, the `<label>_<anything>.wav` naming rule, ~10 suggested phrases per label
+(`yes`/`no` for wake; `known`/`unknown` for speaker, the latter needing 1–2 *other*
+speakers), where `labels.tsv` lands (in the same folder, `group = owner`), that
+misnamed/unreadable files are **reported+skipped** and a single-clip class is
+warned **UNFITTED**, and that the fit is a separate offline step
+(`omniseed_dump_hidden.exe audio <model.gguf> <dir>/labels.tsv <out> --codec focal`
+→ `train_heads.py`) which **must not run until the owner records**. Stated plainly that the `mel` path is blocked by the missing
+audio→E adapter, so recording now readies the data for the day it exists.
+
+### 43.7 Files
+
+- `tools/dump_hidden.cpp` — `vision` + `audio` modes; `--projector`, `--codec`;
+  `load_ppm`/`load_bmp`/`load_image`; manifest reader; PNG/JPG refused.
+- `tests/test_modality_dump.cpp` — **33 checks, 0 fail**, UNGATED (new).
+- `tests/test_calibration.cpp` — **C4 rewritten** to assert the fixture *is* the
+  holdout (was: asserted the false defect). Syntax-checked with `cl /Zs /W4`,
+  clean.
+- `tools/signal_audit.py` — D1 table; false in-sample caveat **removed**.
+- `docs/HOLDOUT_DEFECT.md` — rewritten as the **retraction record** + the real §41
+  defect.
+- `docs/CALIBRATION.md` — §4.1 restored as held out; §4.5 verified-not-assumed;
+  §4.6 states the §41 provenance defect; §6 corrected.
+- `docs/EDGE_RESEARCH.md` — D2, corrected.
+- `RUNBOOK.md` — D3 owner guide.
+- `CMakeLists.txt` — `omniseed_modality_dump` target + `add_test`.
+
+### 43.8 Board
+
+Board grows **43 → 44** (`omniseed_modality_dump`). The C4 rewrite changes
+`omniseed_calibration`'s assertions without changing its count. Run the full local
+board before pushing (see §42's note on the `ctest` teardown exit code).
+

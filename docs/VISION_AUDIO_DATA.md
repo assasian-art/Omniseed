@@ -247,6 +247,15 @@ unfitted.** That is the correct outcome, not a gap to close.
 python tools/get_modality_data.py --plan      # what each set needs, and why
 python tools/get_modality_data.py --fetch ravdess cifar10
 python tools/get_modality_data.py --list      # what is actually installed
+
+# Turn fetched media into h[E] rows via the production fusion path (§43).
+# NOTE: this is the SEPARATE binary omniseed_dump_hidden.exe (not omniseed.exe),
+# and the model path is a POSITIONAL 2nd argument.
+./build/bin/omniseed_dump_hidden.exe vision \
+    models/rwkv7-0.1B-ternary.gguf <dir>/labels.tsv build/dump_vision
+./build/bin/omniseed_dump_hidden.exe audio \
+    models/rwkv7-0.1B-ternary.gguf <dir>/labels.tsv build/dump_audio --codec focal
+# --codec mel is REFUSED: no audio->E adapter exists (see §6 item 4).
 ```
 
 A single run refuses anything over `--max-mb` (default 250) **even mid-stream**,
@@ -269,9 +278,26 @@ gigabytes on someone's metered connection is a worse failure than one that says
    bins mean something else — silently, with no error. That is the §34
    silent-failure shape. `load_wav_bytes` now resamples to 16 kHz and **logs the
    conversion**, so the rate is auditable rather than assumed.
-3. `vision` / `audio` modes in `tools/dump_hidden.cpp`, routed through
-   `MultimodalBridge` so the dumped `h[E]` is the *same* `h[E]` the runtime
-   produces — not a re-derivation (§33's joint exists precisely for this).
-4. Fitting `language.task` + `general.routing`, which need no external data.
-5. Re-running §35's uncertainty audit so `provenance()` flips to **TRAINED** for
-   each set that now has data — and stays visibly **unfitted** for the rest.
+3. **`vision` / `audio` modes in `tools/dump_hidden.cpp` — DONE (§43).** Both route
+   through `MultimodalBridge`, so the dumped `h[E]` is the *same* `h[E]` the
+   runtime produces — not a re-derivation (§33's joint exists precisely for this).
+   `vision` was proven end-to-end on PPMs (`n=2 E=768`, two distinct finite rows);
+   `audio --codec focal` on all 12 RAVDESS clips (**`rate=16000`**, proving §42's
+   resampler fired, 12 distinct balanced rows). PNG/JPG are refused by an
+   extension gate rather than half-decoded.
+4. ⚠️ **`audio --codec mel` is BLOCKED by a missing adapter (§43) — this is the
+   real obstacle to `audio.emotion`, not the data.** `WhisperTiny::encode` emits
+   `[T/2, 384]` but this backbone's `E = 768`, and there is **no audio→E
+   projection in the tree** — vision has `models/vision-proj.gguf`, audio has
+   nothing equivalent. `dump_hidden` therefore **refuses** `--codec mel` with the
+   reason, and records `"no_audio_projection": "TRUE"` in the dump's `meta.json`.
+   672 RAVDESS clips are on disk and ready; the fit waits on the adapter.
+   Zero-padding or a random projection would fit a head to a fabrication and was
+   rejected. Pinned by `tests/test_modality_dump.cpp`.
+5. Fitting `language.task` + `general.routing`, which need no external data.
+   (**Open:** `language.task` has zero labelled rows anywhere and no consumer —
+   see `docs/CALIBRATION.md` §6; the honest move is to leave it unfitted.)
+6. Re-running §35's uncertainty audit so `provenance()` flips to **TRAINED** for
+   each set that now has data — and stays visibly **unfitted** for the rest. Note
+   this is **blocked** for `audio.*` (no adapter, and wake/speaker need the owner's
+   voice) and for `vision.*` (no corpus, and disk is at ~0.6 GB free).

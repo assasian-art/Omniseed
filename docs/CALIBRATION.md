@@ -157,6 +157,11 @@ is not a held-out fold.
 
 ### 4.1 Accuracy
 
+These are **held-out** numbers: the fixture each row is scored on contains exactly
+the holdout rows and nothing else, so scoring every fixture row scores only the
+30% the fit never saw (verified in §4.5; the earlier in-sample claim was retracted
+in §43).
+
 | head | K | holdout n | accuracy | macro-F1 | T |
 |---|---|---|---|---|---|
 | `language.language` | 4 | 71 | **0.845** | — | 5.161 |
@@ -164,6 +169,10 @@ is not a held-out fold.
 | `language.sentiment` | 3 | 71 | **0.676** | — | 3.583 |
 | `language.intent` | 7 | 71 | **0.634** | — | 23.441 |
 | `DecisionAction` | 7 | 369 | **0.244** | 0.133 | 13.325 |
+
+⚠️ **`T` here is the shipped blob's temperature.** Do not confuse it with §41's
+`T = 20.0427`, which belongs to a *different* head §41 refitted inside the holdout
+— see §4.6.
 
 ### 4.2 Calibration (ECE, lower is better)
 
@@ -229,6 +238,13 @@ change the answer:
 
 ### The measured curve (held out, calibrated)
 
+⚠️ **Whose head is this?** The curve is computed by `derive_threshold.py`, which
+refits a head *inside the fixture* (258 of the 369 **holdout** rows) before
+scanning. So `T = 20.0427` and `acc 0.1441` describe **that refit**, not the
+shipped `trading_head.bin` (`T = 13.325159`, holdout acc **0.2439**, §4.1). See
+§4.6 — the provenance is contaminated in the conservative direction and the
+conclusion below is unaffected, but the two heads must not be conflated.
+
 ```
 fixture  tests/fixtures/head_calibration/trading   369 rows (train 258 / holdout 111)
 T = 20.0427      holdout acc 0.1441      ECE 0.0687      chance 0.1429
@@ -273,7 +289,13 @@ live-money path — that gate is separate and C++-enforced (mandate rule 4).
 ./build/bin/omniseed_threshold_derivation.exe           # re-derives from the BLOB
 ```
 
-Both paths must agree. The Python tool reproduces the fit from the fixture
+⚠️ **The two paths do NOT describe the same fit** (§4.6): the Python tool refits
+*inside the fixture* (258 of the holdout's own rows) while the C++ test loads the
+**shipped blob**. They agree on the **decision** (`0.500000`, the fallback) but
+their `T`/accuracy belong to different heads, so they must not be compared
+number-for-number.
+
+The Python tool reproduces a fit from the fixture
 (`chronological_split` + `fit_one(shuffle=False)`, deterministic — two runs give
 byte-identical JSON). The C++ test re-derives the curve from the **committed
 blob** through `DecisionHead::decide()`, applying the same rule, and asserts the
@@ -282,6 +304,108 @@ asserts the answer is the *fallback reached because nothing passed* — not a
 threshold that happened to equal 0.50 — and it carries three controls proving the
 rule can accept a good pool, reject a confident-wrong one, and reject a
 below-chance one.
+
+---
+
+## 4.5 Per-head signal audit — D1 (2026-10-01)
+
+The standing question after the action head landed at ≈ chance: **where does real
+signal actually live?** Assuming is not an answer, so the table publishes it.
+Regenerate with:
+
+```bash
+.venv/Scripts/python.exe tools/signal_audit.py --markdown   # add --json for machines
+```
+
+The rule is the §41 shape reused verbatim: `chance = 1/K`; a set is **SIGNAL**
+when `accuracy >= 2*chance` on `n >= 30`; **INSUFFICIENT-DATA** below `n = 30`;
+**NO-SIGNAL** otherwise.
+
+```
+set                    n_holdout  accuracy    chance   ratio  verdict
+language.intent               71    0.6338    0.1429   4.437  SIGNAL
+language.language             71    0.8451    0.2500   3.380  SIGNAL
+trading.regime               369    0.7046    0.3333   2.114  SIGNAL
+language.sentiment            71    0.6761    0.3333   2.028  SIGNAL
+DecisionAction               369    0.2439    0.1429   1.707  NO-SIGNAL
+SUMMARY: 5 fitted (4 SIGNAL, 1 NO-SIGNAL, 0 INSUFFICIENT-N), 8 unfitted
+```
+
+⚠️ **These accuracies ARE held out — verified, not assumed (§43 retraction).** An
+earlier draft of this milestone claimed `holdout_acc` was in-sample because
+`score_decision()` loops `f.n()` rows. That was wrong: `f.n()` is the **fixture**
+size, and `tools/train_heads.py::emit_fixture()` writes **only the holdout rows**
+into the fixture (`idx` = `hold_used` = `hold`). So scoring every fixture row *is*
+scoring the holdout. Verified from the tree: each fixture's `hidden.f32` row count
+equals `labels.tsv`'s and equals `metrics.tsv`'s `n` (71/71/71/369), and the
+shipped `trading_head.bin` records `cals = 369` — it was calibrated on those 369
+rows, which are the 30% the fit never saw. The full trace is in
+`docs/HOLDOUT_DEFECT.md`.
+
+The one *real* defect this milestone found is adjacent and narrower — see §4.6.
+
+**The eight unfitted sets** (the tool hardcodes them with reasons so the table can
+never imply coverage it does not have): `language.task` (no consumer — see §6),
+`vision.scene` / `vision.anomaly` (no image corpus), `audio.wake` /
+`audio.speaker` (owner voice not yet recorded), `audio.emotion` (no audio→E
+adapter), `general.routing` / `general.priority` (no labelled rows anywhere).
+
+**What this changes.** `trading.regime` at **2.114× chance on 369 held-out rows**
+is the only trading-side set with real signal. That is the fact that makes D2's
+repositioning defensible.
+
+**Gating.** `tests/fixtures/head_calibration/*/metrics.tsv` is the source; a
+regeneration test asserts the numbers above still come out of the committed
+blobs, so a re-fit that moves a ratio cannot land silently.
+
+---
+
+## 4.6 The §41 threshold was derived from a head fitted on holdout rows
+
+This is the genuine defect that the §43 investigation ended up finding, and it is
+**not** about `metrics.tsv`. It is about `tools/derive_threshold.py`.
+
+`threshold_curve.json` records `n_total = 369, n_train = 258, n_holdout = 111`.
+That reads as "369 rows, split 258/111". But 369 is the **fixture** — the §32
+**holdout** — and the script did precisely this:
+
+```python
+meta, H, ids, colnames, labels = th.load_dump(args.fixture)   # the FIXTURE, 369 rows
+tr, hold = th.chronological_split(len(ya))                    # 258 / 111
+```
+
+So it re-fitted a head on **258 rows that are themselves in the §32 holdout**, then
+scored the remaining 111. Consequences:
+
+- Its `temperature = 20.042676` and `holdout_acc = 0.1441` describe **that** head,
+  not the shipped `trading_head.bin` (whose T is 13.325159). The two are different
+  fits; the doc previously implied one head had two numbers.
+- `0.1441` is **optimistically biased** (258 of its 369 test-eligible rows were in
+  its training set) — yet it *still* found no threshold clearing 2× chance.
+- `n_total` is a **mislabel**: it is the fixture size, and calling it the total
+  makes the contamination invisible.
+
+**The conclusion is unaffected and in fact conservative.** A head trained partly on
+holdout rows beat chance by only 1.008×; a head that never saw them (the shipped
+one) still reads 1.707× as recorded, and *nothing* clears the 2× bar either way —
+so `min_confidence` stays 0.50 for the right reason. §41's DECISION 1 stands.
+
+**What is owed.** `derive_threshold.py` should read the **real dump**
+(`state/trading`, 1,231 rows from `train_heads.py`), which fits a clean model and
+then derives the threshold from *its own* holdout — one fit, one split, one
+provenance. Recorded here as a follow-up with its own milestone, **not** patched
+mid-flight: it changes a committed number and the C++ re-derivation test that
+pins it. Both are named in `docs/HOLDOUT_DEFECT.md` §"What is owed".
+
+**The C++ half is already clean.** `omniseed_threshold_derivation` does *not* use
+the Python path — it loads the **shipped blob** and re-derives:
+`head: loaded fitted projection + calibrated (n=369, ece=5.55%)`,
+`derived=0.500000`, `max_conf=0.4966`, **23 checks, 0 fail**. So the *conclusion*
+(`min_confidence = 0.50`) is confirmed against the real head by a gated test; only
+the Python tool's `T`/`0.1441` provenance is contaminated.
+
+⚠️ **Do not read `threshold_curve.json`'s `holdout_acc` as the shipped head's
+accuracy.** The shipped head's held-out accuracy is **0.2439** (§4.1, correct).
 
 ---
 
@@ -309,11 +433,14 @@ below-chance one.
 
 ## 6. Honest gaps (do not overclaim)
 
-- **The trading action head is LOW: accuracy 0.244.** `CLOSE` and `HEDGE` have
-  **zero** holdout recall. Per-class recall:
+- **The trading action head is LOW: holdout accuracy 0.2439 (1.71× chance).** It is
+  a *held-out* number (§4.5). `CLOSE` and `HEDGE` have **zero** holdout recall.
+  Per-class recall:
   `{ABSTAIN 0.20, HOLD 0.015, BUY 0.324, SELL 0.474, CLOSE 0.0, HEDGE 0.0, EXPLAIN 0.026}`.
   It is well-calibrated *and* weak — the two are independent. Calibration makes
-  a weak head **safe**, not good.
+  a weak head **safe**, not good. Its role is a **VETO/ABSTAIN filter, never a
+  directional predictor** — see `docs/EDGE_RESEARCH.md`.
+- **`trading.regime` is the load-bearing learned head (2.114× chance, n=369).**
 - **The regime head never predicts `trend_down`** — there were only 8 such bars
   in 1,231 (label counts `{trend_up 58, trend_down 8, range 1050, high_vol 115}`).
   Accuracy 0.705 is dominated by the majority class; the macro-F1 of 0.389 is the
@@ -326,7 +453,11 @@ below-chance one.
 - **`assets` and `invalidation` are written empty / zero** in the blobs. Treat as
   "unknown", **never** as "no stop".
 - **Nothing else is trained.** Vision and audio still have label spaces and no
-  logic. There is no learned token head.
+  logic. There is no learned token head. The modality **dump paths now exist**
+  (vision and audio both go through `MultimodalBridge` — §43), but vision has no
+  corpus and audio has no `[T/2,384] → E=768` adapter, so neither can be fitted:
+  see `docs/VISION_AUDIO_DATA.md`. `audio.wake` / `audio.speaker` additionally
+  need the owner's recorded voice (`omniseed enroll-audio`, RUNBOOK §5).
 - **The mandate's `n_samples=1255`** was an assumption; the real numbers are
   167/71 (language) and 862/369 (trading).
 

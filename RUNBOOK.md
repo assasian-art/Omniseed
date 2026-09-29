@@ -122,9 +122,10 @@ months of commits before anyone noticed.
 `omniseed_decision_bridge`, `omniseed_regime_parity`,
 `omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
 `omniseed_agent_modules`, `omniseed_uncertainty_split`,
-`omniseed_heads_batch`, `omniseed_streaming_decision` and
-`omniseed_feedback_hook` are deliberately registered **outside** the gate. The
-last six need only **committed** fixtures (no model, no `.venv`, no network), so
+`omniseed_heads_batch`, `omniseed_streaming_decision`,
+`omniseed_feedback_hook`, `omniseed_threshold_derivation` and
+`omniseed_modality_dump` are deliberately registered **outside** the gate. The
+last eight need only **committed** fixtures (no model, no `.venv`, no network), so
 they run everywhere including CI.
 
 ### The head stack (fast, fully offline)
@@ -135,7 +136,7 @@ they run everywhere including CI.
 ./build/bin/omniseed_unified_output.exe   # 267 checks, incl. the fast path
 ./build/bin/omniseed_language_heads.exe   # 614 checks
 ./build/bin/omniseed_soul.exe             # 378 checks, persona + memory + decay
-./build/bin/omniseed_calibration.exe      # 180 checks, fitted heads + ECE
+./build/bin/omniseed_calibration.exe      # 189 checks, fitted heads + ECE
 ./build/bin/omniseed_multimodal.exe       # 110 checks, TokenBus + the joint
 ./build/bin/omniseed_agent_modules.exe    # 131 checks, the last 4 uncovered modules
 ./build/bin/omniseed_uncertainty_split.exe # 154 checks, aleatoric vs epistemic
@@ -445,6 +446,15 @@ Training is Python and **never runs in the runtime**. The runtime only loads the
 ./build/bin/omniseed_dump_hidden.exe market \
     models/rwkv7-0.1B-ternary.gguf models/market/AAPL_1d.csv build/dump_market --stream
 
+# modality rows go through MultimodalBridge, so the h[E] is the runtime's own (§43)
+./build/bin/omniseed_dump_hidden.exe vision \
+    models/rwkv7-0.1B-ternary.gguf <dir>/labels.tsv build/dump_vision
+./build/bin/omniseed_dump_hidden.exe audio \
+    models/rwkv7-0.1B-ternary.gguf <dir>/labels.tsv build/dump_audio --codec focal
+# --codec mel is REFUSED — no audio->E adapter exists in this tree (§43).
+# NOTE: this is the SEPARATE omniseed_dump_hidden.exe binary, not omniseed.exe,
+# and the model path is a POSITIONAL 2nd argument.
+
 # 2. Fit + calibrate + write blobs and fixtures
 python tools/train_heads.py        # or .venv/Scripts/python.exe tools/train_heads.py
 
@@ -638,6 +648,91 @@ they were — a journal that restored while its ledger did not would silently re
 every trust factor to neutral.
 
 Full detail: **`docs/FEEDBACK.md`**.
+
+### Enrolling your own voice (`enroll-audio`) — owner action required
+
+Two audio label sets are deliberately **not** downloaded: `audio.wake` (is this
+address to me?) and `audio.speaker` (is this the owner?). Both are properties of
+*a voice*, and the only voice that matters here is **yours**. A wake head fitted
+on 3,000 strangers from a 2017 corpus is fitted on the wrong distribution; a
+speaker head can only "know" a speaker it has heard. So the dataset is built from
+clips you record, and both sets stay **UNFITTED** until you do. This is the
+intended state, not a missing step — `tools/signal_audit.py` lists them under
+`unfitted` and says why.
+
+**1. Record ~10 phrases per label into one flat folder.** Any recorder works
+(Windows Voice Recorder, Audacity, your phone). 16-bit mono is ideal, but **any
+sample rate is accepted** — the loader resamples to 16 kHz and logs it, so a
+48 kHz recording is *not* silently mis-melled (§42 fixed exactly that bug).
+Aim for 3–5 seconds per clip, and vary it: closer/further, normal/quiet.
+
+The **filename carries the label**: `<label>_<anything>.wav`. The label is
+everything before the **first** `_`, and it must be one of this set's exact
+labels (lowercase):
+
+| Label set | Labels the head knows | Example filenames |
+|---|---|---|
+| `audio.wake` | `yes`, `no` | `yes_01.wav`, `yes_02.wav`, `no_01.wav` … |
+| `audio.speaker` | `known`, `unknown` | `known_a.wav`, `known_b.wav`, `unknown_a.wav` … |
+
+Suggested `audio.wake` phrases — say each 5×, half as `yes_*`, half as `no_*`:
+
+| # | Phrase | Label it as |
+|---|---|---|
+| 1 | "Omniseed" | `yes` |
+| 2 | "Hey Omniseed" | `yes` |
+| 3 | "Omniseed, are you there?" | `yes` |
+| 4 | "Omniseed, check the book" | `yes` |
+| 5 | "Wake up, Omniseed" | `yes` |
+| 6 | "What's the time?" | `no` |
+| 7 | "Turn on the kitchen lights" | `no` |
+| 8 | "Did you send that message?" | `no` |
+| 9 | "Play something else" | `no` |
+| 10 | "Thanks, goodbye" | `no` |
+
+For `audio.speaker`, say **anything** (a fixed sentence is fine) 5× yourself as
+`known_*`, then have **1–2 other people** — or play a podcast/another room — say
+the same sentence 5× as `unknown_*`. A speaker head fitted only on your own voice
+has no negative class and will report unfitted; that is the honest outcome, not a
+bug. ⚠️ **A single clip in a class cannot be split** — the tool warns
+`label '<x>' has ONE clip … will fit as UNFITTED`. Two per label is the floor;
+five is comfortable.
+
+**2. Build the manifest.**
+
+```bash
+./build/bin/omniseed.exe enroll-audio <dir> [audio.wake|audio.speaker]
+```
+
+- `<dir>` is the folder holding the WAVs; `[label-set]` defaults to `audio.wake`.
+- Output is `labels.tsv` written **into that same folder**, with the header
+  `file  <label-set>  group  sample_rate  n_samples` and `group` always `owner`.
+- Files with **no `_` prefix** or an **unreadable WAV** are **reported and
+  skipped** — never folded into a label. A mislabelled enrolment clip is a
+  permanently wrong head, so a skip is the correct outcome. If **nothing** is
+  usable the tool writes **no** manifest and exits non-zero rather than shipping a
+  half-empty one.
+
+**3. Fit — a separate, offline step. Do this only after you have recorded.**
+
+```bash
+# WAV -> h[E] hidden states (must reach the backbone; writes nothing if it cannot)
+# NOTE: separate binary omniseed_dump_hidden.exe; model path is POSITIONAL.
+./build/bin/omniseed_dump_hidden.exe audio \
+    models/rwkv7-0.1B-ternary.gguf <dir>/labels.tsv state/audio_owner --codec focal
+# hidden states -> fitted heads (writes models/heads/*.bin)
+.venv/Scripts/python.exe tools/train_heads.py
+```
+
+⚠️ **The fit is blocked today by a real gap, not by your recordings.** The
+`--codec focal` path works, but the `mel` path — Whisper's `[T/2, 384]` frames —
+has **no adapter to the backbone's `E = 768`** in this tree (vision has
+`models/vision-proj.gguf`; audio has nothing equivalent), so `--codec mel` is
+**refused on purpose** rather than zero-padded into a fabrication. This is
+recorded in `docs/VISION_AUDIO_DATA.md` and asserted by
+`tests/test_modality_dump.cpp`. **Record now and the data is ready**; the fit
+lands the day an audio→E adapter exists. Do **not** substitute a random
+projection to make the number appear.
 
 ---
 

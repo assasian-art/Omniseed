@@ -908,6 +908,27 @@ if(OMNISEED_BUILD_TESTS)
         set_tests_properties(omniseed_audio_resample PROPERTIES TIMEOUT 300)
     endif()
 
+    # §43 — the modality dump contract. tools/dump_hidden.cpp grew `vision` and
+    # `audio` modes so the modality heads can be fitted on h[E] the runtime also
+    # produces. This pins the parts checkable WITHOUT the 243 MB backbone, and
+    # in particular THE REFUSAL: Whisper emits [T/2,384] while E is 768, and
+    # there is no audio->E adapter in this tree, so `--codec mel` refuses rather
+    # than zero-padding a fabrication into a head's training data.
+    # UNGATED — no weights, no fixtures, so it actually runs in CI.
+    add_executable(omniseed_modality_dump tests/test_modality_dump.cpp)
+    target_include_directories(omniseed_modality_dump PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_modality_dump PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_modality_dump PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_modality_dump PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_modality_dump COMMAND omniseed_modality_dump
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_modality_dump PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # Dumper used by tests/test_regime_parity.py to diff C++ against the Python
     # oracle. Not a test itself.
     add_executable(omniseed_regime_dump tests/regime_dump.cpp)

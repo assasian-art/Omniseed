@@ -47,6 +47,7 @@
 #include "omniseed/decision_head.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -864,6 +865,74 @@ static void part_c_held_out_calibration() {
                 CHECK(score_classification(h, f, name, cr, kr));
                 h.set_temperature(si, T);
                 report_and_check(name, f, cc, kc, cr, kr);
+            }
+        }
+    }
+
+    // ---- C4: the fixture IS the holdout (a claim that had to be verified) ---
+    // An earlier draft of this milestone asserted the OPPOSITE — that
+    // `metrics.tsv`'s `holdout_acc` was in-sample because `score_decision()`
+    // loops `f.n()` rows, and `f.n()` was read as the full dataset. That
+    // reading was wrong: `f.n()` is the FIXTURE size, and
+    // `train_heads.py::emit_fixture()` writes ONLY the holdout rows into it
+    // (`idx = rr["_test_idx"]`, and `_test_idx` is `hold_used`). So scoring
+    // every fixture row scores only the 30% the fit never saw, and the
+    // published column is a genuine held-out number.
+    //
+    // This test now asserts the TRUTH, so that a regression putting training
+    // rows back into the fixture would fail loudly:
+    //   (a) the fixture's row count == the blob's recorded calibration sample
+    //       count (both are the holdout, and they must agree),
+    //   (b) the fixture's row count == the `n` column in metrics.tsv,
+    //   (c) the all-rows score of the shipped blob == the recorded accuracy
+    //       (meaningful now the row set is known to be held out).
+    // See docs/HOLDOUT_DEFECT.md, which is kept as the retraction record.
+    TEST("C4: the fixture is the holdout, not a superset of the training set");
+    {
+        const std::string bin = "models/heads/trading_head.bin";
+        const std::string dir = fx + "/trading";
+        if (!file_exists(bin) || !file_exists(dir + "/metrics.tsv")) {
+            SKIP("trading head blob or fixture absent");
+        } else {
+            DecisionHead h;
+            CHECK(h.load(bin));
+            CHECK(h.calibrated());
+            Fixture f;
+            CHECK(f.load(dir));
+
+            const int64_t n_fixture = f.n();
+            platform::log_info(
+                "  C4  fixture rows = %lld", static_cast<long long>(n_fixture));
+
+            // (a) the blob says it was calibrated on K rows; the fixture holds
+            //     K rows. If the fixture were a superset of the training data,
+            //     the blob's sample count would be smaller than the fixture.
+            const int32_t calib = h.calibration_samples();
+            platform::log_info(
+                "  C4  blob calibration_samples = %d", static_cast<int>(calib));
+            CHECK(calib > 0);
+            CHECK(static_cast<int64_t>(calib) == n_fixture);
+
+            // (b) metrics.tsv's `n` must match the fixture too.
+            const auto it = f.metrics.find("DecisionAction");
+            CHECK(it != f.metrics.end());
+            if (it != f.metrics.end()) {
+                CHECK(static_cast<int64_t>(it->second.n) == n_fixture);
+
+                // (c) the shipped blob scored over the fixture reproduces the
+                //     recorded accuracy. This is meaningful BECAUSE the fixture
+                //     is the holdout — the very thing (a)+(b) establish.
+                std::vector<float> conf_all;
+                std::vector<int>   cor_all;
+                CHECK(score_decision(h, f, "DecisionAction", conf_all, cor_all));
+                const double acc_all =
+                    std::accumulate(cor_all.begin(), cor_all.end(), 0) /
+                    static_cast<double>(std::max<size_t>(cor_all.size(), 1));
+                platform::log_info(
+                    "  C4  held-out acc = %.4f n=%zu  (metrics.tsv records %.4f)",
+                    acc_all, cor_all.size(),
+                    static_cast<double>(it->second.acc));
+                CHECK(std::fabs(acc_all - it->second.acc) < 0.005);
             }
         }
     }
