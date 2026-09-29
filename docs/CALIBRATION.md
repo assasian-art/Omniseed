@@ -289,6 +289,16 @@ calibrated confidence (0.4966) never reaches the `0.50` self-routing threshold, 
 it routes 0 of 369 rows. §39's "reported, not tuned" was the honest interim answer;
 DECISION 1 is the proof that, under a 2× bar, there is nothing to tune to.
 
+> **§45 caveat — the bar itself was later found defective.** `chance = 1/K` here
+> assumes a *uniform* label distribution. This label set is not uniform: `BUY` is
+> 37% of the holdout, so a constant "always BUY" scores **0.3686 = 2.58× `1/K`**
+> and the true no-skill floor is **0.3686**, not 0.1429. Re-measured against it,
+> the head's 0.2439 is **0.662×** — *below* a constant. See
+> `docs/EDGE_RESEARCH.md` §1.1 and §4.2. **The derived value is unaffected** (0.50
+> was already the fail-closed fallback — the correction makes the case for it
+> stronger, not weaker), but the "1.71× chance / not far off the bar" reading
+> above must be read with this correction.
+
 ### Paper only (L0)
 
 This threshold gates **paper commits**. It does not gate, loosen or inform any

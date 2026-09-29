@@ -922,6 +922,27 @@ if(OMNISEED_BUILD_TESTS)
         set_tests_properties(omniseed_threshold_gate PROPERTIES TIMEOUT 300)
     endif()
 
+    # §45 — the four pre-registered edge tracks (docs/EDGE_RESEARCH.md) were RUN
+    # by tools/edge_tracks.py, and running them exposed that the adoption bar
+    # itself was wrong: `chance = 1/K` is the no-skill rate only for UNIFORM
+    # labels, and the 7-action teacher's labels are skewed (BUY is 37% of the
+    # holdout, so a constant "always BUY" scores 2.58x1/K). This gate ties the
+    # doc's rejection log and corrected-floor table to tools/edge_tracks.json —
+    # the tool's own output — and pins the two facts that matter most: Track A's
+    # n_forward=5 reproduces the SHIPPED blob exactly (the harness's own control),
+    # and trading.regime's corrected ratio is BELOW 1.0x a constant.
+    # Half A is stdlib-only (CI); half B re-runs the tool and skips visibly.
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_edge_tracks_gate
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_edge_tracks_gate.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        # Generous: half B re-runs three tracks (four fits each) from scratch.
+        set_tests_properties(omniseed_edge_tracks_gate PROPERTIES TIMEOUT 900)
+    endif()
+
     # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper
     # log-mel filterbank is built for 16 kHz; before the fix a 48 kHz file
     # produced a spectrogram whose bins meant something else, SILENTLY. This

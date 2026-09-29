@@ -82,7 +82,7 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-25 tests on a fresh clone (no `.venv`), **46** in a checkout that has one — see
+26 tests on a fresh clone (no `.venv`), **47** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
 
@@ -105,7 +105,7 @@ Every **stdlib-only Python** suite is gated on `.venv` existing
 no `.venv`. So those suites never run in CI — and they do not run here either,
 because this worktree has no `.venv`.
 
-**A green `ctest` on a fresh clone means the C++ tests and the three ungated
+**A green `ctest` on a fresh clone means the C++ tests and the four ungated
 Python suites only.** Run the rest by hand:
 
 ```bash
@@ -124,12 +124,14 @@ months of commits before anyone noticed.
 `omniseed_agent_modules`, `omniseed_uncertainty_split`,
 `omniseed_heads_batch`, `omniseed_streaming_decision`,
 `omniseed_feedback_hook`, `omniseed_threshold_derivation`,
-`omniseed_threshold_gate`, `omniseed_signal_audit` and
+`omniseed_threshold_gate`, `omniseed_edge_tracks_gate`,
+`omniseed_signal_audit` and
 `omniseed_modality_dump` are deliberately registered **outside** the gate. The
-last nine need only **committed** fixtures (no model, no `.venv`, no network), so
-they run everywhere including CI. (`omniseed_threshold_gate` runs its stdlib-only
-half everywhere and skips its tool-regeneration half, visibly, when numpy is
-absent — the §44 gate.)
+last ten need only **committed** fixtures (no model, no `.venv`, no network), so
+they run everywhere including CI. (`omniseed_threshold_gate` and
+`omniseed_edge_tracks_gate` each run their stdlib-only half everywhere and skip
+their tool-regeneration half, visibly, when numpy is absent — the §44 and §45
+gates.)
 
 ### The head stack (fast, fully offline)
 

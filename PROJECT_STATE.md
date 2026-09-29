@@ -4460,3 +4460,142 @@ the edge-track work, not a claim.
 
 **Not done in §44/§44b:** the four `docs/EDGE_RESEARCH.md` tracks (task 3, still
 NOT RUN), Milestone 3, and the rest of the master mandate.
+
+---
+
+## §45 — the four edge tracks, run — and the adoption bar was wrong
+
+The four pre-registered tracks in `docs/EDGE_RESEARCH.md` were **RUN**
+(`tools/edge_tracks.py`, new). Every one is a **rejection** — and running them
+exposed a defect in the bar itself that changes how every head in the project is
+read.
+
+### 45.1 Track A — longer horizons: REJECT (and it needed no re-dump)
+
+The pre-registration assumed a longer teacher horizon needs a re-dump. **It does
+not**: `h[E]` is the backbone's summary of the bar *text* and is independent of
+the action teacher's `n_forward`, so Track A is a pure re-label of the 1,231
+dumped rows. `tools/edge_tracks.py::track_a` re-labels and re-fits.
+
+| horizon | n_holdout | n_eff | acc | vs `1/K` | vs majority | verdict |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 369 | 369 | 0.2385 | 1.669x | 0.662x | REJECT |
+| 5 | 369 | 73 | 0.2439 | 1.707x | 0.662x | REJECT (reproduces shipped blob) |
+| 10 | 369 | 36 | 0.2547 | 1.783x | 0.614x | REJECT (best, still short) |
+| 21 | 369 | 17 | 0.2087 | 1.461x | 0.389x | REJECT (worse) |
+
+`h=5` **reproduces the shipped blob bit-for-bit** (`acc=0.24390`,
+`T=13.325159204929149`, `ECE=0.0555`) — the harness's own control. Longer horizons
+do not help; `h=21` is clearly worse, exactly the label-persistence failure §3.1
+predicted. `n_eff = n // horizon` is reported as an overlap-adjusted **upper
+bound** on independent evidence.
+
+### 45.2 Track B — monster features: REJECT, and the control unmasked the bar
+
+| variant | n | acc | vs `1/K` | vs majority | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `h[E]` only (control) | 369 | 0.2439 | 1.707x | 0.662x | REJECT |
+| features only (no `h[E]`) | 369 | 0.3415 | 2.390x | 0.926x | **apparent SIGNAL** |
+| `h[E]` + features | 369 | 0.2900 | 2.030x | 0.787x | REJECT (did not beat features-only) |
+
+Per the pre-registered §3.2 condition the augmented head must **beat**
+features-only; it does not (0.2900 < 0.3415) ⇒ REJECT. But the features-only row
+*appears* to clear 2×`1/K`, so controls were run:
+
+| control | acc |
+| --- | ---: |
+| features, labels **shuffled** | 0.3144 |
+| features, columns **permuted** across rows | 0.3333 |
+| **constant "always BUY"** | **0.3686** |
+
+**A predictor that learns nothing scores 2.580× `1/K`.** The features-only "win"
+was the majority class, not signal. The tool now refuses to adopt a row that
+passes `2x1/K` but not the majority floor; features-only's stored verdict is
+`REJECT (passes 2x1/K but not the majority-class floor 0.3686 — base-rate
+artifact)`, and the gate asserts it.
+
+### 45.3 The bar was wrong — `chance = 1/K` vs the majority-class floor
+
+`1/K` is the no-skill rate **only for uniform labels**. The 7-action teacher's
+labels are skewed: `BUY` is 34% of train / 37% of holdout, so the true floor is
+`0.3686`. Corrected ratios for **every fitted set** (each set's own holdout
+majority rate):
+
+| set | acc | old (`1/K`) | majority | corrected | change |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `language.intent` | 0.6338 | 4.44x | 0.3239 | **1.957x** | SIGNAL, modest |
+| `language.language` | 0.8451 | 3.38x | 0.4789 | **1.765x** | SIGNAL, modest |
+| `language.sentiment` | 0.6761 | 2.03x | 0.5352 | **1.263x** | weak |
+| `audio.emotion` | 0.3103 | 1.241x | 0.2857 | **1.086x** | NO-SIGNAL |
+| `trading.regime` | 0.7046 | 2.11x | **0.8699** | **0.810x** | **below a constant** |
+| `trading.action` | 0.2439 | 1.707x | 0.3686 | **0.662x** | below a constant |
+
+**Two demotions.** `trading.action` was already VETO-only; it is now known to be
+**below a constant predictor** on accuracy (it still *beats* the constant on
+macro-F1: 0.1333 vs 0.0769 — a real but weak discriminator). **`trading.regime`
+is newly demoted**: §2.2 called it "load-bearing, may gate strategies" on a 2.11×
+ratio; against the majority class it is **0.810×** — its holdout is **86.99%
+`range`** (321/369) with **no `trend_down` rows at all**. The *learned* regime head
+must not gate anything.
+
+**The mechanism:** `argmax` accuracy on a skewed label set is dominated by the
+base rate; a model that always emits the majority class wins the accuracy metric
+and learns nothing. **Macro-F1 is the metric a constant cannot win**, and it is
+now reported alongside accuracy everywhere.
+
+### 45.4 Track D — rank/quantile targets: REJECT (below chance + inverted)
+
+Tertile label, **balanced by construction** (410/391/419), so `chance=1/3` is
+honest. `acc=0.2951` = **0.885× chance** (below chance), and the pre-registered
+conversion test **inverts**: predicted-top rows have *lower* realised return than
+predicted-bottom (separation **−0.081**). Both halves fail.
+
+### 45.5 Track C — multi-asset pooling: REJECT, but the hypothesis survived
+
+Two instruments were present (`AAPL_1d.csv`, `DEMO_1d.csv`), so the track ran:
+each was dumped to `h[E]` (1,231 / 1,236 rows), split chronologically per source,
+and pooled. `tools/edge_tracks.py::track_c` reports pooled AND per-asset, and
+fits a single-asset head for each so a pooled win cannot hide a per-asset loss.
+
+| head | n_holdout | acc | vs `1/K` | vs majority | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| pooled AAPL+DEMO | 740 | 0.3095 | **2.166x** | 0.839x | REJECT (base-rate artifact) |
+
+**The per-asset comparison is the finding:** pooling **raised both** instruments'
+held-out accuracy — AAPL 0.2439 → **0.3062**, DEMO 0.2749 → **0.3127**. So
+multi-asset pooling genuinely adds information (the one track whose hypothesis
+survived contact), but the pooled absolute accuracy (0.3095) is still **below a
+constant predictor (0.3689)**. It moves the head toward the floor without
+reaching it. **Adopted: nothing**, but §5 names this as the track to revisit —
+against a *balanced* teacher rather than the skewed 7-action one.
+
+### 45.6 Files
+
+- `tools/edge_tracks.py` — **new**; the harness. Imports `train_heads.py` and
+  reuses its `fit_one`/`build_action_labels`/splits rather than mirroring them
+  (MEMORY rule 13). Runs the Track B controls (constant / shuffled-labels /
+  permuted-features) *inside* the tool, and refuses to adopt a row that passes
+  `2x1/K` but not the majority-class floor. Emits `tools/edge_tracks.json`.
+- `tools/edge_tracks.json` — **new**; the committed result of the tracks.
+- `tests/test_edge_tracks_gate.py` — **new** gate (33 checks); asserts the doc's
+  §4 log and corrected-floor table match the committed JSON, pins Track A's
+  shipped-blob control, and checks `trading.regime`'s demotion from the
+  committed fixture alone (stdlib). Registered as `omniseed_edge_tracks_gate`.
+- `docs/EDGE_RESEARCH.md` — §1.1 (the bar correction), §2.1/§2.2 (re-tabled),
+  §3.1/§3.2/§3.4 (run results), §4 (the log + §4.2 corrected re-check), §5.
+- `docs/CALIBRATION.md` — §45 caveat on the derived-value paragraph.
+
+### 45.7 Honest status
+
+**No track was adopted; no head graduated from veto-only to advisory.** The
+corrected floor makes the case *stronger* that the learned heads are filters, not
+signal sources — and it quietly **closed a gate** (`trading.regime`) that §2.2 had
+left open on a wrong number. This is the §43 retraction pattern again: the tool
+was pointed at the project's own published number, and the number moved.
+
+**The one-line result:** the project's own adoption bar (`accuracy >= 2 x 1/K`)
+cannot distinguish signal from a constant predictor on a skewed label set. Under
+the corrected floor (the majority-class rate), **no fitted head in the tree
+beats a constant predictor** — and the two that come closest (`language.intent`
+1.957x, `language.language` 1.765x) do so against a *floor*, not against a
+*constant*, which is a harder control not yet run.
