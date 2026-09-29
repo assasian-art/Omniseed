@@ -1,0 +1,72 @@
+id	text
+0	Hello
+1	Hi
+2	Hey there
+3	Hello there
+4	Good morning
+5	Hey, good to see you
+6	Greetings
+7	Hi, are you there
+8	নমস্কার
+9	হ্যালো
+10	শুভ সকাল
+11	Hi আমি ভালো আছি
+12	Good morning বন্ধু
+13	Bye
+14	Talk to you tomorrow
+15	Good night
+16	আবার দেখা হবে
+17	পরে কথা হবে
+18	Bye বন্ধু
+19	অনেক ধন্যবাদ
+20	ধন্যবাদ, that was quick
+21	What does this function do
+22	Can you explain the router
+23	Are the tests passing
+24	ফাইলটা কোথায়
+25	আজ কি ছুটি আছে
+26	এটা কি ভালো ধারণা
+27	কোন শাখা চালু আছে
+28	What is এটা
+29	How does এটা কাজ করে
+30	Run the full test suite
+31	Rebuild in release mode
+32	Stop the daemon
+33	Rewrite this function
+34	ডকুমেন্ট আপডেট করো
+35	This tree has zero dependencies
+36	The build is green
+37	I am working on the parser
+38	The daemon crashed overnight
+39	The docs are out of date
+40	The migration is complete
+41	The numbers look good
+42	আমি ভালো আছি
+43	এটা কাজ করে না
+44	টেস্ট ব্যর্থ হয়েছে
+45	কোডে একটি বাগ আছে
+46	সব ঠিক আছে
+47	এটা খুব ধীর
+48	এটা কাজ করে না, it is broken
+49	আমি কাল handle করব
+50	12345
+51	0.85
+52	   
+53	I am happy with how this turned out
+54	The coverage went up nicely
+55	The error message is genuinely helpful
+56	এটা অনেক দ্রুত
+57	সব ঠিকঠাক চলছে
+58	That refactor made things worse
+59	The error message is useless
+60	I dislike this approach
+61	এটা বিরক্তিকর
+62	What is the expected output
+63	Where did এই সংখ্যা come from
+64	Which test covers এটা
+65	Commit করো এই পরিবর্তন
+66	Thanks for catching that
+67	আবার স্বাগতম
+68	A
+69	[]
+70	####

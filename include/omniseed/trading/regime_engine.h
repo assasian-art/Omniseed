@@ -122,6 +122,14 @@ struct RegimeState {
     double  half_life = kRegimeNaN;
     bool    stressed = false;
 
+    // PROVENANCE (§46). Set to true ONLY by RegimeEngine::detect(), so that
+    // regime_authority.h::GatingRegime::from_engine() can tell the engine's own
+    // output from a struct somebody assembled by hand. A hand-built RegimeState
+    // (the tests do this, and so could a caller trying to launder a learned
+    // label) leaves it false and is therefore refused a gating token. Nothing
+    // else in this tree writes it.
+    bool    engine_minted = false;
+
     bool is_trend() const {
         return label == "trend_up" || label == "trend_down";
     }

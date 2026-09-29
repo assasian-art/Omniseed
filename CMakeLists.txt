@@ -128,6 +128,7 @@ set(OMNISEED_CORE_SOURCES
     src/trading/market_perception.cpp
     src/trading/risk_gate.cpp
     src/trading/regime_engine.cpp
+    src/trading/regime_authority.cpp
     src/trading/strategy_zoo.cpp
     src/trading/router.cpp
     src/trading/sniper.cpp
@@ -636,6 +637,46 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_regime_engine COMMAND omniseed_regime_engine
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_regime_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # §46 — the regime AUTHORITY. The learned `trading.regime` head was demoted
+    # (0.810x a constant, EDGE_RESEARCH §45); this pins that the demotion is
+    # STRUCTURAL, not documentary. A learned (or external, or hand-forged) label
+    # mints a non-gating token and vetoes nothing, while the rule engine's own
+    # output still gates — asserted in both directions, on the REAL fitted blob
+    # over the committed 369-row held-out fixture.
+    add_executable(omniseed_regime_authority tests/test_regime_authority.cpp)
+    target_include_directories(omniseed_regime_authority PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_regime_authority PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_regime_authority PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_regime_authority PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_regime_authority COMMAND omniseed_regime_authority
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_regime_authority PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # §46 Part 3 — a PRE-REGISTERED utility evaluation of the fitted
+    # `language.intent` head as a TIE-BREAKER for the deterministic lexical
+    # classifier. The rule (TAU=0.10, frozen before the run) and the adoption
+    # criterion are stated in the test's header; the outcome is pinned. Uses the
+    # real blob + the committed 71-row held-out fixture (which now carries the
+    # source TEXT, without which a lexical baseline cannot be scored at all).
+    add_executable(omniseed_intent_tiebreak tests/test_intent_tiebreak.cpp)
+    target_include_directories(omniseed_intent_tiebreak PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_intent_tiebreak PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_intent_tiebreak PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_intent_tiebreak PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_intent_tiebreak COMMAND omniseed_intent_tiebreak
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_intent_tiebreak PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # C++ strategy zoo + router + sniper (ports of tools/monster/strategies.py,
     # router.py, sniper_engine.py). Covers the B4 regression (a lone

@@ -703,6 +703,10 @@ RegimeState RegimeEngine::detect(const std::vector<Bar>& bars, size_t i) const {
 RegimeState RegimeEngine::detect(const std::vector<Bar>& bars, size_t i,
                                  int32_t window) const {
     RegimeState st;
+    // §46: mark this as ENGINE output. regime_authority.h::from_engine() refuses
+    // a RegimeState that does not carry this, so a hand-built struct (or one
+    // carrying a learned head's label) can never be minted into a gating token.
+    st.engine_minted = true;
     if (bars.empty()) return st;
     if (i >= bars.size()) i = bars.size() - 1;
 

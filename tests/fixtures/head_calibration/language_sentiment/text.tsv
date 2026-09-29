@@ -1,0 +1,72 @@
+id	text
+0	Hi
+1	Good evening
+2	Hey, good to see you
+3	Hello again
+4	শুভ সকাল
+5	শুভ সন্ধ্যা
+6	আসসালামু আলাইকুম
+7	হ্যালো there
+8	Good morning বন্ধু
+9	Goodbye
+10	Take care
+11	Talk to you tomorrow
+12	Good night
+13	আবার দেখা হবে
+14	See you পরে
+15	Thank you
+16	Thanks a lot
+17	Much appreciated
+18	Thank you for the update
+19	Thank you অনেক
+20	When is the next release
+21	Which branch is current
+22	What is the risk here
+23	Is this a good idea
+24	Why is this so slow
+25	এটা কিভাবে কাজ করে
+26	ফাইলটা কোথায়
+27	আপনি কি আমাকে সাহায্য করতে পারবেন
+28	কত সময় লাগবে
+29	কেন the build failed
+30	Is it ঠিক আছে
+31	Explain the regime engine
+32	Rebuild in release mode
+33	Please review this patch
+34	Clean up the build directory
+35	List the open issues
+36	সব টেস্ট চালাও
+37	Please ব্যাখ্যা করো
+38	This tree has zero dependencies
+39	I prefer the second option
+40	The build is green
+41	The tests are failing
+42	We shipped the release
+43	The config was wrong
+44	There is a bug in the loader
+45	আজ খারাপ দিন
+46	এটা কাজ করে না
+47	আমি দ্বিতীয় অপশন পছন্দ করি
+48	I prefer দ্বিতীয় option
+49	এটা কাজ করে না, it is broken
+50	12345
+51	!!!
+52	???
+53	42
+54	0.85
+55	@#$%
+56	The coverage went up nicely
+57	This is the best version so far
+58	এই পরিবর্তনটা দারুণ
+59	কাজটা সুন্দর হয়েছে
+60	সব ঠিকঠাক চলছে
+61	The build broke again
+62	I dislike this approach
+63	আমি হতাশ হয়েছি
+64	এটা বিরক্তিকর
+65	What is the expected output
+66	Is there a cheaper option
+67	কোনটা ভালো অপশন
+68	Commit these changes
+69	Goodbye, ভালো থেকো
+70	 

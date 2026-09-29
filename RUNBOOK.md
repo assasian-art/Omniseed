@@ -82,9 +82,16 @@ Bengali UTF-8 literals in `src/language/` are safe.
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-26 tests on a fresh clone (no `.venv`), **47** in a checkout that has one — see
+28 tests on a fresh clone (no `.venv`), **49** in a checkout that has one — see
 the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
 one, because the LoRA suites alone can take ~8 minutes each.
+
+> **On a loaded box the three CPU LoRA suites can fail without being broken.**
+> Measured (§46, 2026-10-02): `omniseed_lora_e2e` died on `lora_chat.py`'s
+> internal 1200 s subprocess timeout, `omniseed_lora_chat` hit ctest's 2400 s
+> `TIMEOUT`, and `omniseed_lora_gguf` tripped the sandbox's trash shim
+> (`SHFileOperationW` 0x2). None of the three is a logic failure — check the
+> message before treating a red board as a regression.
 
 To skip the four slow LoRA suites while iterating:
 
@@ -130,8 +137,10 @@ months of commits before anyone noticed.
 last ten need only **committed** fixtures (no model, no `.venv`, no network), so
 they run everywhere including CI. (`omniseed_threshold_gate` and
 `omniseed_edge_tracks_gate` each run their stdlib-only half everywhere and skip
-their tool-regeneration half, visibly, when numpy is absent — the §44 and §45
-gates.)
+their tool-regeneration half, visibly, when numpy is absent — the §44, §45 and
+§46 gates. `omniseed_edge_tracks_gate`'s half B regenerates **all three** track
+artifacts: `edge_tracks.json`, `edge_tracks_balanced.json`,
+`edge_tracks_balanced_reweighted.json`.)
 
 ### The head stack (fast, fully offline)
 

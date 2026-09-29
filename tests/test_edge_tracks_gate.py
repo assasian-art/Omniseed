@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Gated test for §45 — the four edge tracks (`tools/edge_tracks.py`).
+"""Gated test for §45/§46 — the edge tracks (`tools/edge_tracks.py`).
 
 WHAT THIS GUARDS. `docs/EDGE_RESEARCH.md` publishes a rejection log (§4) and a
-corrected-floor table (§1.1/§2.1/§4.2). Those tables are *claims*. This test
-ties them to `tools/edge_tracks.json`, the tool's own committed output, so a doc
-that drifts from the run — or a run that silently changes — fails loudly.
+corrected-floor table (§1.1/§1.2/§2.1/§4.2). Those tables are *claims*. This test
+ties them to `tools/edge_tracks.json` and `tools/edge_tracks_balanced.json`, the
+tool's own committed outputs, so a doc that drifts from the run — or a run that
+silently changes — fails loudly.
 
-THE TWO FACTS THAT MATTER MOST, both pinned:
+THE FACTS THAT MATTER MOST, all pinned:
 
   * **Track A's `n_forward=5` reproduces the SHIPPED blob exactly**
     (`acc=0.24390`, `temperature=13.325159204929149`, `ECE=0.0555`). This is the
@@ -20,10 +21,21 @@ THE TWO FACTS THAT MATTER MOST, both pinned:
     constant predictor's own accuracy (0.3686) is recorded — because those are
     the numbers that DEMOTED a head §2.2 had called load-bearing.
 
+  * **`acc > majority` is NOT the bar; `acc >= 2 x majority` is (§46).** The
+    gate asserts the tool APPLIES its own bar to every row (`adopted` iff
+    `n>=30 and acc >= 2*floor`), and it pins the counterexample that forced the
+    rule: the balanced teacher's features-only head beats the constant by 0.0027
+    (z=0.11) — noise that a bare `>` would have adopted.
+
+  * **The balanced teacher did not rescue the head (§46).** Track E — a
+    PERFECTLY balanced 3-class directional target, so `chance = 1/3` exactly —
+    sits BELOW chance (0.2951 = 0.885x). That is the decisive statement: the
+    failure is not the skew, it is the absence of directional signal in h[E].
+
 TWO HALVES (the §43b/§44 lesson — either alone is insufficient):
-  * A) `tools/edge_tracks.json` (committed) is internally consistent and matches
-       the doc's table rows. **Stdlib only** — runs on a fresh clone, in CI.
-  * B) `tools/edge_tracks.py` REGENERATES that JSON. Needs numpy, so it is
+  * A) the committed JSONs are internally consistent and match the doc's table
+       rows. **Stdlib only** — runs on a fresh clone, in CI.
+  * B) `tools/edge_tracks.py` REGENERATES those JSONs. Needs numpy, so it is
        skipped with a visible reason when no numpy interpreter exists.
 
 Stdlib-only where it can be. Usage:  python tests/test_edge_tracks_gate.py
@@ -39,6 +51,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RESULT = os.path.join(ROOT, "tools", "edge_tracks.json")
+RESULT_BAL = os.path.join(ROOT, "tools", "edge_tracks_balanced.json")
 TOOL = os.path.join(ROOT, "tools", "edge_tracks.py")
 DOC = os.path.join(ROOT, "docs", "EDGE_RESEARCH.md")
 
@@ -49,6 +62,13 @@ DOC = os.path.join(ROOT, "docs", "EDGE_RESEARCH.md")
 MAJORITY_FLOOR = 0.3686
 SHIPPED_ACC = 0.243900
 SHIPPED_TEMP = 13.325159
+# The balanced teacher's h=5 majority floor (§46). Lower than the shipped
+# teacher's 0.3686 because the quantile directional branch equalises
+# BUY/SELL/HOLD; it is NOT 1/7, because the four regime-conditional actions stay
+# rare on an 85%-`range` tape.
+BALANCED_FLOOR_H5 = 0.3198
+BAR_RATIO = 2.0
+MIN_HOLDOUT = 30
 
 g_pass = g_fail = g_skip = 0
 
@@ -308,15 +328,129 @@ def main():
     else:
         skip("docs/EDGE_RESEARCH.md is absent")
 
+    # =====================================================================
+    #  §46 — the bar is `acc >= 2 x majority`, and the balanced teacher
+    # =====================================================================
+
+    # ---- A7. the tool APPLIES its own bar to every row it emits ---------------
+    # The §46 rule lives in `_verdict`; this asserts the JSON cannot contain a
+    # row whose `adopted` flag disagrees with it. A tool that publishes the right
+    # rule but adopts on a different one is the §41 defect class.
+    check(d.get("bar", {}).get("rule", "").find("majority") >= 0,
+          "A7 the tool declares the 2x-majority rule (%r)"
+          % d.get("bar", {}).get("rule"))
+    bad = []
+    for t, rows in d.get("tracks", {}).items():
+        for r in rows:
+            if "accuracy" not in r or "floor" not in r:
+                continue          # e.g. a Track C "NOT RUN" row
+            want = (r.get("n_holdout", 0) >= MIN_HOLDOUT and
+                    r["accuracy"] >= BAR_RATIO * r["floor"])
+            if bool(r.get("adopted")) != bool(want):
+                bad.append((t, r.get("variant"), r.get("adopted"), want))
+    check(not bad,
+          "A7 every row's `adopted` == (n>=30 and acc >= 2 x floor) "
+          "(%d violation(s): %r)" % (len(bad), bad[:3]))
+
+    # ---- A8. the balanced teacher LOWERED the floor but did not rescue the head
+    if not os.path.isfile(RESULT_BAL):
+        skip("A8 tools/edge_tracks_balanced.json absent (run with "
+             "--teacher balanced)")
+    else:
+        with open(RESULT_BAL, encoding="utf-8") as f:
+            db = json.load(f)
+        check(db.get("teacher") == "balanced",
+              "A8 the balanced artifact records teacher=balanced (%r)"
+              % db.get("teacher"))
+        b5 = find_row(db, "A", "n_forward=5")
+        if b5 is None:
+            check(False, "A8 balanced artifact has an n_forward=5 row")
+        else:
+            check(abs(b5.get("floor", 0) - BALANCED_FLOOR_H5) < 5e-4,
+                  "A8 balanced h=5 floor is %.4f (got %r) — lower than the "
+                  "shipped 0.3686, so the rebalance is real"
+                  % (BALANCED_FLOOR_H5, b5.get("floor")))
+            check(b5["floor"] < MAJORITY_FLOOR,
+                  "A8 balanced floor (%.4f) < shipped floor (%.4f)"
+                  % (b5["floor"], MAJORITY_FLOOR))
+            check(b5.get("adopted") is False,
+                  "A8 the balanced head at h=5 is STILL not adopted — the "
+                  "failure was not a skew artifact")
+        b_all = [r for rows in db.get("tracks", {}).values() for r in rows
+                 if "accuracy" in r]
+        check(len(b_all) > 0 and all(r.get("adopted") is False for r in b_all),
+              "A8 NO balanced-teacher row was adopted (%d rows)" % len(b_all))
+
+        # ---- A9. Track E — the decisive control: a PERFECTLY balanced 3-class
+        #          directional target, below chance.
+        e = find_row(db, "E", "tertile")
+        if e is None:
+            check(False, "A9 balanced artifact has the Track E control row")
+        else:
+            check(e.get("label_balanced") is True,
+                  "A9 Track E's label mix is ~1/3 by construction")
+            check(abs(e.get("chance", 0) - 1.0 / 3) < 1e-9,
+                  "A9 Track E's by-construction chance is exactly 1/3 (%r)"
+                  % e.get("chance"))
+            check(e["accuracy"] < e["chance"],
+                  "A9 Track E is BELOW its by-construction 1/3 floor (%.4f < "
+                  "%.4f) — h[E] does not linearly encode the forward direction"
+                  % (e["accuracy"], e["chance"]))
+            check(e["accuracy"] < e.get("floor", 1.0),
+                  "A9 Track E is ALSO below the chronological holdout's own "
+                  "majority rate (%.4f < %.4f)"
+                  % (e["accuracy"], e.get("floor", float("nan"))))
+            check(e.get("macro_f1", 1.0) < e["chance"],
+                  "A9 Track E's macro-F1 (%.4f) is also below 1/3 (%.4f)"
+                  % (e.get("macro_f1", float("nan")), e["chance"]))
+            check(e.get("adopted") is False, "A9 Track E is NOT adopted")
+
+        # ---- A10. the counterexample that forced §46: a bare `>` bar would have
+        #           adopted features-only on a 0.11-sigma margin.
+        fb = find_row(db, "B", "features only")
+        if fb is None:
+            check(False, "A10 balanced artifact has the features-only row")
+        else:
+            check(fb.get("beats_majority") is True,
+                  "A10 balanced features-only DOES beat the majority class "
+                  "(%.4f > %.4f) — the trap §46 closes"
+                  % (fb["accuracy"], fb.get("majority_rate", float("nan"))))
+            check(abs(fb.get("constant_z", 99)) < 1.0,
+                  "A10 ...but only by %.2f standard errors — noise, not signal"
+                  % fb.get("constant_z", float("nan")))
+            check(fb.get("adopted") is False,
+                  "A10 balanced features-only is NOT adopted (2x-floor bar)")
+
+    # ---- A11. the doc's §1.2/§46 correction is present -------------------------
+    if os.path.isfile(DOC):
+        with open(DOC, encoding="utf-8") as f:
+            doc = f.read()
+        check("1.2" in doc and "2 x majority" in doc.lower().replace("×", "x"),
+              "A11 the doc carries the §1.2 bar correction (2 x majority)")
+        check("0.3198" in doc,
+              "A11 the doc records the balanced floor 0.3198")
+        check("0.885" in doc or "0.885x" in doc,
+              "A11 the doc records Track E's 0.885x (below chance)")
+    else:
+        skip("docs/EDGE_RESEARCH.md is absent")
+
     # ---- B. the tool REGENERATES this JSON (numpy-gated) ----------------------
     print("  -- half B: regenerate (needs numpy) --")
     py = _numpy_python()
     if py is None:
         skip("B no numpy-capable interpreter found; regeneration not checked")
     else:
-        ok = _regen_matches(py, d)
+        ok = _regen_matches(py, d, [])
         check(ok, "B the tool regenerates tools/edge_tracks.json byte-for-byte "
                   "on its declared tracks")
+        if os.path.isfile(RESULT_BAL):
+            with open(RESULT_BAL, encoding="utf-8") as f:
+                db = json.load(f)
+            okb = _regen_matches(py, db, ["--teacher", "balanced"])
+            check(okb, "B the tool regenerates tools/edge_tracks_balanced.json "
+                       "byte-for-byte on its declared tracks")
+        else:
+            skip("B balanced artifact absent; balanced regeneration not checked")
 
     print("\n=== RESULT: %d passed, %d failed, %d skipped ==="
           % (g_pass, g_fail, g_skip))
@@ -344,15 +478,18 @@ def _numpy_python():
     return None
 
 
-def _regen_matches(py, committed):
+def _regen_matches(py, committed, extra):
     """Run the tool's deterministic tracks into a temp file; compare.
 
-    Only the numpy-only tracks (A, B, D) are re-run — Track C shells out to a
+    Only the numpy-only tracks (A, B, D, E) are re-run — Track C shells out to a
     dump that a fresh clone may not have, and the gate must not depend on it.
+    `extra` carries the teacher/class-weight flags for the balanced artifact.
     """
     import tempfile
-    tmp = os.path.join(tempfile.gettempdir(), "edge_tracks_gate.json")
-    cmd = [py, TOOL, "--tracks", "A", "B", "D", "--out", tmp]
+    tag = ("_".join(extra).replace("--", "") or "v1")
+    tmp = os.path.join(tempfile.gettempdir(), "edge_tracks_gate_%s.json" % tag)
+    tracks = ["A", "B", "D", "E"]
+    cmd = [py, TOOL, "--tracks"] + tracks + ["--out", tmp] + list(extra)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
                            cwd=ROOT)
@@ -368,9 +505,13 @@ def _regen_matches(py, committed):
         return False
     with open(tmp, encoding="utf-8") as f:
         fresh = json.load(f)
-    for t in ("A", "B", "D"):
-        if json.dumps(fresh.get("tracks", {}).get(t), sort_keys=True) != \
-           json.dumps(committed.get("tracks", {}).get(t), sort_keys=True):
+    for t in tracks:
+        f_rows = fresh.get("tracks", {}).get(t)
+        c_rows = committed.get("tracks", {}).get(t)
+        if f_rows is None and c_rows is None:
+            continue
+        if json.dumps(f_rows, sort_keys=True) != json.dumps(c_rows,
+                                                            sort_keys=True):
             print("      track %s differs between fresh run and committed JSON" % t)
             return False
     return True

@@ -34,7 +34,17 @@ import numpy as np  # noqa: E402
 
 import train_heads as TH  # noqa: E402
 
-# --- the bar, verbatim from docs/EDGE_RESEARCH.md §1 --------------------------
+# --- the bar, verbatim from docs/EDGE_RESEARCH.md §1, corrected in §1.2 ---------
+# The pre-registration said `accuracy >= 2 x chance`, chance = 1/K. §45 showed
+# 1/K is the wrong floor for a SKEWED label set (a constant "always BUY" scored
+# 2.580 x 1/K on the shipped teacher). §46 showed the fix has to go further: the
+# floor must be the majority-class rate AND the 2x must apply to THAT, because
+# "acc > majority" is cleared by noise (Track B features-only beat the constant
+# 0.3225 vs 0.3198 — 0.1 standard errors). The operative bar is therefore
+#
+#       accuracy >= 2 x (majority-class rate)   AND   n_holdout >= 30
+#
+# on a genuinely held-out split. A rejection is a RESULT and is recorded as one.
 RATIO_BAR = 2.0
 MIN_HOLDOUT = 30
 
@@ -43,11 +53,28 @@ def _ratio(acc, chance):
     return acc / chance if chance else float("nan")
 
 
-def _verdict(acc, chance, n_hold):
-    """The ONLY adoption decision, in one place, so every track is judged alike."""
+def _no_skill_floor(y_hold):
+    """The correct no-skill floor: the majority-class rate of the HOLDOUT.
+
+    Computed from the labels themselves, never assumed. For a balanced set this
+    equals 1/K; for a skewed one it is larger, and using 1/K there would let a
+    constant predictor pass the bar (§45).
+    """
+    vals, cnt = np.unique(np.asarray(y_hold), return_counts=True)
+    if cnt.sum() == 0:
+        return float("nan")
+    return float(cnt.max() / cnt.sum())
+
+
+def _verdict(acc, floor, n_hold):
+    """The ONLY adoption decision, in one place, so every track is judged alike.
+
+    `floor` is the no-skill rate (the majority-class rate). Adoption needs the
+    head to reach 2x that floor on a holdout of at least 30 rows.
+    """
     if n_hold < MIN_HOLDOUT:
         return "REJECT (n<%d)" % MIN_HOLDOUT, False
-    r = _ratio(acc, chance)
+    r = _ratio(acc, floor)
     if r >= RATIO_BAR:
         return "SIGNAL", True
     return "NO-SIGNAL", False
@@ -56,6 +83,24 @@ def _verdict(acc, chance, n_hold):
 def read_bars(path):
     """(closes, times) from an OHLCV csv — reuses the trainer's own reader."""
     return TH.read_closes(path)
+
+
+def labels_for(args, ids, regime, closes, hz):
+    """Dispatch the action teacher. v1 is the SHIPPED teacher; `balanced` is the
+    §45-revisit variant (trailing-window quantile thresholds). Both return the
+    same 7-name vocabulary so the head's K never changes between runs."""
+    if args.teacher == "v1":
+        return TH.build_action_labels(ids, regime, closes, n_forward=hz)
+    if args.teacher == "balanced":
+        return TH.build_action_labels_balanced(ids, regime, closes, n_forward=hz)
+    raise SystemExit("unknown teacher %r" % args.teacher)
+
+
+def _fit(H, y, K, tr, hold, args):
+    """One fit, with the run's class-weight setting. `none` is the shipped fit."""
+    cw = None if args.class_weight == "none" else args.class_weight
+    return TH.fit_one(H, y, K, tr, hold, shuffle=False, seed=args.seed,
+                      class_weight=cw)
 
 
 def effective_n(n, horizon):
@@ -89,53 +134,49 @@ def track_a(H, ids, regime, closes, args):
     K = len(action_names)
     chance = 1.0 / K
     for hz in args.horizons:
-        ya, names, detail = TH.build_action_labels(
-            ids, regime, closes, n_forward=hz)
+        ya, names, detail = labels_for(args, ids, regime, closes, hz)
         if names != action_names:
             raise SystemExit("action order drift: %r" % (names,))
         dist = {action_names[i]: int((ya == i).sum()) for i in range(K)}
         tr, hold = TH.chronological_split(len(ya))
         present = sorted(set(ya.tolist()))
         missing = [action_names[i] for i in range(K) if i not in present]
-        r = TH.fit_one(H, ya, K, tr, hold, shuffle=False, seed=args.seed)
+        r = _fit(H, ya, K, tr, hold, args)
         acc = r["holdout_acc"]
         n_hold = len(hold)
         n_eff = effective_n(n_hold, hz)
-        verdict, adopted = _verdict(acc, chance, n_hold)
-        # The overlap-aware view: does it still clear the bar on independent
-        # evidence? Reported, never used to LAUNDER a pass — only to downgrade.
-        ratio_eff = _ratio(acc, chance)
         yh = ya[hold]
-        _, cnt = np.unique(yh, return_counts=True)
-        maj_rate = float(cnt.max() / cnt.sum())
-        # ADOPTION NEEDS BOTH (§1.1): 2x1/K AND beating the majority class.
-        if adopted and acc <= maj_rate:
-            verdict = ("REJECT (passes 2x1/K but not the majority-class floor "
-                       "%.4f — base-rate artifact)" % maj_rate)
-            adopted = False
+        maj_rate = _no_skill_floor(yh)
+        # The operative bar (§1.2): 2x the MAJORITY-class rate, not 2x1/K.
+        verdict, adopted = _verdict(acc, maj_rate, n_hold)
+        # The pre-registered 1/K view, kept visible so the correction is auditable.
+        ratio_1k = _ratio(acc, chance)
         row = {
             "track": "A", "variant": "n_forward=%d" % hz, "horizon": hz,
             "n_train": int(len(tr)), "n_holdout": int(n_hold),
             "n_eff": int(n_eff),
             "accuracy": float(acc), "chance": float(chance),
-            "ratio": round(ratio_eff, 4),
+            "ratio": round(ratio_1k, 4),
+            "floor": round(maj_rate, 4),
             "majority_rate": round(maj_rate, 4),
             "ratio_vs_majority": round(_ratio(acc, maj_rate), 4),
             "beats_majority": bool(acc > maj_rate),
+            "clears_2x_floor": bool(_ratio(acc, maj_rate) >= RATIO_BAR),
             "macro_f1": float(r["holdout_macro_f1"]),
             "temperature": float(r["temperature"]),
             "ece_calibrated": float(r["ece_calibrated"]),
             "action_counts": dist,
             "actions_missing": missing,
             "verdict": verdict, "adopted": bool(adopted),
-            "n_eff_ratio": round(ratio_eff, 4),
+            "n_eff_ratio": round(ratio_1k, 4),
             "n_eff_note": ("overlap-adjusted (n//horizon); a pass that does not "
                            "survive this is reported as fragile, not adopted"),
         }
         results.append(row)
-        print("  Track A h=%-2d  n=%d (n_eff=%d)  acc=%.4f  chance=%.4f  "
-              "ratio=%.3fx  %s"
-              % (hz, n_hold, n_eff, acc, chance, ratio_eff, verdict))
+        print("  Track A h=%-2d  n=%d (n_eff=%d)  acc=%.4f  floor=%.4f  "
+              "ratio_vs_floor=%.3fx  %s"
+              % (hz, n_hold, n_eff, acc, maj_rate,
+                 _ratio(acc, maj_rate), verdict))
         if missing:
             print("      actions with zero examples: %s" % missing)
     return results
@@ -252,7 +293,7 @@ def track_b(H, ids, regime, closes, highs, lows, args):
         os.path.join(ROOT, "include", "omniseed", "decision_head.h"))
     K = len(action_names)
     chance = 1.0 / K
-    ya, _, _ = TH.build_action_labels(ids, regime, closes, n_forward=5)
+    ya, _, _ = labels_for(args, ids, regime, closes, 5)
     tr, hold = TH.chronological_split(len(ya))
 
     # Build the features over the WHOLE csv (they need trailing history), then
@@ -276,12 +317,12 @@ def track_b(H, ids, regime, closes, highs, lows, args):
     rows = []
 
     # (b1) h[E] alone — the shipped configuration, as the control.
-    rH = TH.fit_one(H, ya, K, tr, hold, shuffle=False, seed=args.seed)
+    rH = _fit(H, ya, K, tr, hold, args)
     rows.append(_b_row("B", "h[E] only (control)", rH, chance, len(hold),
                        y_hold=ya[hold]))
 
     # (b2) features alone — no hidden state at all.
-    rF = TH.fit_one(Fz, ya, K, tr, hold, shuffle=False, seed=args.seed)
+    rF = _fit(Fz, ya, K, tr, hold, args)
     rows.append(_b_row("B", "features only (no h[E])", rF, chance, len(hold),
                        y_hold=ya[hold]))
 
@@ -290,7 +331,7 @@ def track_b(H, ids, regime, closes, highs, lows, args):
     #     fit_one; features are ~unit-scale already. Concatenate RAW h with the
     #     standardised features so the h block keeps its own internal scaling.
     Hcat = np.concatenate([H, Fz], axis=1)
-    rC = TH.fit_one(Hcat, ya, K, tr, hold, shuffle=False, seed=args.seed)
+    rC = _fit(Hcat, ya, K, tr, hold, args)
     row = _b_row("B", "h[E] + features", rC, chance, len(hold),
                  y_hold=ya[hold])
     rows.append(row)
@@ -324,14 +365,18 @@ def track_b(H, ids, regime, closes, highs, lows, args):
     rows[2]["feature_names"] = fnames
     for rr in rows:
         rr["controls"] = ctl
-        print("  Track B %-26s n=%d acc=%.4f ratio=%.3fx %s"
-              % (rr["variant"], rr["n_holdout"], rr["accuracy"], rr["ratio"],
+        print("  Track B %-26s n=%d acc=%.4f floor=%.4f ratio_vs_floor=%.3fx %s"
+              % (rr["variant"], rr["n_holdout"], rr["accuracy"],
+                 rr.get("floor", float("nan")), rr.get("ratio_vs_floor",
+                                                      float("nan")),
                  rr["verdict"]))
     print("      features-only acc=%.4f  augmented acc=%.4f  "
           "backbone contributes: %s" % (feat_acc, aug_acc, beats_features))
     print("      controls: constant=%.4f  labels-shuffled=%.4f  "
           "features-permuted=%.4f" % (const_acc, ctl["shuffled_labels"]["accuracy"],
                                       ctl["permuted_features"]["accuracy"]))
+    print("      features-only margin over the constant: %.4f  (z=%.2f)"
+          % (feat_acc - const_acc, rows[1].get("constant_z", float("nan"))))
     return rows
 
 
@@ -354,12 +399,12 @@ def _track_b_controls(H, ya, Fz, tr, hold, K, args):
 
     ysh = ya.copy()
     rng.shuffle(ysh)
-    r_sh = TH.fit_one(Fz, ysh, K, tr, hold, shuffle=False, seed=args.seed)
+    r_sh = _fit(Fz, ysh, K, tr, hold, args)
 
     Fp = Fz.copy()
     for j in range(Fp.shape[1]):
         Fp[:, j] = Fz[rng.permutation(len(Fz)), j]
-    r_pf = TH.fit_one(Fp, ya, K, tr, hold, shuffle=False, seed=args.seed)
+    r_pf = _fit(Fp, ya, K, tr, hold, args)
 
     return {
         "constant": {"accuracy": const_acc, "majority_class": maj,
@@ -372,38 +417,39 @@ def _track_b_controls(H, ya, Fz, tr, hold, K, args):
 
 
 def _b_row(track, variant, r, chance, n_hold, y_hold=None):
-    """One result row. `y_hold` (the holdout labels) adds the CORRECTED view.
+    """One result row. `y_hold` (the holdout labels) sets the CORRECTED floor.
 
     The `1/K` ratio is kept because it is what the document pre-registered. The
-    majority-class ratio is added because §1.1 proved `1/K` is the wrong floor
-    for a skewed set — a reader must be able to see both without re-running.
+    majority-class rate is the OPERATIVE floor (§1.2): adoption needs
+    `accuracy >= 2 x majority`, not `accuracy > majority` (which noise clears)
+    and not `2 x 1/K` (which a constant clears).
     """
     acc = float(r["holdout_acc"])
-    verdict, adopted = _verdict(acc, chance, n_hold)
+    if y_hold is not None and len(y_hold) > 0:
+        floor = _no_skill_floor(y_hold)
+    else:
+        floor = chance
+    verdict, adopted = _verdict(acc, floor, n_hold)
     row = {
         "track": track, "variant": variant,
         "n_holdout": int(n_hold), "accuracy": acc, "chance": float(chance),
         "ratio": round(_ratio(acc, chance), 4),
+        "floor": round(float(floor), 4),
+        "ratio_vs_floor": round(_ratio(acc, floor), 4),
         "macro_f1": float(r["holdout_macro_f1"]),
         "temperature": float(r["temperature"]),
         "verdict": verdict, "adopted": bool(adopted),
     }
     if y_hold is not None and len(y_hold) > 0:
-        vals, cnt = np.unique(np.asarray(y_hold), return_counts=True)
-        maj_rate = float(cnt.max() / cnt.sum())
-        row["majority_rate"] = round(maj_rate, 4)
-        row["ratio_vs_majority"] = round(_ratio(acc, maj_rate), 4)
-        # A result that clears 2x1/K but not the majority floor is a base-rate
-        # artifact; say so in the row rather than only in the doc.
-        row["beats_majority"] = bool(acc > maj_rate)
-        # ADOPTION NEEDS BOTH (§1.1). The pre-registered 2x1/K bar is kept as
-        # the first gate, but a row that only passes it while failing to beat a
-        # constant predictor is NOT adopted — the §45 correction applied at the
-        # point of decision, not just in prose.
-        if row["adopted"] and not row["beats_majority"]:
-            row["verdict"] = ("REJECT (passes 2x1/K but not the majority-class "
-                              "floor %.4f — base-rate artifact)" % maj_rate)
-            row["adopted"] = False
+        row["majority_rate"] = round(float(floor), 4)
+        row["ratio_vs_majority"] = round(_ratio(acc, floor), 4)
+        row["beats_majority"] = bool(acc > floor)
+        row["clears_2x_floor"] = bool(_ratio(acc, floor) >= RATIO_BAR)
+        # How many standard errors above the constant is this, really? §46: a
+        # bare `acc > majority` is not evidence (Track B's features-only cleared
+        # it by 0.1 SE). Reported so a reader can see the margin is noise.
+        se = math.sqrt(max(floor * (1.0 - floor), 1e-12) / max(n_hold, 1))
+        row["constant_z"] = round((acc - floor) / se, 3) if se else None
     return row
 
 
@@ -449,7 +495,7 @@ def track_c(args):
         if closes is None:
             print("  Track C: %s has no bars path (%r) — skipped" % (name, bars))
             continue
-        ya, _, _ = TH.build_action_labels(ids, reg, closes, n_forward=5)
+        ya, _, _ = labels_for(args, ids, reg, closes, 5)
         Hs.append(H)
         ys.append(ya)
         owners.append(np.full(len(ya), len(Hs) - 1))
@@ -475,12 +521,14 @@ def track_c(args):
     tr = np.concatenate(tr_parts)
     hold = np.concatenate(hold_parts)
 
-    rP = TH.fit_one(Hp, yp, K, tr, hold, shuffle=False, seed=args.seed)
+    rP = _fit(Hp, yp, K, tr, hold, args)
     row = _b_row("C", "pooled (%s)" % "+".join(n for n, _ in dumps[:len(Hs)]),
                  rP, chance, len(hold), y_hold=yp[hold])
     out.append(row)
-    print("  Track C pooled  n_train=%d n_holdout=%d acc=%.4f ratio=%.3fx %s"
-          % (len(tr), len(hold), row["accuracy"], row["ratio"], row["verdict"]))
+    print("  Track C pooled  n_train=%d n_holdout=%d acc=%.4f floor=%.4f "
+          "ratio_vs_floor=%.3fx %s"
+          % (len(tr), len(hold), row["accuracy"], row.get("floor", float("nan")),
+             row.get("ratio_vs_floor", float("nan")), row["verdict"]))
 
     # Per-asset reporting (§3.3): TWO numbers per asset, because one alone is
     # misleading. (i) the POOLED head scored on that asset's own holdout — does
@@ -494,35 +542,36 @@ def track_c(args):
             continue
         lg = rP["_raw_logits"][m]
         acc = float((lg.argmax(axis=1) == yp[m]).mean())
-        v, _ = _verdict(acc, chance, len(m))
-        _, cnt_m = np.unique(yp[m], return_counts=True)
-        maj_m = float(cnt_m.max() / cnt_m.sum())
+        maj_m = _no_skill_floor(yp[m])
+        v, _ = _verdict(acc, maj_m, len(m))
         out.append({"track": "C", "variant": "pooled head scored on %s holdout" % name,
                     "n_holdout": int(len(m)), "accuracy": acc,
                     "chance": float(chance),
                     "ratio": round(_ratio(acc, chance), 4),
+                    "floor": round(maj_m, 4),
                     "majority_rate": round(maj_m, 4),
                     "ratio_vs_majority": round(_ratio(acc, maj_m), 4),
                     "beats_majority": bool(acc > maj_m),
+                    "clears_2x_floor": bool(_ratio(acc, maj_m) >= RATIO_BAR),
                     "verdict": v, "adopted": False})
 
         # (ii) single-asset head on the same rows.
         Hs_i = np.where(op == src)[0]
         tr_i, hold_i = TH.chronological_split(len(Hs_i))
-        ri = TH.fit_one(Hp[Hs_i], yp[Hs_i], K, tr_i, hold_i,
-                        shuffle=False, seed=args.seed)
+        ri = _fit(Hp[Hs_i], yp[Hs_i], K, tr_i, hold_i, args)
         acc_i = float(ri["holdout_acc"])
-        vi, _ = _verdict(acc_i, chance, len(hold_i))
+        maj_i = _no_skill_floor(yp[Hs_i][hold_i])
+        vi, _ = _verdict(acc_i, maj_i, len(hold_i))
         gains = acc > acc_i
-        _, cnt_i = np.unique(yp[Hs_i][hold_i], return_counts=True)
-        maj_i = float(cnt_i.max() / cnt_i.sum())
         out.append({"track": "C", "variant": "%s alone (single-asset head)" % name,
                     "n_holdout": int(len(hold_i)), "accuracy": acc_i,
                     "chance": float(chance),
                     "ratio": round(_ratio(acc_i, chance), 4),
+                    "floor": round(maj_i, 4),
                     "majority_rate": round(maj_i, 4),
                     "ratio_vs_majority": round(_ratio(acc_i, maj_i), 4),
                     "beats_majority": bool(acc_i > maj_i),
+                    "clears_2x_floor": bool(_ratio(acc_i, maj_i) >= RATIO_BAR),
                     "verdict": vi, "adopted": False,
                     "pooling_helps_this_asset": bool(gains)})
         print("  Track C  -> %-8s  pooled-head n=%d acc=%.4f | "
@@ -586,7 +635,7 @@ def track_d(H, ids, regime, closes, args):
     balanced = all(0.20 <= f <= 0.47 for f in frac)
 
     tr, hold = TH.chronological_split(len(yqq))
-    rD = TH.fit_one(Hq, yqq, Q, tr, hold, shuffle=False, seed=args.seed)
+    rD = _fit(Hq, yqq, Q, tr, hold, args)
     row = _b_row("D", "forward-return tertile (5d, trailing 252)", rD,
                  QCHANCE, len(hold), y_hold=yqq[hold])
     row["label_mix"] = mix
@@ -604,6 +653,52 @@ def track_d(H, ids, regime, closes, args):
           % (len(hold), row["accuracy"], QCHANCE, row["ratio"], row["verdict"]))
     print("      label mix: %s (balanced=%s)" % (mix, balanced))
     print("      conversion: %s" % row["conversion"]["detail"])
+    return [row]
+
+
+# =============================================================================
+#  Track E — the perfectly-balanced 3-class directional control
+# =============================================================================
+def track_dir_control(H, ids, closes, args):
+    """Does h[E] linearly encode the FORWARD DIRECTION of the bar at all?
+
+    This is a MEASUREMENT control, not a shippable head (the DecisionAction enum
+    has 7 members). The label is the forward-return tertile by a trailing-window
+    quantile, so the mix is ~1/3 by construction and the no-skill floor is
+    EXACTLY 1/3 — there is no majority-class ambiguity to correct for, which is
+    the whole point: if a head cannot beat 1/3 HERE, the 7-action failure in §45
+    is not a skew artifact, it is the absence of directional signal in h[E].
+    """
+    y3 = TH.directional_quantile_labels(ids, closes, n_forward=5)
+    mask = y3 >= 0
+    H3, y3 = H[mask], y3[mask]
+    K = 3
+    chance = 1.0 / K
+    mix = {int(v): int((y3 == v).sum()) for v in range(K)}
+    frac = [mix[v] / len(y3) for v in range(K)]
+    balanced = all(0.30 <= f <= 0.37 for f in frac)
+
+    tr, hold = TH.chronological_split(len(y3))
+    r = _fit(H3, y3, K, tr, hold, args)
+    row = _b_row("E", "directional tertile (balanced 3-class control)", r,
+                 chance, len(hold), y_hold=y3[hold])
+    row["label_mix"] = mix
+    row["label_frac"] = [round(f, 4) for f in frac]
+    row["label_balanced"] = bool(balanced)
+    row["note"] = ("chance = 1/3 is the BY-CONSTRUCTION floor (each bar is "
+                   "placed by its own trailing quantile); the chronological "
+                   "holdout's own majority rate is `floor` above and may differ "
+                   "slightly. The head is below BOTH. A failure here is not a "
+                   "skew artifact.")
+    if not balanced:
+        row["verdict"] = ("INVALID CONTROL (label mix %r is not ~1/3)"
+                          % [round(f, 3) for f in frac])
+        row["adopted"] = False
+    print("  Track E  dir-tertile  n=%d acc=%.4f chance=%.4f ratio=%.3fx "
+          "macroF1=%.4f %s"
+          % (len(hold), row["accuracy"], chance, row["ratio"],
+             row["macro_f1"], row["verdict"]))
+    print("      label mix: %s (balanced=%s)" % (mix, balanced))
     return [row]
 
 
@@ -642,8 +737,14 @@ def main():
                     metavar="NAME=DIR",
                     help="per-asset market dump for Track C (repeatable)")
     ap.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 10, 21])
-    ap.add_argument("--tracks", nargs="+", default=["A", "B", "C", "D"])
+    ap.add_argument("--tracks", nargs="+", default=["A", "B", "C", "D", "E"])
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--teacher", choices=["v1", "balanced"], default="v1",
+                    help="action teacher: v1 = shipped fixed-threshold rule; "
+                         "balanced = trailing-window quantile thresholds (§45)")
+    ap.add_argument("--class-weight", choices=["none", "inverse"],
+                    default="none",
+                    help="loss re-weighting: none = shipped; inverse = 1/freq")
     ap.add_argument("--out", default="tools/edge_tracks.json")
     args = ap.parse_args()
 
@@ -662,7 +763,11 @@ def main():
     out = {
         "generated_by": "tools/edge_tracks.py",
         "bar": {"ratio": RATIO_BAR, "min_holdout": MIN_HOLDOUT,
-                "source": "docs/EDGE_RESEARCH.md §1"},
+                "floor": "majority-class rate of the holdout",
+                "rule": "accuracy >= 2 x majority_rate AND n_holdout >= 30",
+                "source": "docs/EDGE_RESEARCH.md §1 (corrected §1.1/§1.2)"},
+        "teacher": args.teacher,
+        "class_weight": args.class_weight,
         "baseline": {"candidate": "DecisionAction shipped blob own holdout",
                      "n": 369, "accuracy": 0.2439, "chance": 1.0 / 7,
                      "ratio": 1.707},
@@ -682,6 +787,9 @@ def main():
     if "D" in args.tracks:
         print("\n--- Track D: rank / quantile targets ---")
         out["tracks"]["D"] = track_d(H, ids, regime, closes, args)
+    if "E" in args.tracks:
+        print("\n--- Track E: balanced 3-class directional control ---")
+        out["tracks"]["E"] = track_dir_control(H, ids, closes, args)
 
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(out, f, indent=2)

@@ -221,19 +221,48 @@ def load_dump(dump_dir):
 # ---------------------------------------------------------------------------
 # Softmax regression + temperature scaling
 # ---------------------------------------------------------------------------
-def fit_softmax(Z, y, K, lam=1e-3, iters=600, lr=0.15):
+def inverse_freq_weights(y_train, K):
+    """Per-class weights ~ 1/frequency, mean-normalised to 1.
+
+    The "explicitly re-weighted" half of the balanced-teacher experiment: the
+    unweighted fit minimises the average NLL, which a skewed label mix lets it
+    do by ignoring the rare classes. Weighting each row by 1/frequency makes
+    every class contribute equally to the loss, which is what macro-F1 measures.
+    Mean-normalised so the Adam step size stays comparable to the unweighted fit.
+    """
+    counts = np.bincount(np.asarray(y_train), minlength=K).astype(np.float64)
+    w = 1.0 / np.maximum(counts, 1.0)
+    return w / w.mean()
+
+
+def fit_softmax(Z, y, K, lam=1e-3, iters=600, lr=0.15, class_weight=None):
     """Full-batch Adam on the L2-regularised multinomial log-likelihood.
 
     Z is [N, E] STANDARDISED, y is [N] in 0..K-1. Returns (W [K,E], b [K]).
     No closed form exists for multinomial logistic regression; with 768
     features and <=1300 rows this converges in well under a second, so a
     first-order method is the right tool rather than an approximation.
+
+    `class_weight` (length-K, or None) weights each row by its class. None is
+    the shipped, unweighted fit — the default is left alone so the committed
+    blobs reproduce bit-for-bit (MEMORY rule 13: do not perturb the oracle).
     """
     N, E = Z.shape
     W = np.zeros((K, E))
     counts = np.bincount(y, minlength=K).astype(np.float64)
     priors = np.maximum(counts, 1.0) / max(counts.sum(), 1.0)
     b = np.log(priors)
+
+    if class_weight is None:
+        row_w = np.ones(N)
+    else:
+        cw = np.asarray(class_weight, dtype=np.float64)
+        if cw.shape != (K,):
+            raise SystemExit("class_weight must have K=%d entries" % K)
+        row_w = cw[np.asarray(y, dtype=int)]
+    wsum = float(row_w.sum())
+    if not np.isfinite(wsum) or wsum <= 0:
+        row_w = np.ones(N); wsum = float(N)
 
     mW = np.zeros_like(W); vW = np.zeros_like(W)
     mb = np.zeros_like(b); vb = np.zeros_like(b)
@@ -246,7 +275,7 @@ def fit_softmax(Z, y, K, lam=1e-3, iters=600, lr=0.15):
         P = ex / ex.sum(axis=1, keepdims=True)
         Y = np.zeros_like(P)
         Y[np.arange(N), y] = 1.0
-        G = (P - Y) / N
+        G = (P - Y) * row_w[:, None] / wsum
         gW = G.T @ Z + lam * W
         gb = G.sum(axis=0)
 
@@ -421,7 +450,7 @@ def chronological_split(n, train_frac=0.70):
 # ---------------------------------------------------------------------------
 # One fitted classifier: standardise -> fit -> fold standardisation back in
 # ---------------------------------------------------------------------------
-def fit_one(H, y, K, tr, hold, shuffle=True, seed=1234):
+def fit_one(H, y, K, tr, hold, shuffle=True, seed=1234, class_weight=None):
     """Returns a dict with the RAW-h projection, the temperature, and metrics.
 
     Standardising h before the fit is a linear reparameterisation, so the
@@ -434,6 +463,10 @@ def fit_one(H, y, K, tr, hold, shuffle=True, seed=1234):
     `hold` is the entire held-out portion. The temperature is fitted by
     cross-validation inside it — see fit_temperature_cv for the measured reason
     a single small calibration slice is not enough.
+
+    `class_weight` is None (the shipped unweighted fit), the string "inverse"
+    (weights read off the TRAIN split's class frequencies), or a length-K array.
+    Weights are derived from `tr` only, never the holdout.
     """
     if len(tr) == 0:
         raise SystemExit("empty training split — the dump is too small or a "
@@ -443,7 +476,16 @@ def fit_one(H, y, K, tr, hold, shuffle=True, seed=1234):
     sd[sd < 1e-6] = 1.0                      # a constant dim carries no signal
     Z = (H - mu) / sd
 
-    W, b = fit_softmax(Z[tr], y[tr], K)
+    cw = None
+    if class_weight is not None:
+        if isinstance(class_weight, str):
+            if class_weight != "inverse":
+                raise SystemExit("unknown class_weight %r" % class_weight)
+            cw = inverse_freq_weights(y[tr], K)
+        else:
+            cw = np.asarray(class_weight, dtype=np.float64)
+
+    W, b = fit_softmax(Z[tr], y[tr], K, class_weight=cw)
 
     # Fold standardisation back in.
     proj = W / sd[None, :]
@@ -567,6 +609,128 @@ def build_action_labels(ids, regime_labels, closes, n_forward=5,
     return np.array(y, dtype=int), names, detail
 
 
+BALANCED_TEACHER_DOC = (
+    "BALANCED RULE-BASED TEACHER (v2), N=5 bars forward. Same 7-action "
+    "vocabulary as v1, but every THRESHOLD is a trailing-window QUANTILE of the "
+    "PAST forward returns instead of a fixed constant: the window ends at i-1, "
+    "so no row ever sees its own future. CLOSE if trend_up/trend_down and the "
+    "forward return opposes the trend beyond the dead band; HEDGE if high_vol "
+    "and |r| <= the median |r|; ABSTAIN if high_vol and |r| above it; EXPLAIN if "
+    "range and |r| <= the dead quantile; BUY if r > the 2/3 quantile; SELL if "
+    "r < the 1/3 quantile; HOLD otherwise. WHY: v1's fixed +/-1.5% wall plus the "
+    "85%-range regime mix produced a 37%-BUY holdout, so a constant predictor "
+    "cleared the project's own 2x1/K bar (docs/EDGE_RESEARCH.md 1.1). Bucketing "
+    "the directional branch by quantile equalises BUY/SELL/HOLD by construction; "
+    "the four regime-conditional actions stay rare because the regime engine "
+    "calls 85% of the tape `range` — that residual skew is INHERENT to the "
+    "7-action structure and is reported, not hidden."
+)
+
+
+def build_action_labels_balanced(ids, regime_labels, closes, n_forward=5,
+                                 window=252, dead_q=0.10, vol_q=0.50,
+                                 use_regime=True, min_window=30):
+    """A balanced variant of the action teacher (see BALANCED_TEACHER_DOC).
+
+    The bar index comes from the dumper's provenance id ("bar<i>@<ts>"), so the
+    labels stay aligned with the hidden states even if a bar was skipped.
+
+    Every threshold is read off the trailing window `fwd[i-window:i]` of PAST
+    forward returns — indices < i, each of which needed only closes up to
+    (i-window+n_forward) <= i-1. There is no look-ahead. A row whose window is
+    shorter than `min_window` (the first bars) is ABSTAIN, exactly as v1 treats a
+    row with no forward return.
+
+    Returns (y, names, detail) with the SAME vocabulary and order as v1 so the
+    head's K is unchanged and the two teachers are directly comparable.
+    """
+    names = ["ABSTAIN", "HOLD", "BUY", "SELL", "CLOSE", "HEDGE", "EXPLAIN"]
+    idx_of = {n: i for i, n in enumerate(names)}
+    n = len(closes)
+
+    # Forward return per bar (future-referencing by construction; it is the
+    # TARGET, and it is only ever read at index i, never inside the window).
+    fwd = np.full(n, np.nan)
+    for i in range(n):
+        j = i + n_forward
+        if j < n and closes[i] != 0:
+            fwd[i] = (closes[j] - closes[i]) / closes[i]
+
+    y, detail = [], []
+    for prov, reg in zip(ids, regime_labels):
+        m = re.match(r"bar(\d+)@", prov)
+        if not m:
+            raise SystemExit("unexpected provenance id: %r" % prov)
+        i = int(m.group(1))
+        r = fwd[i] if i < n else np.nan
+        if not np.isfinite(r):
+            y.append(idx_of["ABSTAIN"]); detail.append("no-forward-return")
+            continue
+        win = fwd[max(0, i - window):i]
+        win = win[np.isfinite(win)]
+        if len(win) < min_window:
+            y.append(idx_of["ABSTAIN"]); detail.append("short-window")
+            continue
+        q1, q2 = np.quantile(win, [1.0 / 3, 2.0 / 3])
+        dead = float(np.quantile(np.abs(win), dead_q))
+        vol = float(np.quantile(np.abs(win), vol_q))
+
+        if use_regime:
+            if reg in ("trend_up", "trend_down"):
+                trend_up = reg == "trend_up"
+                if abs(r) > dead and ((r > 0) != trend_up):
+                    y.append(idx_of["CLOSE"]); detail.append("close"); continue
+            if reg == "high_vol":
+                if abs(r) <= vol:
+                    y.append(idx_of["HEDGE"]); detail.append("hedge")
+                else:
+                    y.append(idx_of["ABSTAIN"]); detail.append("abstain-vol")
+                continue
+            if reg == "range" and abs(r) <= dead:
+                y.append(idx_of["EXPLAIN"]); detail.append("explain"); continue
+
+        if r > q2:
+            y.append(idx_of["BUY"]); detail.append("buy")
+        elif r < q1:
+            y.append(idx_of["SELL"]); detail.append("sell")
+        else:
+            y.append(idx_of["HOLD"]); detail.append("hold")
+    return np.array(y, dtype=int), names, detail
+
+
+def directional_quantile_labels(ids, closes, n_forward=5, window=252,
+                                min_window=30):
+    """A PERFECTLY balanced 3-class directional teacher, for measurement only.
+
+    BUY / SELL / HOLD split by the 1/3 and 2/3 trailing-window quantiles, so the
+    label mix is ~1/3 each by construction and the no-skill floor is EXACTLY 1/3
+    — there is no majority-class ambiguity to correct for. It is the cleanest
+    possible test of the question "does h[E] linearly encode the forward
+    direction of the bar at all?", independent of the 7-action teacher's skew.
+    It is NOT a shippable head (the DecisionAction enum has 7 members); it is a
+    control, and it is reported as one.
+    """
+    n = len(closes)
+    fwd = np.full(n, np.nan)
+    for i in range(n):
+        j = i + n_forward
+        if j < n and closes[i] != 0:
+            fwd[i] = (closes[j] - closes[i]) / closes[i]
+    y = np.full(len(ids), -1, dtype=int)     # -1 = no label (dropped)
+    for k, prov in enumerate(ids):
+        i = int(re.match(r"bar(\d+)@", prov).group(1))
+        r = fwd[i] if i < n else np.nan
+        if not np.isfinite(r):
+            continue
+        win = fwd[max(0, i - window):i]
+        win = win[np.isfinite(win)]
+        if len(win) < min_window:
+            continue
+        q1, q2 = np.quantile(win, [1.0 / 3, 2.0 / 3])
+        y[k] = 0 if r <= q1 else (1 if r <= q2 else 2)
+    return y
+
+
 # ---------------------------------------------------------------------------
 # Held-out fixture
 #
@@ -591,13 +755,20 @@ def build_action_labels(ids, regime_labels, closes, n_forward=5,
 # committed blob against the committed rows, so regenerating one without the
 # other is a loud failure rather than a silent drift.
 # ---------------------------------------------------------------------------
-def emit_fixture(root, name, H, idx, columns, meta, metrics, vocabs):
+def emit_fixture(root, name, H, idx, columns, meta, metrics, vocabs,
+                 texts=None):
     """Write one held-out fixture directory.
 
     columns  list of (label_set_name, string_labels_array)
     metrics  dict: label_set_name -> dict(temperature, ece_calibrated,
                                           holdout_acc)
     vocabs   dict: label_set_name -> ordered label list
+    texts    optional array aligned with the FULL dump rows; when given, the
+             held-out rows' source strings are written to `text.tsv`. The
+             language fixtures need it: the deterministic LEXICAL classifier
+             (src/language/intent.cpp) reads TEXT, and an evaluation that pits
+             that classifier against the fitted head cannot run without it.
+             Written with `id` matching labels.tsv's row order, so the two join.
 
     The files are flat TSV rather than one JSON blob because the reader is C++
     with no JSON dependency, and a fixture that needs a parser to read is a
@@ -616,6 +787,17 @@ def emit_fixture(root, name, H, idx, columns, meta, metrics, vocabs):
             for _, lab in columns:
                 f.write("\t" + str(lab[i]))
             f.write("\n")
+
+    if texts is not None:
+        with open(os.path.join(d, "text.tsv"), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write("id\ttext\n")
+            for k, i in enumerate(idx):
+                # Tabs/newlines would break the TSV; the corpus has none, but a
+                # future one might, and a silently malformed fixture is worse
+                # than a visibly escaped one.
+                t = str(texts[i]).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+                f.write("%d\t%s\n" % (k, t))
 
     with open(os.path.join(d, "vocab.tsv"), "w", encoding="utf-8",
               newline="\n") as f:
@@ -646,6 +828,36 @@ def emit_fixture(root, name, H, idx, columns, meta, metrics, vocabs):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def load_language_texts(dump_ids, path):
+    """Source utterance per DUMP row, from the corpus the dumper read.
+
+    The language dumper's provenance id is "ex<i>", where <i> is the 0-based
+    DATA row index in `tools/data/head_language.tsv`. That id is what makes the
+    text recoverable at all: the fixture's own `id` column is a holdout-relative
+    counter (0..n-1), so it cannot be joined back to the corpus on its own.
+
+    Returns a list aligned with `dump_ids`, or None if the corpus is absent or a
+    provenance id does not parse (a fixture without text is still useful; a
+    fixture with MISALIGNED text would be actively harmful, so we refuse).
+    """
+    if not os.path.isfile(path):
+        return None
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f, delimiter="\t"):
+            rows.append(r.get("text", ""))
+    out = []
+    for p in dump_ids:
+        m = re.match(r"ex(\d+)$", str(p))
+        if not m:
+            return None
+        i = int(m.group(1))
+        if i >= len(rows):
+            return None
+        out.append(rows[i])
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--language", default="build/head_data/language")
@@ -686,6 +898,9 @@ def main():
         meta, H, ids, set_names, labels = load_dump(args.language)
         print("\n=== language: N=%d E=%d sets=%s" % (H.shape[0], H.shape[1], set_names))
         cols = {name: np.array([r[i] for r in labels]) for i, name in enumerate(set_names)}
+        # Source text per dump row, so the fixture can carry it (see emit_fixture).
+        lang_texts = load_language_texts(
+            ids, os.path.join(ROOT, "tools", "data", "head_language.tsv"))
 
         sets_out, proj_rows, bias_rows, fitted_rows = [], [], [], []
         per_set = {}
@@ -733,7 +948,8 @@ def main():
                              {name: {"temperature": r["temperature"],
                                      "ece_calibrated": r["ece_calibrated"],
                                      "holdout_acc": r["holdout_acc"]}},
-                             {name: vocab})
+                             {name: vocab},
+                             texts=lang_texts)
 
         proj = np.vstack(proj_rows)
         bias = np.concatenate(bias_rows)

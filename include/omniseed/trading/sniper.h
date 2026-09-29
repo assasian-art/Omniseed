@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "omniseed/trading/regime_authority.h"
 #include "omniseed/trading/regime_engine.h"
 #include "omniseed/trading/router.h"
 #include "omniseed/trading/strategy_zoo.h"
@@ -119,6 +120,13 @@ struct SniperVerdict {
     bool    veto = false;
     std::string veto_reason;
     std::vector<std::string> factors;
+    // --- regime authority (§46) -------------------------------------------
+    // `regime_gated` is true iff the regime label was AUTHORISED to gate (i.e.
+    // it came from the rule engine). It is false when the label was refused, in
+    // which case `regime` was neutralised to "range" and no regime veto could
+    // fire. A learned `trading.regime` label can never set this true.
+    bool        regime_gated = false;
+    std::string regime_source = "unset";
     // --- ensemble / regime detail (never part of S) -----------------------
     double trend_score = kRegimeNaN;
     double half_life = kRegimeNaN;

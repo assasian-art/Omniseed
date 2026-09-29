@@ -234,18 +234,26 @@ void regime_legacy(const Prepared& p, size_t i, const SniperConfig& cfg,
 }
 
 void regime(const Prepared& p, size_t i, const SniperConfig& cfg, std::string& label,
-            double& score) {
+            double& score, GatingRegime& gate) {
     // Default path is the advanced multi-axis engine. It is strictly better
     // informed than a single SMA200 slope: a slope rule is a low-volatility
     // filter in disguise on equities (where low vol and uptrends coincide) and
     // stops working the moment you move to FX.
     if (cfg.regime_mode == "legacy" || !p.has_regimes()) {
         regime_legacy(p, i, cfg, label, score);
+        // The SMA-slope rule is DETERMINISTIC and computed from bars, so it may
+        // gate — but it is minted through its own factory so the distinction
+        // between "a rule" and "a learned readout" stays visible here.
+        gate = GatingRegime::from_legacy_rule(label);
         return;
     }
     const std::string raw = p.regimes()[i].label;
     label = regime_label_known(raw) ? raw : "range";
     score = regime_score_for_label(label);
+    // §46: the ONLY mint in the trading path that can gate. `from_engine()`
+    // refuses a RegimeState the engine did not produce, so a learned label
+    // smuggled into a hand-built state yields a NON-gating token.
+    gate = GatingRegime::from_engine(p.regimes()[i]);
 }
 
 double cross(const EvalContext* ctx, const SniperConfig& cfg) {
@@ -278,7 +286,19 @@ SniperVerdict evaluate(const Prepared& p, size_t i, const EvalContext* ctx,
 
     v.micro = micro(p, i, ctx, cfg);
     technical(p, i, cfg, v.tech, v.votes, v.factors);
-    regime(p, i, cfg, v.regime, v.regime_score);
+    GatingRegime gate;
+    regime(p, i, cfg, v.regime, v.regime_score, gate);
+    v.regime_gated = gate.authorize();
+    v.regime_source = regime_source_name(gate.source());
+    if (!v.regime_gated) {
+        // §46: a label with no authority influences NOTHING — neither the score
+        // nor the veto. Neutralise it to the "range" reading and record that it
+        // was refused. In normal operation this branch is unreachable (the rule
+        // engine mints its own states); it exists so that the ONE way a regime
+        // can reach a gate is the engine's, and every other way is inert.
+        v.regime = "range";
+        v.regime_score = 0.5;
+    }
     v.cross = cross(ctx, cfg);
 
     // S is the mandate's weighted sum, and NOTHING below may change it.
@@ -286,16 +306,12 @@ SniperVerdict evaluate(const Prepared& p, size_t i, const EvalContext* ctx,
               cfg.w_cross * v.cross;
 
     // --- hard vetoes (before the score is even considered) -----------------
-    if (v.regime == "trend_down") {
-        if (!mean_reversion_confirmed(p, i, cfg)) {
-            v.veto = true;
-            v.veto_reason = "counter-regime";
-        }
-    } else if (v.regime == "high_vol") {
-        if (!mean_reversion_confirmed(p, i, cfg)) {
-            v.veto = true;
-            v.veto_reason = "high-vol-needs-mean-reversion";
-        }
+    // The decision lives in regime_authority.cpp so there is exactly ONE place
+    // that can turn a regime label into a block, and it takes a GatingRegime.
+    const std::string rv = regime_veto(gate, mean_reversion_confirmed(p, i, cfg));
+    if (!rv.empty()) {
+        v.veto = true;
+        v.veto_reason = rv;
     }
 
     if (!v.veto && ctx != nullptr && ctx->cross_invalidate >= cfg.invalidate_veto) {

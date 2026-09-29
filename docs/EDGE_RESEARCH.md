@@ -15,6 +15,14 @@ than keep tuning a head that has no signal to find, this document:
 > constant predictor cleared it. The corrected floor is the **majority-class
 > rate**, and under it **no fitted head in this document beats a constant**. The
 > original `1/K` ratios are kept visible beside their corrections.
+>
+> **§46 update.** Two follow-ups, both in §6. (i) The bar is corrected a second
+> time — `acc > majority` is cleared by *noise*, so the operative bar is
+> **`acc >= 2 x majority`** (§1.2). (ii) The surviving hypothesis (rebuild the
+> teacher balanced) was **tested and failed**: a balanced teacher lowered the
+> floor 0.3686 → 0.3198 and moved the head not at all, and a **perfectly
+> balanced 3-class directional control sits below `1/3`** — so the failure is the
+> absence of directional signal in `h[E]`, not the skew.
 
 ---
 
@@ -87,6 +95,40 @@ The other fitted sets are re-checked under the corrected floor in §4.2.
 
 ---
 
+### 1.2 Correction (§46): the floor is right, but the *comparison* was still too weak
+
+§1.1 fixed the floor (`1/K` → majority-class rate) but left the comparison as a
+bare **`acc > majority`**. That is not a bar, it is a coin flip with a tiebreak:
+`>` is cleared by **noise**. The balanced-teacher rebuild (§6) produced exactly
+that counterexample —
+
+> Track B's features-only head, under the balanced teacher, scores **0.3225**
+> against a constant of **0.3198**. It clears `acc > majority`. Its margin is
+> **0.0027, or z = 0.11** — one tenth of a standard error. A bare `>` bar would
+> have adopted it.
+
+So the bar is corrected a second time: the **`2x` multiplier applies to the
+majority floor**, not just to `1/K`.
+
+| criterion | §1.1 | §1.2 (operative) |
+| --- | --- | --- |
+| accuracy | `> majority-class rate` | **`>= 2 x majority-class rate`** |
+| n_holdout | `>= 30` | `>= 30` (unchanged) |
+| reported alongside | `ratio` vs `1/K` | `ratio` vs `1/K` **and** `ratio_vs_floor`, `macro_f1`, and `constant_z` |
+
+For a **balanced** label set `majority = 1/K`, so §1.2 reduces to the original
+pre-registration — the change only bites on skewed sets, which is where it
+matters. `constant_z = (acc - majority) / sqrt(majority*(1-majority)/n)` is
+reported so a reader can see whether a "win" over the constant is real or noise;
+it is **diagnostic only** and never decides adoption.
+
+The tool applies this bar in **one place** (`edge_tracks.py::_verdict`), and the
+gate asserts that *every* row's `adopted` flag agrees with it (§A7 of
+`tests/test_edge_tracks_gate.py`). Under §1.2 **no candidate in this document is
+adopted** — including every balanced-teacher row (§6).
+
+---
+
 ## 2. The reposition (D2, adopted now)
 
 ### 2.1 What the audit says
@@ -150,6 +192,34 @@ class its 0.7046 accuracy is 0.810x — the head does **worse than always
 predicting `range`**, which is 86.99% of its holdout. It may still be *read* as a
 feature (the regime engine's rule-based output is a separate, parity-tested
 thing), but the *learned* regime head must not gate anything.
+
+**ENFORCED IN CODE (§46).** "Must not gate" was, until §46, a sentence in a
+document. It is now a property of the type system —
+`include/omniseed/trading/regime_authority.h`:
+
+- A strategy gate accepts a `GatingRegime`, never a bare label string. A
+  `GatingRegime` carries its **provenance**, and `can_gate()` is true for exactly
+  two sources: `RuleEngine` (the multi-axis `RegimeEngine`/`RegimeTracker`) and
+  `LegacyRule` (the deterministic SMA-slope rule).
+- `GatingRegime::from_learned(label)` — how a fitted head's output would enter —
+  produces a token whose `can_gate()` is **false**, and `refusal_reason()` names
+  the demotion. `from_external()` is false too.
+- The single veto decision, `regime_veto()`, begins with `if (!gate.authorize())
+  return "";`. That one line is the whole enforcement: a label without authority
+  blocks nothing, whatever it says.
+- `from_engine()` refuses a hand-built `RegimeState` (it checks
+  `RegimeState::engine_minted`, set only by `RegimeEngine::detect()`), so a
+  learned label cannot be laundered by assembling a struct around it.
+- In `SniperVerdict`, an unauthorised label is additionally **neutralised** —
+  `regime` is reset to `"range"` and `regime_score` to `0.5` — so it cannot move
+  the score either. `regime_gated` / `regime_source` record which happened.
+
+`tests/test_regime_authority.cpp` (786 checks, `omniseed_regime_authority`) pins
+this in both directions and is non-vacuous: it runs the **real fitted
+`models/heads/trading_regime_head.bin` over the committed 369-row holdout**, finds
+**22 rows** where the head emits a label (`trend_down`/`high_vol`) that *would*
+veto, asserts all 22 are refused — and asserts the identical labels through the
+rule factory *do* veto. Removing the authority check turns 27 checks red.
 
 ### 2.3 The edge source: the rule-based engines
 
@@ -476,6 +546,10 @@ Stated so the reasoning can be attacked directly:
   rule, so a pooled head converges on the base rate. Re-running pooling against a
   target that is **not** the skewed action teacher (e.g. a balanced one) is the
   obvious next experiment, and it is *not* claimed to work here.
+  **RESOLVED (§46, §6.6): it was re-run against the balanced teacher. Pooling
+  still lifts both instruments under an accuracy-shaped loss, but the lift is
+  *not* robust to a balanced (inverse-frequency) loss, and the pooled head is
+  still below the floor. "Survived contact" is downgraded accordingly.**
 - **If §41's threshold is ever re-derived from a clean fit** (see
   `docs/HOLDOUT_DEFECT.md` §"What was owed"), the 0.50 value may move. **RESOLVED
   (§44): it was re-derived from the shipped blob and the real dump, and the answer
@@ -491,3 +565,167 @@ Stated so the reasoning can be attacked directly:
   "edge source" claim in §2.3 is wrong regardless of what the heads do. Their
   parity tests prove they *compute what they claim*; they do not prove the claim
   is profitable. That proof does not exist yet and is not claimed here.
+
+---
+
+## 6. The balanced-teacher rebuild (§46) — the surviving hypothesis, tested
+
+§4.3 named the one experiment worth running: *"re-run pooling against a target
+that is **not** the skewed action teacher"*. §5 repeated it. This section is that
+run, and its answer is **no** — the skew was not what was hiding the signal.
+
+### 6.1 The hypothesis
+
+The §45 correction left one honest escape hatch: maybe the head failed only
+because the teacher's labels are skewed (37% `BUY`), so a constant predictor
+occupied the bar and a real-but-weak signal was buried under the base rate.
+If so, **rebuilding the teacher balanced should let the head through.**
+
+### 6.2 The balanced teacher (v2)
+
+Same 7-action vocabulary (`K` unchanged, so the head is the same shape), but
+every threshold is a **trailing-window quantile of past forward returns** instead
+of a fixed constant (`tools/train_heads.py::build_action_labels_balanced`, doc
+string `BALANCED_TEACHER_DOC`). The window ends at `i-1`, so there is no
+look-ahead. The directional branch (BUY/SELL/HOLD) is bucketed by the 1/3 and 2/3
+quantiles, which equalises it **by construction**.
+
+| teacher | holdout h=5 mix | majority floor |
+| --- | --- | ---: |
+| v1 (shipped, fixed ±1.5%) | BUY 136 / SELL 78 / HOLD 68 / EXPLAIN 39 / ABSTAIN 35 / HEDGE 8 / CLOSE 5 | **0.3686** |
+| v2 (balanced, quantile) | (over all 1,231 rows: BUY 370 / SELL 335 / HOLD 240 / EXPLAIN 116 / ABSTAIN 75 / HEDGE 51 / CLOSE 44) | **0.3198** |
+
+The floor **fell** (0.3686 → 0.3198) — the rebalance is real. It did **not** reach
+`1/K = 0.1429`, and it cannot: the four regime-conditional actions (CLOSE, HEDGE,
+ABSTAIN, EXPLAIN) inherit the regime engine's distribution, and `range` is 85% of
+the tape. That residual skew is **inherent to the 7-action structure** and is
+reported, not hidden — it is also why the bar (§1.2) must be the majority floor,
+not `1/K`.
+
+### 6.3 Result: the head does not move
+
+`tools/edge_tracks_balanced.json` (teacher=balanced, unweighted — the
+apples-to-apples comparison):
+
+| track | v1 acc (ratio_vs_floor) | v2 acc (ratio_vs_floor) | adopted |
+| --- | ---: | ---: | --- |
+| A h=1 | 0.2385 (0.662x) | 0.1680 (0.544x) | no |
+| A h=5 | 0.2439 (0.662x) | 0.2385 (0.746x) | no |
+| A h=10 | 0.2547 (0.614x) | 0.2276 (0.689x) | no |
+| A h=21 | 0.2087 (0.389x) | 0.2060 (0.547x) | no |
+| B `h[E]` only | 0.2439 (0.662x) | 0.2385 (0.746x) | no |
+| B features only | 0.3415 (0.926x) | 0.3225 (1.008x) | no |
+| C pooled | 0.3095 (0.839x) | 0.3095 (0.902x) | no |
+
+**Balancing the teacher moved the head by nothing.** The v2 `h[E]`-only accuracy
+(0.2385) is *the same head* on a *fairer* target, and it is still **0.75x a
+constant**. The hypothesis is dead: the failure is not the skew.
+
+**It also produced the counterexample that forced §1.2.** Track B's features-only
+head now scores 0.3225 against a constant of 0.3198 — it *clears* `acc > majority`
+by **z = 0.11**. A bare `>` bar would have adopted it. That is why the bar is
+`>= 2 x majority` (§1.2), and why the tool now records `constant_z`.
+
+### 6.4 The re-weighted arm (the "(or explicitly re-weighted)" alternative)
+
+`tools/edge_tracks_balanced_reweighted.json` re-fits with **inverse-frequency
+class weights** (`--class-weight inverse`), i.e. the loss is macro-F1-shaped
+rather than accuracy-shaped. Every verdict is unchanged (all rejected); the
+weights do what they claim (the controls now sit *below* chance — labels-shuffled
+0.1165, features-permuted 0.1247 — because a weighted fit cannot win by guessing
+the majority), and macro-F1 rises (Track E 0.2667 → 0.2730) without accuracy
+reaching the floor. Re-weighting is not a substitute for signal.
+
+### 6.5 The decisive control — Track E
+
+The sharpest test is not the 7-action teacher at all. **Track E** labels each bar
+by its forward-return tertile against a trailing window, so the label mix is
+~1/3 **by construction** and the by-construction floor is **exactly `1/3`** —
+there is no majority-class ambiguity left to correct for.
+
+> **Track E: acc = 0.2951, macro-F1 = 0.2667, against a 1/3 floor.**
+> **Below chance** — and below the chronological holdout's own majority (0.3716).
+
+A head that cannot beat `1/3` on a perfectly balanced directional target is not
+suffering a skew artifact. **`h[E]` does not linearly encode the forward
+direction of the bar.** That is the result, and it is consistent with the
+efficient-market reading in the preamble.
+
+### 6.6 Track C revisited (the §4.3 hypothesis)
+
+Pooling AAPL+DEMO against the balanced teacher, with the §1.2 bar:
+
+| instrument | single-asset head | pooled head | pooling helps? |
+| --- | ---: | ---: | --- |
+| AAPL | 0.2385 | 0.2737 | yes (+0.035) |
+| DEMO | 0.2399 | 0.3450 | yes (+0.055) |
+| pooled | — | 0.3095 (0.902x floor) | **not adopted** |
+
+Pooling still lifts **both** instruments, and the pooled head is still below the
+floor. Under the re-weighted loss the AAPL lift **disappears** (0.2466 pooled vs
+0.2493 single) — so the pooling gain is **not robust to the loss**, and §4.3's
+"survived contact" is downgraded to *"survives an accuracy-shaped loss, not a
+balanced one."* Recorded as a correction, not buried.
+
+### 6.7 Outcome
+
+| question | answer |
+| --- | --- |
+| Was the §45 failure a label-skew artifact? | **No** (§6.3, §6.5) |
+| Did the balanced teacher let anything through? | **No** — 0 of 14 rows adopted |
+| Does re-weighting rescue it? | **No** (§6.4) |
+| Does `h[E]` encode forward direction at all? | **No** — below `1/3` on a balanced target (§6.5) |
+| Newly fitted blob to re-audit? | **None.** No blob was fitted or shipped; the balanced teacher is an experiment (`--teacher balanced`), not a new artifact. D1 (`tools/signal_audit.py`) and DECISION 1 (`derive_threshold.py`) therefore need **no** re-run — their inputs are unchanged. |
+
+Artifacts: `tools/edge_tracks.json` (v1), `tools/edge_tracks_balanced.json` (v2),
+`tools/edge_tracks_balanced_reweighted.json` (v2 + inverse weights). All three are
+regenerated byte-for-byte by the gate (`tests/test_edge_tracks_gate.py`).
+
+### 6.8 The intent head as a tie-breaker — pre-registered, REJECTED (§46.9)
+
+Under the §1.2 floor `language.intent` sits at 0.6338 / 0.3239 = **1.957x** — below
+the `2x` bar, above a constant. That is the one band where a head is neither
+adoptable nor obviously worthless, so the remaining role worth testing is a
+**tie-breaker**: consult the head only where the deterministic lexical classifier
+is already unsure.
+
+**Pre-registered before the run** (`tests/test_intent_tiebreak.cpp`, offline, real
+blob + the committed 71-row held-out fixture):
+
+```
+m   = lexical top-1 - lexical top-2            TAU = 0.10   (one value, not tuned)
+m >= TAU : lexical stands
+m <  TAU : lexical stands UNLESS head_top1 > lexical_top1, then take the head
+ADOPT iff (combined > lexical) AND (gain >= 2 rows)   <-- the noise guard
+```
+
+Both clauses are part of the pre-registration. The TAU curve is **reported, never
+selected from** (selecting from it would be §41's defect).
+
+| arm | accuracy | correct |
+| --- | ---: | ---: |
+| lexical only | **0.7465** | 53/71 |
+| fitted head only | 0.6338 | 45/71 |
+| combined (tie-break) | 0.7606 | 54/71 |
+
+Consulted on **3** rows, overrode **1** (helped 1, hurt 0) ⇒ **gain = 1 row**,
+discordant = 1, exact two-sided sign test **p = 1.0000**.
+
+**Verdict: clause 1 FIRED, clause 2 did NOT ⇒ REJECTED.** The point estimate
+improves by a single row out of 71; adopting on that is the §45 defect (a bar
+cleared by noise). The rejection is recorded, not resolved by relaxing the guard.
+
+Two free by-products: the head-only arm **re-derives** the D1 table's
+`language.intent` holdout accuracy (0.6338 = 45/71) from the fixture rather than
+copying it; and the lexical classifier **beats** the fitted head (0.7465 vs
+0.6338), which is what the design predicts — the language domain is lexical on
+purpose.
+
+Curve (reported, not selected from): TAU 0.05/0.10/0.20/0.30 → 0.7606 (consulted
+3/3/4/4); TAU 0.50 → 0.7465 (27); TAU 1.01 → 0.7465 (71).
+
+**Non-vacuity, both directions:** corrupting `kMinGain` 2 → 1 flips the verdict to
+ADOPT and turns **2** checks red; the first run, carrying a *placeholder* lexical
+pin (0.6479 instead of the measured 0.7465), failed **4** checks. **No blob was
+fitted or changed** — nothing in §4.2's corrected table needs re-auditing.
+
