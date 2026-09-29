@@ -123,7 +123,8 @@ months of commits before anyone noticed.
 `omniseed_strategy_parity`, `omniseed_calibration`, `omniseed_multimodal`,
 `omniseed_agent_modules`, `omniseed_uncertainty_split`,
 `omniseed_heads_batch`, `omniseed_streaming_decision`,
-`omniseed_feedback_hook`, `omniseed_threshold_derivation` and
+`omniseed_feedback_hook`, `omniseed_threshold_derivation`,
+`omniseed_signal_audit` and
 `omniseed_modality_dump` are deliberately registered **outside** the gate. The
 last eight need only **committed** fixtures (no model, no `.venv`, no network), so
 they run everywhere including CI.

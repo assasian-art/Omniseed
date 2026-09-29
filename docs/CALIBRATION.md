@@ -354,9 +354,14 @@ adapter), `general.routing` / `general.priority` (no labelled rows anywhere).
 is the only trading-side set with real signal. That is the fact that makes D2's
 repositioning defensible.
 
-**Gating.** `tests/fixtures/head_calibration/*/metrics.tsv` is the source; a
-regeneration test asserts the numbers above still come out of the committed
-blobs, so a re-fit that moves a ratio cannot land silently.
+**Gating.** `tests/fixtures/head_calibration/*/metrics.tsv` is the source.
+`tests/test_signal_audit.py` asserts the table above regenerates from the
+committed fixtures **both ways** — its own independent re-derivation must equal
+the published literals, and `signal_audit.py --json` must equal that
+re-derivation. Both halves were shown to fail when corrupted and to pass when
+restored (**54 checks, 0 fail**). Registered as `omniseed_signal_audit`,
+stdlib-only so it runs in CI. A re-fit that moves a ratio now fails loudly instead
+of landing silently.
 
 ---
 

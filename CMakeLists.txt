@@ -583,6 +583,20 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_strategy_parity.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_strategy_parity PROPERTIES TIMEOUT 900)
+
+        # D1 signal-audit gate (§43). docs/CALIBRATION.md §4.5 publishes a
+        # per-head (accuracy, ratio, verdict) table; this asserts it regenerates
+        # from the committed fixtures, from BOTH directions — the test's own
+        # re-derivation must match the published literals AND
+        # tools/signal_audit.py must agree with that re-derivation. Stdlib-only
+        # (no numpy), so it runs in CI where no .venv exists.
+        add_test(NAME omniseed_signal_audit
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_signal_audit.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_signal_audit PROPERTIES TIMEOUT 300)
     endif()
 
     # System-1 decision head ("two heads, one brain"): action space + labels,

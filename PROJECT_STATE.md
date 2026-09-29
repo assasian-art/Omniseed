@@ -4191,6 +4191,14 @@ Publishes, from the committed fixtures, whether each fitted head carries signal:
 DECISION 1's (`>= 2x chance` AND `n >= 30`), reused not reinvented. **§32's 0.2439
 is the shipped head's held-out accuracy; §41's 0.1441 is a contaminated refit.**
 
+**Gated, as the directive required.** `tests/test_signal_audit.py` asserts the
+table regenerates from the committed fixtures — from **both** directions: its own
+independent re-derivation must equal the published literals, *and*
+`signal_audit.py --json` must equal that re-derivation. Both halves were shown to
+**fail** when corrupted (a wrong verdict → 53/1; a flipped tool constant →
+53/1) and to pass when restored (**54 checks, 0 fail**). Stdlib-only, so it runs
+in CI where no `.venv` exists. Registered as `omniseed_signal_audit`.
+
 ### 43.5 D2 — strategic pivot (`docs/EDGE_RESEARCH.md`)
 
 - `trading.action` → **VETO/ABSTAIN filter only; it may only REMOVE exposure, never
@@ -4227,6 +4235,8 @@ audio→E adapter, so recording now readies the data for the day it exists.
   holdout (was: asserted the false defect). Syntax-checked with `cl /Zs /W4`,
   clean.
 - `tools/signal_audit.py` — D1 table; false in-sample caveat **removed**.
+- `tests/test_signal_audit.py` — **new**, the D1 gate (54 checks, 0 fail,
+  stdlib-only, both halves proven non-vacuous).
 - `docs/HOLDOUT_DEFECT.md` — rewritten as the **retraction record** + the real §41
   defect.
 - `docs/CALIBRATION.md` — §4.1 restored as held out; §4.5 verified-not-assumed;
@@ -4237,7 +4247,10 @@ audio→E adapter, so recording now readies the data for the day it exists.
 
 ### 43.8 Board
 
-Board grows **43 → 44** (`omniseed_modality_dump`). The C4 rewrite changes
-`omniseed_calibration`'s assertions without changing its count. Run the full local
-board before pushing (see §42's note on the `ctest` teardown exit code).
+Board grows **43 → 45**: `omniseed_modality_dump` (#44) plus the D1 gate
+`omniseed_signal_audit` (#45). The C4 rewrite changes `omniseed_calibration`'s
+assertions without changing its count. Full local board **44/44 passed
+(4040.09 s)** before the D1 gate was added; `omniseed_signal_audit` then passed on
+its own (3.99 s) ⇒ **45 registered**. Run the full local board before pushing (see
+§42's note on the `ctest` teardown exit code).
 
