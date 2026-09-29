@@ -4363,3 +4363,100 @@ exit code).
 **Not done in §44 (explicitly deferred, next milestones):** the audio→E adapter
 (task 2), the four edge tracks of `docs/EDGE_RESEARCH.md` (task 3, all still
 **NOT RUN**), Milestone 3 (dream consolidation), and the rest of the master mandate.
+
+## 44b. TASK 2 — the audio→E route EXISTS; `audio.emotion` is FITTED (2026-09-29)
+
+**The §43 brief called the missing audio→E adapter "the real blocker on
+`audio.emotion`". It was HALF right, and the half that mattered was already
+solved.** `--codec mel` (Whisper `[T/2,384]`) is genuinely blocked — no `384→768`
+projection exists — but `dump_hidden.cpp`'s **`--codec focal` path already reaches
+`h[E]`**: `PcmAudio(16k) → FocalCodec::encode → int32 ids → MultimodalBridge::fuse
+→ the SAME backbone forward`. The codec's own codebook does the modality→token
+mapping, so **no projection is needed for that route**. §44 exercised it.
+
+### 44b.1 The dump — all 672 RAVDESS clips, zero failures
+
+The clips were already staged (`models/modality/audio.emotion/`, 672 wavs +
+`labels.tsv` + `LICENCE.txt`, research-only). `labels.tsv`'s header
+(`file<TAB>audio.emotion<TAB>actor<TAB>sample_rate<TAB>n_samples`) is exactly the
+2-column manifest `read_modality_manifest` wants, so **no rewrite was needed**.
+
+```
+omniseed_dump_hidden.exe audio models/rwkv7-0.1B-ternary.gguf \
+    models/modality/audio.emotion/labels.tsv build/head_data/audio_emotion --codec focal
+→ audio: n=672 E=768 set=audio.emotion codec=focal bad(dec=0 enc=0 fuse=0)   [25m27s]
+```
+
+`meta.json`: `E=768, n=672, decoded_bad=0, encode_bad=0, fuse_bad=0`, histogram
+`{happy 192, sad 192, angry 192, neutral 96}` — **exactly RAVDESS's known 2:2:2:1
+balance**, and the rate was **16 kHz** (proving §42's resampler fired on the 48 kHz
+source). `hidden.f32` = 2,064,384 B = 672 × 768 × 4. This is the runtime's own
+`h[E]`, not a re-derivation.
+
+### 44b.2 The fit — a REAL but WEAK result, reported as such
+
+A new AUDIO block was added to `tools/train_heads.py` (`--audio`, default
+`build/head_data/audio_emotion`) mirroring the language block: `stratified_split`
+(clips have no time order — a chronological split would put a whole actor's worth
+of one emotion on one side), `fit_one`, `write_classification_head`.
+
+```
+audio.emotion  K=4  train=469 holdout=203 | acc=0.310 (macroF1=0.297)
+               ECE 0.659 -> 0.120 | T=50.0
+               per-class recall: {happy 0.2414, sad 0.3793, angry 0.3621, neutral 0.2069}
+→ models/heads/audio_head.bin (12,409 B, 4 labels)
+→ tests/fixtures/head_calibration/audio_emotion/ (203 held-out rows)
+```
+
+**Held-out accuracy 0.310340 on 203 rows ⇒ 1.241× chance (0.25).** Above chance,
+**below the 2× bar ⇒ NO-SIGNAL.** `sad` and `angry` carry most of it; `happy` and
+`neutral` are near chance. The `T=50.0` temperature says the raw logits were badly
+over-confident — the calibrated confidence (ECE 0.120) is usable even though the
+ranking is weak. **This is not presented as an emotion classifier that works.**
+
+### 44b.3 Provenance flipped to TRAINED — proven from C++
+
+`ClassificationHead::trained()` is `fitted_rows_ == total_labels_`; the blob writes
+all 4 rows fitted, so it loads as **TRAINED** (was "seeded placeholder
+(UNTRAINED)"). Verified by a new **C5** in `tests/test_calibration.cpp`: the blob
+loads, is `ready()`, `trained()`, `calibrated()`, `hidden_size()==768`,
+`label_set(0).name == "audio.emotion"`, and **its held-out accuracy reproduces
+exactly when scored over the committed fixture**: `acc = 0.3103`,
+`ECE raw=0.6590 → calibrated=0.1195` — both matching `metrics.tsv` to 4 dp.
+`omniseed_calibration` grew **189 → 209 checks, 0 fail**.
+
+### 44b.4 The D1 audit, re-published
+
+`tools/signal_audit.py` auto-discovers fixtures, so the new row appeared
+immediately; **`audio.emotion` was REMOVED from its hardcoded `UNFITTED` list**
+(8 → 7). `tests/test_signal_audit.py` was updated in the same commit — the
+`PUBLISHED` table gained the row, `EXPECTED_UNFITTED` lost it, the count text went
+8 → 7 — and now reports **64 checks, 0 fail** (was 54). This is the D1 gate doing
+its job: a set gaining weights is a change it is built to make loud.
+
+### 44b.5 Files
+
+- `tools/train_heads.py` — new `--audio` block (fits `audio.emotion`; writes
+  `audio_head.bin` + the fixture).
+- `models/heads/audio_head.bin` — **new**, 12,409 B (git-tracked; `models/heads/`
+  is negated in `.gitignore`).
+- `tests/fixtures/head_calibration/audio_emotion/` — **new** fixture (hidden.f32,
+  labels.tsv, metrics.tsv, vocab.tsv, meta.json).
+- `tests/test_calibration.cpp` — **C5 added**, 189 → 209 checks.
+- `tools/signal_audit.py` — `audio.emotion` out of `UNFITTED`.
+- `tests/test_signal_audit.py` — table + expected-unfitted updated (64 checks).
+- `docs/CALIBRATION.md` — §4.5 table + unfitted list + §6 gaps.
+- `docs/VISION_AUDIO_DATA.md` — the mel-vs-focal correction; the route that worked.
+
+### 44b.6 Honest status of `audio.emotion`
+
+**Fitted, verified, and weak.** It is NOT a working emotion classifier: 1.241×
+chance, `NO-SIGNAL` under the project's own 2× bar, and only 2 of 4 classes carry
+recall above chance. What it *does* establish is that the **focal-codec audio→E
+route is real and reaches the runtime's own `h[E]`**, so the `audio` modality is no
+longer blocked by a missing adapter. Whether the `mel` route (if ever built) or a
+trained adapter carries more emotion signal is **untested** and is a candidate for
+the edge-track work, not a claim.
+
+**Not done in §44/§44b:** the four `docs/EDGE_RESEARCH.md` tracks (task 3, still
+NOT RUN), Milestone 3, and the rest of the master mandate.

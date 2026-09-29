@@ -339,7 +339,8 @@ language.language             71    0.8451    0.2500   3.380  SIGNAL
 trading.regime               369    0.7046    0.3333   2.114  SIGNAL
 language.sentiment            71    0.6761    0.3333   2.028  SIGNAL
 DecisionAction               369    0.2439    0.1429   1.707  NO-SIGNAL
-SUMMARY: 5 fitted (4 SIGNAL, 1 NO-SIGNAL, 0 INSUFFICIENT-N), 8 unfitted
+audio.emotion                203    0.3103    0.2500   1.241  NO-SIGNAL
+SUMMARY: 6 fitted (4 SIGNAL, 2 NO-SIGNAL, 0 INSUFFICIENT-N), 7 unfitted
 ```
 
 ⚠️ **These accuracies ARE held out — verified, not assumed (§43 retraction).** An
@@ -355,11 +356,21 @@ rows, which are the 30% the fit never saw. The full trace is in
 
 The one *real* defect this milestone found is adjacent and narrower — see §4.6.
 
-**The eight unfitted sets** (the tool hardcodes them with reasons so the table can
+**`audio.emotion` (added in §44) is the first fitted MODALITY head.** Its `h[E]`
+comes from the focal codec's ids routed through `MultimodalBridge` and the same
+backbone forward — no `[T/2,384] → E=768` projection is needed for that route
+(§43's refusal of `--codec mel` still stands; it is a *different* feature set, and
+whether it carries more signal is untested). **1.241× chance is real but below the
+2× bar: NO-SIGNAL.** The per-class recall is `{happy 0.24, sad 0.38, angry 0.36,
+neutral 0.21}` — above chance on `sad`/`angry`, near chance elsewhere. Its ECE
+drops 0.659 → 0.120 with `T = 50.0` (the raw logits were badly over-confident, so
+the calibrated confidence is usable even though the ranking is weak).
+
+**The seven unfitted sets** (the tool hardcodes them with reasons so the table can
 never imply coverage it does not have): `language.task` (no consumer — see §6),
 `vision.scene` / `vision.anomaly` (no image corpus), `audio.wake` /
-`audio.speaker` (owner voice not yet recorded), `audio.emotion` (no audio→E
-adapter), `general.routing` / `general.priority` (no labelled rows anywhere).
+`audio.speaker` (owner voice not yet recorded), `general.routing` /
+`general.priority` (no labelled rows anywhere).
 
 **What this changes.** `trading.regime` at **2.114× chance on 369 held-out rows**
 is the only trading-side set with real signal. That is the fact that makes D2's
@@ -370,9 +381,9 @@ repositioning defensible.
 committed fixtures **both ways** — its own independent re-derivation must equal
 the published literals, and `signal_audit.py --json` must equal that
 re-derivation. Both halves were shown to fail when corrupted and to pass when
-restored (**54 checks, 0 fail**). Registered as `omniseed_signal_audit`,
-stdlib-only so it runs in CI. A re-fit that moves a ratio now fails loudly instead
-of landing silently.
+restored (**64 checks, 0 fail**, 6 fitted + 7 unfitted after §44). Registered as
+`omniseed_signal_audit`, stdlib-only so it runs in CI. A re-fit that moves a ratio
+now fails loudly instead of landing silently.
 
 ---
 
@@ -485,14 +496,19 @@ asserted *absent*.
   a definition. Nothing in this milestone claims the policy is profitable.
 - **`assets` and `invalidation` are written empty / zero** in the blobs. Treat as
   "unknown", **never** as "no stop".
-- **Nothing else is trained.** Vision and audio still have label spaces and no
-  logic. There is no learned token head. The modality **dump paths now exist**
-  (vision and audio both go through `MultimodalBridge` — §43), but vision has no
-  corpus and audio has no `[T/2,384] → E=768` adapter, so neither can be fitted:
-  see `docs/VISION_AUDIO_DATA.md`. `audio.wake` / `audio.speaker` additionally
-  need the owner's recorded voice (`omniseed enroll-audio`, RUNBOOK §5).
+- **`audio.emotion` is now FITTED (§44) but WEAK.** `models/heads/audio_head.bin`
+  loads and reports `trained()`, and its `h[E]` is the runtime's own (focal codec →
+  `MultimodalBridge` → the same backbone). At **1.241× chance** it is **NO-SIGNAL**;
+  it must not be presented as an emotion classifier that works. It is the first
+  modality head, not a good one.
+- **Nothing else is trained.** `vision.*` still have label spaces and no corpus;
+  `audio.wake` / `audio.speaker` need the owner's recorded voice (`omniseed
+  enroll-audio`, RUNBOOK §5). There is no learned token head. The `--codec mel`
+  route is still refused (no `[T/2,384] → E=768` adapter) — §44 fitted audio
+  through the *focal codec* instead, which needs no projection. See
+  `docs/VISION_AUDIO_DATA.md`.
 - **The mandate's `n_samples=1255`** was an assumption; the real numbers are
-  167/71 (language) and 862/369 (trading).
+  167/71 (language), 862/369 (trading) and 469/203 (audio.emotion).
 
 ---
 

@@ -74,14 +74,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 FIXTURE_DIR = os.path.join(ROOT, "tests", "fixtures", "head_calibration")
 
-# The 8 sets that have NO fitted weights. Listed so the report can say so out
+# The 7 sets that have NO fitted weights. Listed so the report can say so out
 # loud; a table that simply omits them invites the reader to assume they pass.
+# `audio.emotion` LEFT this list in §44: it now has a fitted blob (1.241x chance,
+# NO-SIGNAL) via the focal-codec route, so it appears in the table above.
 UNFITTED = [
     ("language.task", "INSUFFICIENT-DATA", "no labelled rows exist anywhere"),
     ("vision.scene", "INSUFFICIENT-DATA", "no images in tree; CIFAR fetch abandoned"),
     ("vision.anomaly", "INSUFFICIENT-DATA", "needs scene images first"),
     ("audio.wake", "INSUFFICIENT-DATA", "Speech Commands v2 unfetchable; use enroll-audio"),
-    ("audio.emotion", "INSUFFICIENT-DATA", "672 RAVDESS clips available; NO mel path (no audio->E adapter)"),
     ("audio.speaker", "INSUFFICIENT-DATA", "needs other speakers; owner has not enrolled"),
     ("general.routing", "INSUFFICIENT-DATA", "no labelled rows exist anywhere"),
     ("general.priority", "NO-SIGNAL", "no objective label exists; must stay unfitted"),

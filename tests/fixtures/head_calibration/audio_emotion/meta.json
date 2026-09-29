@@ -1,0 +1,77 @@
+{
+  "bin": "models/heads/audio_head.bin",
+  "set_name": "audio.emotion",
+  "split": "stratified 70/30 + 5-fold CV for T",
+  "render": "PcmAudio(16k) -> FocalCodec ids -> MultimodalBridge -> backbone (no audio->E projection needed)",
+  "ece_bins_calibrated": [
+    {
+      "lo": 0.0,
+      "hi": 0.1,
+      "n": 0
+    },
+    {
+      "lo": 0.1,
+      "hi": 0.2,
+      "n": 0
+    },
+    {
+      "lo": 0.2,
+      "hi": 0.3,
+      "n": 9,
+      "accuracy": 0.2222,
+      "confidence": 0.282
+    },
+    {
+      "lo": 0.3,
+      "hi": 0.4,
+      "n": 85,
+      "accuracy": 0.2941,
+      "confidence": 0.3526
+    },
+    {
+      "lo": 0.4,
+      "hi": 0.5,
+      "n": 71,
+      "accuracy": 0.2676,
+      "confidence": 0.4449
+    },
+    {
+      "lo": 0.5,
+      "hi": 0.6,
+      "n": 20,
+      "accuracy": 0.45,
+      "confidence": 0.5454
+    },
+    {
+      "lo": 0.6,
+      "hi": 0.7,
+      "n": 13,
+      "accuracy": 0.3846,
+      "confidence": 0.6457
+    },
+    {
+      "lo": 0.7,
+      "hi": 0.8,
+      "n": 4,
+      "accuracy": 0.75,
+      "confidence": 0.7621
+    },
+    {
+      "lo": 0.8,
+      "hi": 0.9,
+      "n": 1,
+      "accuracy": 0.0,
+      "confidence": 0.8143
+    },
+    {
+      "lo": 0.9,
+      "hi": 1.0,
+      "n": 0
+    }
+  ],
+  "E": 768,
+  "n": 203,
+  "columns": [
+    "audio.emotion"
+  ]
+}

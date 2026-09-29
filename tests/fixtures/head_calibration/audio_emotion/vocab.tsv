@@ -1,0 +1,5 @@
+column	index	label
+audio.emotion	0	happy
+audio.emotion	1	sad
+audio.emotion	2	angry
+audio.emotion	3	neutral

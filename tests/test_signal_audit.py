@@ -54,13 +54,17 @@ PUBLISHED = {
     "trading.regime":      (369, 0.7046, 2.114, "SIGNAL"),
     "language.sentiment":  (71, 0.6761, 2.028, "SIGNAL"),
     "DecisionAction":      (369, 0.2439, 1.707, "NO-SIGNAL"),
+    # §44: the first FITTED modality head. Via the focal-codec route (PcmAudio ->
+    # FocalCodec ids -> MultimodalBridge -> backbone), no audio->E projection.
+    "audio.emotion":       (203, 0.3103, 1.241, "NO-SIGNAL"),
 }
 
-# The 8 sets that must appear as unfitted. If one gains weights, the audit table
-# gains a row and this list shrinks — a change worth failing loudly for.
+# The 7 sets that must appear as unfitted. §44 removed `audio.emotion` from here:
+# it gained weights, so the audit table gained a row and this list shrank — the
+# exact change this assertion exists to make loud.
 EXPECTED_UNFITTED = {
     "language.task", "vision.scene", "vision.anomaly", "audio.wake",
-    "audio.emotion", "audio.speaker", "general.routing", "general.priority",
+    "audio.speaker", "general.routing", "general.priority",
 }
 
 _g_passed = 0
@@ -213,11 +217,11 @@ def main() -> int:
             check_eq(r["verdict"], m[3], "%s tool verdict" % col)
 
     # ---- 3. the unfitted sets are reported, not omitted ---------------------
-    print("\n-- 3. the 8 unfitted sets are listed, not silently dropped --")
+    print("\n-- 3. the 7 unfitted sets are listed, not silently dropped --")
     if audit is not None:
         got_unfitted = {u["set"] for u in audit.get("unfitted", [])}
         check_eq(got_unfitted, EXPECTED_UNFITTED,
-                 "the tool lists exactly the 8 unfitted sets")
+                 "the tool lists exactly the 7 unfitted sets")
         # No unfitted set may also appear as fitted — that would be a set that
         # has weights AND is reported as having none.
         check(not (got_unfitted & set(PUBLISHED.keys())),

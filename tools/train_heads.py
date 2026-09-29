@@ -650,6 +650,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--language", default="build/head_data/language")
     ap.add_argument("--trading", default="build/head_data/trading")
+    ap.add_argument("--audio", default="build/head_data/audio_emotion",
+                    help="audio h[E] dump (focal-codec route); fits audio.emotion")
     ap.add_argument("--bars", default="models/market/AAPL_1d.csv")
     ap.add_argument("--out-dir", default="models/heads")
     ap.add_argument("--report", default="build/head_data/report.json")
@@ -887,6 +889,95 @@ def main():
         print("!! trading dump missing at %s — NOT FITTED" % args.trading)
         report["heads"]["trading_action"] = {"status": "NOT FITTED",
                                              "why": "no dump at " + args.trading}
+
+    # ======================= AUDIO ==========================================
+    # §44's route. The audio dump is produced WITHOUT any audio->E projection:
+    # `omniseed_dump_hidden.exe audio ... --codec focal` turns each clip into the
+    # focal codec's own int32 ids, feeds them through MultimodalBridge, and runs
+    # the SAME backbone forward the runtime does — so the h[E] written here is the
+    # runtime's own, not a fabrication. (The `--codec mel` path is still refused:
+    # Whisper emits [T/2,384] with no 384->768 adapter; §43, docs/VISION_AUDIO_DATA.)
+    # A single label set today (audio.emotion); the block is written to extend.
+    if os.path.isdir(args.audio):
+        meta, H, ids, set_names, labels = load_dump(args.audio)
+        print("\n=== audio: N=%d E=%d sets=%s" % (H.shape[0], H.shape[1], set_names))
+        cols = {name: np.array([r[i] for r in labels]) for i, name in enumerate(set_names)}
+
+        sets_out, proj_rows, bias_rows, fitted_rows = [], [], [], []
+        per_set = {}
+        temps, cals, eces = [], [], []
+        for name in set_names:
+            vocab = label_sets.get(name)
+            if vocab is None:
+                raise SystemExit("label set %r is not in the C++ canonical list" % name)
+            inv = {l: i for i, l in enumerate(vocab)}
+            unknown = sorted(set(cols[name]) - set(inv))
+            if unknown:
+                raise SystemExit("labels %r in %s are not canonical for %r"
+                                 % (unknown, name, vocab))
+            y = np.array([inv[v] for v in cols[name]], dtype=int)
+            K = len(vocab)
+            # STRATIFIED, not chronological: clips have no time order, and the
+            # RAVDESS balance is 2:2:2:1 so a chronological split would put a
+            # whole actor's worth of one emotion in one side.
+            tr, hold = stratified_split(y, seed=args.seed)
+            r = fit_one(H, y, K, tr, hold, shuffle=True, seed=args.seed)
+            print("  %-20s K=%d  train=%d holdout=%d | acc=%.3f "
+                  "(macroF1=%.3f) | ECE %.3f -> %.3f | T=%.3f"
+                  % (name, K, len(tr), len(hold), r["holdout_acc"],
+                     r["holdout_macro_f1"], r["ece_raw"], r["ece_calibrated"],
+                     r["temperature"]))
+            print("      per-class recall: %s"
+                  % {vocab[i]: r["per_class_recall_holdout"][i] for i in range(K)})
+            print("      label counts: %s"
+                  % {vocab[i]: int((y == i).sum()) for i in range(K)})
+            per_set[name] = public_metrics(r)
+            per_set[name]["labels"] = vocab
+            per_set[name]["label_counts"] = {
+                vocab[i]: int((y == i).sum()) for i in range(K)}
+            sets_out.append({"name": name, "labels": vocab})
+            proj_rows.append(r["proj"])
+            bias_rows.append(r["bias"])
+            fitted_rows.extend([1] * K)
+            temps.append(r["temperature"])
+            cals.append(len(hold) if len(hold) else len(tr))
+            eces.append(r["ece_calibrated"])
+            if not args.no_fixture:
+                emit_fixture(args.fixture_dir, name.replace(".", "_"), H,
+                             r["_test_idx"], [(name, cols[name])],
+                             {"bin": "models/heads/audio_head.bin",
+                              "set_name": name,
+                              "split": "stratified 70/30 + 5-fold CV for T",
+                              "render": "PcmAudio(16k) -> FocalCodec ids -> "
+                                        "MultimodalBridge -> backbone (no "
+                                        "audio->E projection needed)",
+                              "ece_bins_calibrated": r["ece_bins_calibrated"]},
+                             {name: {"temperature": r["temperature"],
+                                     "ece_calibrated": r["ece_calibrated"],
+                                     "holdout_acc": r["holdout_acc"]}},
+                             {name: vocab})
+
+        proj = np.vstack(proj_rows)
+        bias = np.concatenate(bias_rows)
+        apath2 = os.path.join(args.out_dir, "audio_head.bin")
+        asize2 = write_classification_head(
+            apath2, H.shape[1], sets_out, proj, bias,
+            sum(len(s["labels"]) for s in sets_out), fitted_rows,
+            default_temperature=1.0, temperatures=temps,
+            calib_samples_list=cals, calib_errors=eces)
+        print("  wrote %s (%d bytes, %d labels)" % (apath2, asize2, len(bias)))
+        report["heads"]["audio"] = {
+            "kind": "ClassificationHead", "path": apath2, "bytes": asize2,
+            "E": H.shape[1], "n_examples": int(H.shape[0]),
+            "temperatures": {n: round(t, 6) for n, t in zip(set_names, temps)},
+            "calibration_samples": {n: c for n, c in zip(set_names, cals)},
+            "ece_calibrated": {n: round(e, 6) for n, e in zip(set_names, eces)},
+            "sets": per_set, "source": meta,
+        }
+    else:
+        print("!! audio dump missing at %s — NOT FITTED" % args.audio)
+        report["heads"]["audio"] = {"status": "NOT FITTED",
+                                    "why": "no dump at " + args.audio}
 
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:

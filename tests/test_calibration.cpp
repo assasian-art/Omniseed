@@ -936,6 +936,59 @@ static void part_c_held_out_calibration() {
             }
         }
     }
+
+    // ---- C5: the audio head (§44) — the first fitted MODALITY head -----------
+    // §43 refused `--codec mel` because Whisper's [T/2,384] has no E=768 adapter.
+    // §44 fitted `audio.emotion` the OTHER way: the focal codec's own ids go
+    // through MultimodalBridge and the SAME backbone forward, so the h[E] is the
+    // runtime's own and no projection is needed. This asserts the resulting blob
+    // is real — it LOADS, is TRAINED (every label row fitted), and its recorded
+    // held-out accuracy reproduces when scored over the committed fixture.
+    //
+    // The number is deliberately NOT asserted to clear the 2x bar: it is 1.241x
+    // chance (NO-SIGNAL, see docs/CALIBRATION.md §4.5), and a test that demanded
+    // signal here would be asserting a result the data does not support.
+    TEST("C5: the fitted audio.emotion head loads, is TRAINED, and reproduces "
+         "its held-out accuracy");
+    {
+        const std::string bin = "models/heads/audio_head.bin";
+        const std::string dir = fx + "/audio_emotion";
+        if (!file_exists(bin) || !file_exists(dir + "/metrics.tsv")) {
+            SKIP("models/heads/audio_head.bin or its fixture is absent");
+        } else {
+            ClassificationHead h;
+            CHECK(h.load(bin));
+            CHECK(h.ready());
+            CHECK(h.trained());
+            CHECK(h.hidden_size() == 768);
+            CHECK(h.label_set_count() == 1);
+            CHECK(h.label_set(0).name == "audio.emotion");
+            CHECK(h.calibrated());
+            CHECK(h.calibration_error() > 0.0f);
+
+            Fixture f;
+            CHECK(f.load(dir));
+            const auto it = f.metrics.find("audio.emotion");
+            CHECK(it != f.metrics.end());
+            if (it != f.metrics.end()) {
+                CHECK(static_cast<int64_t>(it->second.n) == f.n());
+                std::vector<float> cc, cr;
+                std::vector<int>   kc, kr;
+                CHECK(score_classification(h, f, "audio.emotion", cc, kc));
+                const float T = h.temperature(0);
+                h.set_temperature(0, 1.0f);
+                CHECK(score_classification(h, f, "audio.emotion", cr, kr));
+                h.set_temperature(0, T);
+                report_and_check("audio.emotion", f, cc, kc, cr, kr);
+                const double acc = std::accumulate(kc.begin(), kc.end(), 0) /
+                                   static_cast<double>(std::max<size_t>(kc.size(), 1));
+                platform::log_info(
+                    "  C5  held-out acc = %.4f n=%zu  (metrics.tsv records %.4f)",
+                    acc, kc.size(), static_cast<double>(it->second.acc));
+                CHECK(std::fabs(acc - it->second.acc) < 0.005);
+            }
+        }
+    }
 }
 
 // =============================================================================
