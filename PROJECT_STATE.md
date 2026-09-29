@@ -4831,3 +4831,204 @@ what the design predicts: the language domain is lexical on purpose.
 run, which carried a **placeholder** lexical pin (0.6479 instead of the measured
 0.7465), failed **4** checks. The gate can say no and can say yes.
 
+
+---
+
+## §47 — the dream pass as a JOINT, the direction program CLOSED, and the board split (2026-10-03)
+
+**Directive.** (1) Milestone 3 — dream consolidation — is *a joint*: the pieces
+exist, nothing consumes them. (2) One last pre-registered direction probe, and
+then the direction program closes either way. (3) Label the slow LoRA suites and
+keep the default board all-green.
+
+### 47.1 The dream joint — the seam, not a feature
+
+Three subsystems had grown exactly the pieces a dream pass is supposed to
+consume, and each said so in a comment:
+
+| subsystem | the primitive | what its own comment said |
+| --- | --- | --- |
+| `MemoryCrystals` (§31) | `decay()`, `reinforce()` | "Call periodically (e.g. from dream())" |
+| `Soul` (§30) | `decay_memories()`, `reinforce_memory()` | "Belongs in a dream/idle pass, not on the hot path" |
+| `DecisionJournal` (§38) | every §37 verdict and realised outcome | **nothing consumed it — a standing open finding** |
+
+So the gap was never a missing feature; it was the **joint**. `SelfImprovement::
+dream()` now consumes all three, and the contract is one context in, one report
+out (`include/omniseed/agent/dream.h`).
+
+**What the pass does**
+
+1. **Journal evidence first** (§38). A trace whose key the journal **CORRECTED**
+   is pruned whatever its `success_count`; a key it **CONFIRMED**/**REALISED**
+   gets its `last_used` refreshed so it stops ageing. The journal is evidence
+   about the world; `success_count` is only evidence about our own bookkeeping,
+   and when the two disagree the world wins. The refresh is **idempotent** — it
+   does not increment, because a standing record must not inflate on every dream.
+2. **Streaming verdicts** (§37) counted, and the report **names its source**
+   (`events` / `journal` / `none`) rather than implying it saw live events.
+3. **The original trace rules**, unchanged when the context is empty — this is
+   the pre-§47 behaviour, so nothing that worked stops working.
+4. **Crystal pass** (§31): a crystal whose `last_access_token` advanced past
+   `previous_token` — i.e. one actually RECALLED since the last dream — is
+   **reinforced first, then** `decay()` runs over the rest. That order is the
+   Ebbinghaus contract the memory layer already documents: retrieval is the
+   evidence of usefulness, so a memory recalled yesterday must not be deleted
+   today for having been old yesterday. `previous_token == 0` means "unknown"
+   (first dream) and disables reinforcement.
+
+**The accounting closes exactly.** `traces_before == traces_after + pruned +
+pruned_by_journal + faded + dropped_unsuccessful`. The last two counters are new
+because the pre-§47 pass dropped zero-success traces **silently** — the final
+`if (success_count > 0)` keep-test removed them and nothing said so. The
+behaviour is unchanged; only the accounting is new.
+
+**A dream pass never invents activity.** With an empty context the report is all
+zeros and the log says so. Nothing here is fitted, sampled or random — every
+count is a deterministic function of the inputs, which is what makes
+`state/dream_log.json` diffable night to night. The single non-deterministic
+field is `generated_ms`.
+
+### 47.2 `omniseed dream --nightly`
+
+`omniseed dream` (no flag) is a **demo**: on an empty state it fabricates a day so
+the command always prints something. A *scheduled* pass must never do that —
+inventing a day and then writing it to a log is how a record starts lying.
+
+`--nightly` is the honest variant: it reads only what exists, does nothing when
+there is nothing, and writes the log. Flags: `--dream-log`, `--crystals`,
+`--feedback-journal`, `--now-token`. It exits non-zero if the log cannot be
+written, so a scheduler reports a failure rather than a silent no-op.
+
+**The clock is the crystal clock, whose unit is TOKENS.** One night is one day:
+`now = previous + tokens_per_day` (100000), and `previous` is read back out of
+`state/dream_log.json` so consecutive runs advance monotonically instead of
+resetting. Verified: night 1 `0 -> 100000`, night 2 `100000 -> 200000`,
+`--now-token 999999` `200000 -> 999999`. RUNBOOK §4 carries the Task Scheduler
+and cron lines.
+
+### 47.3 Track F — the last direction probe (non-linear)
+
+Track E (§46) killed the **linear** probe. One escape hatch remained: maybe
+`h[E]` encodes the forward direction, but not linearly. Track F pre-registers a
+single non-linear probe and runs it once.
+
+**The instrument took three attempts, and that history is part of the result.**
+
+| attempt | probe | leak control | non-linear control | usable? |
+| --- | --- | ---: | --- | --- |
+| v0 | SGD, 400 epochs, 768 raw dims | **0.61** ✗ | not recoverable | **NO** — invalid instrument |
+| v1 | Adam, 2000 epochs, 768 raw dims | 0.81 ✓ | not recoverable | **NO** — no power at N≈850 |
+| v2 | Adam, 2000 epochs, **PCA-32 (train)** | **1.0000** ✓ | **0.6967** vs linear **0.5519** ✓ | **YES** |
+
+v0's leak control put the label **into** `h[E][:,0]` and the probe still reached
+only 0.61 — a probe failure, not evidence about `h[E]`, so v0's candidate numbers
+(0.2787 / 0.2493) were **discarded as such**. Adam (the optimiser `fit_softmax`
+already uses) and a train-split PCA projection fixed the conditioning. The
+projection does not weaken the comparison: a linear head on those components
+*is* a linear head on `h[E]` restricted to that subspace, so the non-linear probe
+stays a strict superset of the linear one it is contrasted with.
+
+**Pre-registered probe:** `h[E]` → standardise(train) → PCA(32, train,
+sign-fixed) → 1 hidden layer, 64 tanh units → softmax; full-batch Adam, 2000
+epochs, lr 0.05, l2 1e-4, seeded init, inverse-frequency class weights from the
+train split. The holdout is never read during the fit. Bar unchanged:
+`acc >= 2 x majority_rate AND n_holdout >= 30`.
+
+| row | role | target | n | acc | floor | ÷floor | required | got |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| **F1** | candidate | directional tertile (Track E's exact target/split/holdout) | 366 | **0.3197** | 0.3716 | **0.860x** | clear | **NO-SIGNAL** |
+| **F2** | candidate | balanced 7-action teacher (§45) | 369 | **0.2114** | 0.3198 | **0.661x** | clear | **NO-SIGNAL** |
+| Fleak | control | label injected into PC0 | 366 | **1.0000** | 0.3716 | 2.691x | must clear | ✓ |
+| Fcap | control | in-split tertiles of pc0·pc1 — **mlp** | 366 | **0.6967** | 0.3333 | 2.090x | must clear | ✓ |
+| Fcap | control | in-split tertiles of pc0·pc1 — **linear** | 366 | 0.5519 | 0.3333 | 1.656x | must NOT clear | ✓ |
+| Fctl | control | F1, TRAIN labels shuffled | 366 | 0.3716 | 0.3716 | 1.000x | must NOT clear | ✓ |
+
+`controls_valid = true`. The four controls say one thing together: the probe
+**recovers a signal that is present** (1.0000), it **generalises a genuinely
+non-linear function that a linear probe on the same target cannot** (0.6967 vs
+0.5519), and it **cannot clear the bar on shuffled labels** (exactly 1.000x — it
+collapses onto the majority class). Without those, a "no-signal" verdict would be
+unfalsifiable.
+
+Control rows carry `control_floor` / `cleared_bar` instead of `floor` /
+`adopted`, so nothing can mistake a control for a head that cleared the bar —
+and the gate's A7 invariant still applies to every *candidate* row.
+
+**The calibration did not manufacture the verdict:** F1 read 0.279 / 0.295 /
+0.353 / 0.306 / 0.320 across the five probe budgets, never once approaching the
+0.372 floor.
+
+### 47.4 The direction-prediction program is CLOSED
+
+| track | probe family | target | best ÷floor | adopted |
+| --- | --- | --- | ---: | --- |
+| A | linear (7-action) | shipped + balanced teacher, 4 horizons | 0.926x | no |
+| B | linear + 12 hand features | shipped + balanced teacher | 1.008x (z=0.11 — noise) | no |
+| C | linear, multi-asset pooled | shipped + balanced teacher | 0.902x | no |
+| D | linear, rank/quantile | forward-return rank | 0.789x | no |
+| E | **linear** | **perfectly balanced 3-class direction** | **0.885x** (below 1/3) | no |
+| F | **non-linear (64-unit)** | **balanced 3-class direction** | **0.860x** | no |
+| F | non-linear | balanced 7-action teacher | 0.661x | no |
+
+**`h[E]` does not carry the forward direction of the bar in a form any probe
+tried here can recover.** No further direction experiment will be opened. The
+system's trading edge does **not** come from predicting direction; it lives in
+the rule-based engines (the only components authorised to gate), risk management,
+and honest abstention (0 of 369 rows committed).
+
+### 47.5 Board hygiene — the default board is green, the slow profile is explicit
+
+The three CPU LoRA suites (`omniseed_lora_e2e`, `omniseed_lora_chat`,
+`omniseed_lora_gguf`) train a real model and can exceed their timeouts on a
+loaded box without anything being broken (§46 measured all three). They are now
+labelled **`slow`** in `CMakeLists.txt`:
+
+```bash
+ctest --test-dir build -C Release -LE slow      # default: 46 tests, minutes, must be green
+ctest --test-dir build -C Release               # full:    49 tests, includes the slow three
+```
+
+`omniseed_lora_i8` is deliberately **not** labelled: it skips internally when its
+GGUF base is absent and it passed on the same loaded box, so removing it would
+cost coverage for no gain. Both invocations are in RUNBOOK §3.
+
+`omniseed_edge_tracks_gate`'s timeout went 900 → **1200 s**, because it now also
+regenerates Track F (called separately, so A/B/D/E are not paid for twice).
+
+### 47.6 Files
+
+- `include/omniseed/agent/dream.h` · `src/agent/dream.cpp` — **new**: the joint.
+  `DreamContext`, `DreamReport` (exact counters + `to_json()`),
+  `crystal_used_since()`, `write_dream_log()`.
+- `include/omniseed/agent/agent.h` — `DreamReport dream(const DreamContext&)`
+  alongside the untouched `void dream()`.
+- `tests/test_agent_modules.cpp` — **+C10–C13** (222 checks): a reinforced
+  crystal survives, an unreinforced stale one decays, the `dream_log.json`
+  schema is asserted, the journal outranks `success_count`, and the accounting
+  identity closes. **C5 — the success-only/failure-only trace invariant — is
+  untouched.**
+- `src/cli/main.cpp` — `dream --nightly` + `--dream-log` / `--crystals` /
+  `--feedback-journal` / `--now-token`.
+- `tools/edge_tracks.py` — **+Track F**: `_pca_basis`, `fit_mlp` (Adam),
+  `_insplit_tertiles`, `_f_row` / `_f_control_row`, `track_f`, and the
+  `direction_program` decision block. Default tracks `A..F`.
+- `tools/edge_tracks.json` · `tools/edge_tracks_balanced.json` ·
+  `tools/edge_tracks_balanced_reweighted.json` — regenerated with Track F.
+- `tests/test_edge_tracks_gate.py` — **+A12–A15** (the decision, the two
+  candidates, the four controls, the doc) and an F-only regeneration check.
+- `docs/EDGE_RESEARCH.md` — **+§6.9** (Track F) and **+§6.10** (the closure).
+- `CMakeLists.txt` — the `slow` labels; the edge-tracks gate timeout.
+- `RUNBOOK.md` — the two board profiles, the `dream --nightly` entry.
+
+### 47.7 Honest status
+
+**No blob was fitted or shipped.** Track F fits a probe for *measurement only*
+and discards it — the `DecisionAction` heads are untouched, so D1
+(`signal_audit.py`) and DECISION 1 (`derive_threshold.py`) need **no** re-run;
+their inputs are unchanged. The shipped trading blob still reproduces
+`acc=0.24390`, `T=13.325159204929149` bit-for-bit.
+
+**The one-line result:** the dream pass is no longer a set of primitives waiting
+for a caller — it is the joint that consumes the soul, the crystals and the
+feedback journal, and it is schedulable. And the direction program is **closed**:
+six pre-registered tracks, two probe families, one answer.

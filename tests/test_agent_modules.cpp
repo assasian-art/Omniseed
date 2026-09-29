@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -483,6 +484,228 @@ static void part_c_self_improvement() {
         CHECK(r.load(path));
         CHECK(r.size() == 1);
         std::remove(path.c_str());
+    }
+
+    // =========================================================================
+    // §47 — the dream JOINT. C5 above is the trace-only invariant and is left
+    // EXACTLY as it was: a caller with no other subsystem in play must get the
+    // behaviour it always got. C10-C13 cover what the joint adds.
+    // =========================================================================
+
+    TEST("C10: dream() reinforces a crystal recalled since the last pass, and decays one that was not");
+    {
+        Tokenizer tok;
+        CHECK(tok.build_minimal());
+
+        const std::string used_text    = "deploy window tuesday rollback plan";
+        const std::string ignored_text = "lunch menu vegetarian option";
+
+        MemoryCrystals mc;
+        uint64_t used = 0, ignored = 0;
+        CHECK(mc.crystallize(tok.encode(used_text), tok, 0, -1.0f, &used));
+        CHECK(mc.crystallize(tok.encode(ignored_text), tok, 0, -1.0f, &ignored));
+        CHECK(mc.size() == 2);
+        CHECK(used != 0);
+        CHECK(ignored != 0);
+        CHECK(used != ignored);
+
+        // The predicate, named and checked directly. Strictly greater, and an
+        // unknown clock (0) claims NOTHING was used.
+        {
+            MemoryCrystal c;
+            c.last_access_token = 100;
+            CHECK(crystal_used_since(c, 50));
+            CHECK(!crystal_used_since(c, 100));
+            CHECK(!crystal_used_since(c, 0));
+        }
+
+        const uint64_t previous = 1000000;   // the clock at the last dream
+
+        // ONE crystal is recalled. Retrieval stamps last_access_token — that is
+        // the memory layer's own documented contract ("retrieval reinforces"),
+        // and it is the ONLY thing that distinguishes the two crystals here.
+        const std::vector<MemoryCrystal> got =
+            mc.retrieve(tok.encode(used_text), 1, previous + 5);
+        CHECK(got.size() == 1);
+        CHECK(got[0].id == used);            // the query IS this crystal's text
+        const MemoryCrystal* cu = mc.find(used);
+        const MemoryCrystal* ci = mc.find(ignored);
+        CHECK(cu != nullptr);
+        CHECK(ci != nullptr);
+        CHECK(cu->last_access_token > previous);
+        CHECK(ci->last_access_token <= previous);
+
+        SelfImprovement imp;
+        DreamContext ctx;
+        ctx.crystals       = &mc;
+        ctx.previous_token = previous;
+        ctx.now_token      = previous + 5000000;   // ~50 days later in the crystal clock
+        const DreamReport r = imp.dream(ctx);
+
+        CHECK(r.crystals_before == 2);
+        CHECK(r.crystals_reinforced == 1);         // exactly the recalled one
+        CHECK(r.crystals_decayed == 1);            // exactly the ignored one
+        CHECK(r.crystals_after == 1);
+        CHECK(mc.find(used) != nullptr);           // reinforced => survived
+        CHECK(mc.find(ignored) == nullptr);        // untouched => decayed away
+    }
+
+    TEST("C11: dream_log.json is written with a stable, asserted schema");
+    {
+        DreamReport r;
+        r.traces_before = 3;
+        r.traces_after  = 2;
+        r.traces_pruned = 1;
+        r.crystals_before = 4;
+        r.crystals_after  = 3;
+        r.crystals_reinforced = 2;
+        r.crystals_decayed    = 1;
+        r.journal_present = true;
+        r.journal_predictions = 7;
+        r.journal_confirmed_keys = 1;
+        r.stream_source = "journal";
+        r.stream_events = 7;
+        r.stream_committed = 2;
+        r.stream_flips = 1;
+        r.previous_token = 10;
+        r.now_token = 20;
+
+        const std::string path = tmp("test_dream_log.json");
+        CHECK(write_dream_log(r, path));
+
+        std::ifstream f(path);
+        CHECK(static_cast<bool>(f));
+        const std::string j((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        f.close();
+
+        // Every section and every counter the log promises. A key that is
+        // renamed or dropped must fail HERE, not silently disappear from the
+        // nightly record.
+        CHECK(j.find("\"version\": 1") != std::string::npos);
+        CHECK(j.find("\"generated_ms\": ") != std::string::npos);
+        CHECK(j.find("\"previous_token\": 10") != std::string::npos);
+        CHECK(j.find("\"now_token\": 20") != std::string::npos);
+        CHECK(j.find("\"traces\": {") != std::string::npos);
+        CHECK(j.find("\"before\": 3") != std::string::npos);
+        CHECK(j.find("\"after\": 2") != std::string::npos);
+        CHECK(j.find("\"pruned\": 1") != std::string::npos);
+        CHECK(j.find("\"pruned_by_journal\": 0") != std::string::npos);
+        CHECK(j.find("\"reinforced_by_journal\": 0") != std::string::npos);
+        CHECK(j.find("\"decayed\": 0") != std::string::npos);
+        CHECK(j.find("\"faded\": 0") != std::string::npos);
+        CHECK(j.find("\"dropped_unsuccessful\": 0") != std::string::npos);
+        CHECK(j.find("\"crystals\": {") != std::string::npos);
+        CHECK(j.find("\"before\": 4") != std::string::npos);
+        CHECK(j.find("\"after\": 3") != std::string::npos);
+        CHECK(j.find("\"reinforced\": 2") != std::string::npos);
+        CHECK(j.find("\"decayed\": 1") != std::string::npos);
+        CHECK(j.find("\"journal\": {") != std::string::npos);
+        CHECK(j.find("\"present\": true") != std::string::npos);
+        CHECK(j.find("\"predictions\": 7") != std::string::npos);
+        CHECK(j.find("\"confirmed_keys\": 1") != std::string::npos);
+        CHECK(j.find("\"stream\": {") != std::string::npos);
+        CHECK(j.find("\"source\": \"journal\"") != std::string::npos);
+        CHECK(j.find("\"committed\": 2") != std::string::npos);
+        CHECK(j.find("\"flips\": 1") != std::string::npos);
+        CHECK(j.find("\"soul\": {") != std::string::npos);
+        CHECK(j.find("\"present\": false") != std::string::npos);
+
+        // It is actually JSON, not a printf of the same numbers.
+        CHECK(j.size() > 400);
+        CHECK(j.front() == '{');
+        CHECK(j.back() == '\n');
+        int depth = 0;
+        bool balanced = true;
+        for (const char c : j) {
+            if (c == '{') ++depth;
+            else if (c == '}') { --depth; if (depth < 0) balanced = false; }
+        }
+        CHECK(balanced);
+        CHECK(depth == 0);
+
+        std::remove(path.c_str());
+    }
+
+    TEST("C12: the journal outranks success_count — a CORRECTED key is pruned, a CONFIRMED key refreshed");
+    {
+        SelfImprovement imp;
+        imp.record("good path", {"a"}, true, 1.0);
+        imp.record("bad path",  {"b"}, true, 1.0);
+        imp.record("untouched", {"c"}, true, 1.0);
+        CHECK(imp.size() == 3);
+
+        DecisionJournal j;
+        JournalEntry e1;
+        e1.task_key  = "bad path";
+        e1.predicted = DecisionAction::BUY;
+        const int64_t id1 = j.record(e1);
+        CHECK(id1 > 0);
+        CHECK(j.resolve_kind(id1, OutcomeKind::Corrected));
+
+        JournalEntry e2;
+        e2.task_key  = "good path";
+        e2.predicted = DecisionAction::BUY;
+        const int64_t id2 = j.record(e2);
+        CHECK(id2 > 0);
+        CHECK(j.resolve_kind(id2, OutcomeKind::Confirmed));
+
+        DreamContext ctx;
+        ctx.journal = &j;
+        const DreamReport r = imp.dream(ctx);
+
+        CHECK(r.journal_present);
+        CHECK(r.journal_predictions == 2);
+        CHECK(r.journal_corrected_keys == 1);
+        CHECK(r.journal_confirmed_keys == 1);
+        CHECK(r.traces_pruned_by_journal == 1);
+        CHECK(r.traces_reinforced_by_journal == 1);
+        CHECK(r.traces_before == 3);
+        CHECK(r.traces_after == 2);
+
+        // The corrected key is gone even though its own record is spotless —
+        // that is the whole point of letting the journal outrank it.
+        std::vector<std::string> steps;
+        CHECK(!imp.find_replay("bad path", steps));
+        CHECK(imp.find_replay("good path", steps));
+        CHECK(imp.find_replay("untouched", steps));
+    }
+
+    TEST("C13: the trace accounting closes exactly, and an empty context claims nothing");
+    {
+        SelfImprovement imp;
+        imp.record("a", {"x"}, true, 1.0);
+        imp.record("b", {"y"}, true, 1.0);
+        imp.record("c", {"z"}, false, 1.0);            // 1 failure: kept by no rule
+        for (int i = 0; i < 3; ++i) imp.record("d", {"w"}, false, 1.0);  // failure-only
+
+        DreamContext empty;                            // no crystals, no journal, no events
+        const DreamReport r = imp.dream(empty);
+
+        CHECK(r.traces_before == 4);
+        CHECK(r.traces_pruned == 1);                   // "d"
+        CHECK(r.traces_dropped_unsuccessful == 1);     // "c" — the silent drop, named
+        CHECK(r.traces_after == 2);                    // "a", "b"
+        // The identity. The pre-§47 pass could not state it, because one of its
+        // drop paths had no counter at all.
+        CHECK(r.traces_before == r.traces_after + r.traces_pruned +
+                                 r.traces_pruned_by_journal + r.traces_faded +
+                                 r.traces_dropped_unsuccessful);
+
+        // An empty context must not invent activity in the other subsystems.
+        CHECK(!r.journal_present);
+        CHECK(r.journal_predictions == 0);
+        CHECK(r.journal_verdicts == 0);
+        CHECK(r.stream_source == "none");
+        CHECK(r.stream_events == 0);
+        CHECK(r.stream_committed == 0);
+        CHECK(r.crystals_before == 0);
+        CHECK(r.crystals_after == 0);
+        CHECK(r.crystals_reinforced == 0);
+        CHECK(r.crystals_decayed == 0);
+        CHECK(!r.soul_present);
+        CHECK(r.soul_crystals == 0);
+        CHECK(r.soul_clock == 0);
     }
 }
 

@@ -114,6 +114,7 @@ set(OMNISEED_CORE_SOURCES
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
     src/agent/self_improvement.cpp
+    src/agent/dream.cpp
     src/agent/compute_throttle.cpp
     src/agent/flash_skills.cpp
     src/agent/agent_intel.cpp
@@ -358,6 +359,19 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora_e2e/e2e_lora_i8.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_lora_i8 PROPERTIES TIMEOUT 2400)
+
+        # §47 — BOARD HYGIENE. These three train a real model on the CPU and
+        # each can take ~8 minutes; on a loaded box they can exceed their
+        # timeouts and go red without anything being broken (measured §46:
+        # lora_e2e on its internal 1200 s subprocess limit, lora_chat on ctest's
+        # 2400 s TIMEOUT, lora_gguf on the sandbox's trash shim). Labelling them
+        # `slow` lets the default board run `ctest -LE slow` and stay all-green
+        # in minutes, while the full profile (`ctest` with no -L/-E) still runs
+        # them. `omniseed_lora_i8` is deliberately NOT labelled: it skips
+        # internally when its GGUF base is absent and it passed on the same
+        # loaded box, so removing it would drop real coverage for no gain.
+        set_tests_properties(omniseed_lora_e2e omniseed_lora_chat
+                             omniseed_lora_gguf PROPERTIES LABELS slow)
     endif()
 
     # Trading framework: deterministic signal/risk/backtest math on synthetic
@@ -980,8 +994,9 @@ if(OMNISEED_BUILD_TESTS)
                      "${OMNISEED_TEST_PY}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_edge_tracks_gate.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-        # Generous: half B re-runs three tracks (four fits each) from scratch.
-        set_tests_properties(omniseed_edge_tracks_gate PROPERTIES TIMEOUT 900)
+        # Generous: half B re-runs A/B/D/E (four fits each) twice — v1 and
+        # balanced — plus Track F's non-linear probe (~6 fits) on its own.
+        set_tests_properties(omniseed_edge_tracks_gate PROPERTIES TIMEOUT 1200)
     endif()
 
     # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper

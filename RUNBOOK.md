@@ -78,22 +78,37 @@ Bengali UTF-8 literals in `src/language/` are safe.
 
 ### The whole board
 
+Two profiles. **Default (iterate):** skips the `slow`-labelled suites.
+
+```bash
+ctest --test-dir build -C Release -LE slow --output-on-failure
+```
+
+**Full (nightly / release):** everything, including the slow suites.
+
 ```bash
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-28 tests on a fresh clone (no `.venv`), **49** in a checkout that has one — see
-the warning below. Expect 5 minutes on a fast box; **35-45 minutes** on a loaded
-one, because the LoRA suites alone can take ~8 minutes each.
+The default profile runs in minutes and must be **all-green**. 28 tests on a
+fresh clone (no `.venv`), **46** in a checkout that has one (49 minus the three
+slow ones) — see the warning below.
 
 > **On a loaded box the three CPU LoRA suites can fail without being broken.**
 > Measured (§46, 2026-10-02): `omniseed_lora_e2e` died on `lora_chat.py`'s
 > internal 1200 s subprocess timeout, `omniseed_lora_chat` hit ctest's 2400 s
 > `TIMEOUT`, and `omniseed_lora_gguf` tripped the sandbox's trash shim
 > (`SHFileOperationW` 0x2). None of the three is a logic failure — check the
-> message before treating a red board as a regression.
+> message before treating a red board as a regression. They are labelled `slow`
+> in `CMakeLists.txt` so `ctest -LE slow` leaves them out of the default board;
+> the full profile still runs them, and that is where a red one should be read
+> as a signal.
 
-To skip the four slow LoRA suites while iterating:
+`omniseed_lora_i8` is deliberately **not** labelled: it skips internally when
+its GGUF base is absent, and it passed on the same loaded box — dropping it
+would cost coverage for no gain.
+
+To skip the four slow LoRA suites by name (e.g. when you want i8 out too):
 
 ```bash
 ctest --test-dir build -C Release --output-on-failure \
@@ -103,7 +118,7 @@ ctest --test-dir build -C Release --output-on-failure \
 ⚠️ **`ctest -I` is not a test-number list.** The flag parses as
 `Start,End,Stride,test#,test#...`, so `-I 1,2,3,4,5,10,...` silently runs
 `Start=1,End=2,Stride=3` **plus** the numbers after it — not the list you wrote.
-Use `-R <regex>` or `-E <regex>`.
+Use `-R <regex>` or `-E <regex>` (or `-L` / `-LE` for labels).
 
 ### ⚠️ A green board is NOT a complete green board
 
@@ -249,6 +264,58 @@ consume). Measured with the fitted head: **`hit_rate` 0.2439, ECE 0.0555** —
 matching `metrics.tsv` exactly, through a completely independent path — and
 **0 committed steps**, because the head's maximum calibrated confidence (0.4966)
 sits just under the 0.50 bar.
+
+### The nightly consolidation pass (`dream --nightly`)
+
+```bash
+./build/bin/omniseed.exe dream --nightly \
+    --dream-log state/dream_log.json \
+    --feedback-journal state/feedback_journal.bin
+```
+
+`omniseed dream` (no flag) is a **demo**: when the state is empty it fabricates a
+day of history so the command always prints something. A *scheduled* pass must
+never do that — inventing a day and then writing it to a log is how a record
+starts lying. `--nightly` is the honest variant: it reads only what exists, does
+nothing when there is nothing, and writes `state/dream_log.json`.
+
+What it consumes, and what it does:
+
+| input | where it comes from | what the pass does with it |
+|---|---|---|
+| trace cache | `state/improve.bin` | prune failure-only / stale-and-unsuccessful, halve success weight older than 14 days |
+| feedback journal (§38) | `--feedback-journal` | a **corrected** key is pruned; a **confirmed**/**realised** key has its `last_used` refreshed |
+| memory crystals (§31) | the soul (`--crystals`, else the soul's default) | a crystal **recalled since the previous dream** is reinforced; then `decay()` runs |
+| streaming verdicts (§37) | the journal's persisted filter columns | counted as `stream.*`; the report names the source (`events` / `journal` / `none`) |
+
+The clock is the crystal clock, whose unit is **tokens**, and one night is one
+day: `now = previous + tokens_per_day` (100000). `previous` is read back out of
+`state/dream_log.json`, so consecutive runs advance the clock monotonically
+rather than resetting it. `--now-token N` overrides it (useful in tests).
+
+```bash
+# night 1: 0 -> 100000        night 2: 100000 -> 200000
+./build/bin/omniseed.exe dream --nightly
+```
+
+**Scheduling.** On Windows, a nightly Task Scheduler entry:
+
+```
+schtasks /Create /TN OmniSeedDream /SC DAILY /ST 03:30 ^
+  /TR "C:\path\to\omniseed\build\bin\omniseed.exe dream --nightly"
+```
+
+On Linux, a cron line:
+
+```
+30 3 * * *  cd /path/to/omniseed && ./build/bin/omniseed dream --nightly
+```
+
+Either way it exits non-zero if the log could not be written, so the scheduler
+reports a failure instead of a silent no-op. **Nothing here is fitted, sampled
+or random** — every count in the log is a deterministic function of the inputs,
+which is what makes the log diffable night to night. The single non-deterministic
+field is `generated_ms`.
 
 ---
 

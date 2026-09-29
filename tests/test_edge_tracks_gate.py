@@ -32,6 +32,15 @@ THE FACTS THAT MATTER MOST, all pinned:
     sits BELOW chance (0.2951 = 0.885x). That is the decisive statement: the
     failure is not the skew, it is the absence of directional signal in h[E].
 
+  * **Track F closes the program (§47).** The last escape hatch — "the signal
+    exists but is not LINEARLY decodable" — is tested once with a 64-unit
+    one-hidden-layer probe and FAILS (F1 0.3197 vs a 0.3716 floor = 0.860x). The
+    gate does not merely assert the number: it asserts the four CONTROLS, each in
+    the direction it must go — the leak control clears (1.0000), the non-linear
+    capacity control clears (0.6967) while a LINEAR probe on the SAME target does
+    not (0.5519), and the shuffled-label control does not (the bar is not
+    vacuous). Without those, a "no-signal" verdict would be unfalsifiable.
+
 TWO HALVES (the §43b/§44 lesson — either alone is insufficient):
   * A) the committed JSONs are internally consistent and match the doc's table
        rows. **Stdlib only** — runs on a fresh clone, in CI.
@@ -376,10 +385,15 @@ def main():
             check(b5.get("adopted") is False,
                   "A8 the balanced head at h=5 is STILL not adopted — the "
                   "failure was not a skew artifact")
+        # CANDIDATE rows only: Track F's control rows also carry `accuracy` but
+        # deliberately carry `control_floor`/`cleared_bar` instead of
+        # `floor`/`adopted`, so requiring the `adopted` key is what keeps a
+        # control from being read as an adopted head here.
         b_all = [r for rows in db.get("tracks", {}).values() for r in rows
-                 if "accuracy" in r]
+                 if "accuracy" in r and "adopted" in r]
         check(len(b_all) > 0 and all(r.get("adopted") is False for r in b_all),
-              "A8 NO balanced-teacher row was adopted (%d rows)" % len(b_all))
+              "A8 NO balanced-teacher candidate row was adopted (%d rows)"
+              % len(b_all))
 
         # ---- A9. Track E — the decisive control: a PERFECTLY balanced 3-class
         #          directional target, below chance.
@@ -434,6 +448,108 @@ def main():
     else:
         skip("docs/EDGE_RESEARCH.md is absent")
 
+    # =====================================================================
+    #  §47 — Track F: the LAST direction probe (NON-LINEAR). The program CLOSES.
+    # =====================================================================
+
+    # ---- A12. the decision is recorded, and it is CLOSE ----------------------
+    dp = d.get("direction_program", {})
+    check(dp.get("closed") is True,
+          "A12 the tool records `direction_program.closed = true` (%r)"
+          % dp.get("closed"))
+    check("CLOSE" in str(dp.get("verdict", "")),
+          "A12 the direction program verdict is CLOSE (%r)" % dp.get("verdict"))
+    check(dp.get("adopted") is False,
+          "A12 no direction candidate was adopted")
+    check(dp.get("controls_valid") is True,
+          "A12 the Track F controls are VALID — a probe that failed its own "
+          "controls could not pronounce on h[E] at all")
+
+    # ---- A13. Track F's rows: both candidates BELOW their own floors ----------
+    frows = rows_of(d, "F")
+    check(len(frows) == 6, "A13 Track F emitted all six rows (got %d)" % len(frows))
+    f_cand = [r for r in frows if r.get("role") == "candidate"]
+    check(len(f_cand) == 2,
+          "A13 Track F has exactly two candidates (got %d)" % len(f_cand))
+    for r in f_cand:
+        check(r.get("adopted") is False,
+              "A13 %s is NOT adopted" % r.get("variant"))
+        check(r["accuracy"] < r["floor"],
+              "A13 %s is BELOW its own majority floor (%.4f < %.4f)"
+              % (r.get("variant"), r["accuracy"], r["floor"]))
+    f1 = find_row(d, "F", "F1 directional")
+    f2 = find_row(d, "F", "F2 balanced")
+    if f1 is None or f2 is None:
+        check(False, "A13 Track F has the F1 and F2 candidate rows")
+    else:
+        check(abs(f1["accuracy"] - 0.3197) < 5e-5,
+              "A13 F1 acc is 0.3197 (got %r) — the pre-registered number"
+              % f1["accuracy"])
+        check(abs(f1["floor"] - 0.3716) < 5e-5,
+              "A13 F1 floor is 0.3716 (got %r)" % f1["floor"])
+        check(abs(f2["accuracy"] - 0.2114) < 5e-5,
+              "A13 F2 acc is 0.2114 (got %r)" % f2["accuracy"])
+        # The probe's shape is part of the pre-registration; a row that does not
+        # declare it is not the probe that was registered.
+        pr = f1.get("probe", {})
+        check(pr.get("hidden") == 64, "A13 the probe declares 64 hidden units (%r)"
+              % pr.get("hidden"))
+        check(pr.get("pca_components") == 32,
+              "A13 the probe declares its PCA width (32) (%r)"
+              % pr.get("pca_components"))
+        check(pr.get("epochs") == 2000,
+              "A13 the probe declares its epoch budget (2000) (%r)"
+              % pr.get("epochs"))
+        check(pr.get("optimiser") == "adam",
+              "A13 the probe declares Adam (the optimiser fit_softmax uses) (%r)"
+              % pr.get("optimiser"))
+
+    # ---- A14. the four controls, each in the direction it MUST go -------------
+    byc = {r.get("control"): r for r in frows if r.get("role") == "control"}
+    check(set(byc) == {"label-leak", "capacity-nonlinear", "capacity-linear",
+                       "shuffled-labels"},
+          "A14 Track F carries all four controls (%r)" % sorted(byc))
+    if len(byc) == 4:
+        leak = byc["label-leak"]
+        check(leak["clears_2x_floor"] is True,
+              "A14 the leak control CLEARS the bar (%.4f) — the instrument "
+              "recovers a signal that IS present" % leak["accuracy"])
+        check(abs(leak["accuracy"] - 1.0) < 1e-9,
+              "A14 the leak control is at ceiling (%.4f)" % leak["accuracy"])
+        cm = byc["capacity-nonlinear"]
+        check(cm["clears_2x_floor"] is True,
+              "A14 the non-linear capacity control CLEARS the bar (%.4f >= %.4f) "
+              "— the probe fits and generalises a non-linear function"
+              % (cm["accuracy"], 2 * cm["control_floor"]))
+        cl = byc["capacity-linear"]
+        check(cl["clears_2x_floor"] is False,
+              "A14 the LINEAR probe on the SAME target does NOT clear (%.4f) — "
+              "which is what makes the mlp row evidence of NON-linearity"
+              % cl["accuracy"])
+        check(cm["accuracy"] > cl["accuracy"],
+              "A14 the mlp beats the linear probe on the non-linear target "
+              "(%.4f > %.4f)" % (cm["accuracy"], cl["accuracy"]))
+        ctl = byc["shuffled-labels"]
+        check(ctl["clears_2x_floor"] is False,
+              "A14 the shuffled-label control does NOT clear (%.4f) — the bar is "
+              "not vacuous" % ctl["accuracy"])
+
+    # ---- A15. the doc records Track F and the closure ------------------------
+    if os.path.isfile(DOC):
+        with open(DOC, encoding="utf-8") as f:
+            doc = f.read()
+        check("6.9" in doc and "Track F" in doc,
+              "A15 the doc carries §6.9 (Track F)")
+        check("6.10" in doc and "CLOSED" in doc.upper(),
+              "A15 the doc carries §6.10 (the program is CLOSED)")
+        check("0.3197" in doc and "0.6967" in doc and "0.5519" in doc,
+              "A15 the doc records Track F's numbers (F1 0.3197, capacity mlp "
+              "0.6967, capacity linear 0.5519)")
+        check("rule-based engines" in doc.lower(),
+              "A15 the doc states plainly where the trading edge actually lives")
+    else:
+        skip("docs/EDGE_RESEARCH.md is absent")
+
     # ---- B. the tool REGENERATES this JSON (numpy-gated) ----------------------
     print("  -- half B: regenerate (needs numpy) --")
     py = _numpy_python()
@@ -443,6 +559,11 @@ def main():
         ok = _regen_matches(py, d, [])
         check(ok, "B the tool regenerates tools/edge_tracks.json byte-for-byte "
                   "on its declared tracks")
+        # Track F is regenerated on its own: it is the expensive one, and the
+        # A/B/D/E call above would otherwise pay for it twice.
+        okf = _regen_matches(py, d, [], ["F"])
+        check(okf, "B the tool regenerates Track F byte-for-byte (the §47 "
+                   "non-linear probe is deterministic)")
         if os.path.isfile(RESULT_BAL):
             with open(RESULT_BAL, encoding="utf-8") as f:
                 db = json.load(f)
@@ -478,18 +599,19 @@ def _numpy_python():
     return None
 
 
-def _regen_matches(py, committed, extra):
+def _regen_matches(py, committed, extra, tracks=("A", "B", "D", "E")):
     """Run the tool's deterministic tracks into a temp file; compare.
 
-    Only the numpy-only tracks (A, B, D, E) are re-run — Track C shells out to a
+    Only the numpy-only tracks are re-run — Track C shells out to a
     dump that a fresh clone may not have, and the gate must not depend on it.
-    `extra` carries the teacher/class-weight flags for the balanced artifact.
+    `extra` carries the teacher/class-weight flags for the balanced artifact;
+    `tracks` selects which tracks to regenerate (Track F is called separately
+    because it is the expensive one).
     """
     import tempfile
-    tag = ("_".join(extra).replace("--", "") or "v1")
+    tag = ("_".join(extra).replace("--", "") or "v1") + "_" + "".join(tracks)
     tmp = os.path.join(tempfile.gettempdir(), "edge_tracks_gate_%s.json" % tag)
-    tracks = ["A", "B", "D", "E"]
-    cmd = [py, TOOL, "--tracks"] + tracks + ["--out", tmp] + list(extra)
+    cmd = [py, TOOL, "--tracks"] + list(tracks) + ["--out", tmp] + list(extra)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
                            cwd=ROOT)

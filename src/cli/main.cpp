@@ -85,7 +85,12 @@ void print_usage() {
         "  demo-audio F.wav            sound events / scene / wake word\n"
         "  enroll-audio D set          build an owner-voice dataset from D/*.wav\n"
         "  demo-vision                 pointer grounding + spatial map\n"
-        "  dream                       Dream-State consolidation pass\n"
+        "  dream                       Dream-State consolidation pass (demo)\n"
+        "  dream --nightly             the SCHEDULED pass: reads the crystals, the\n"
+        "                              feedback journal and the stream, consolidates,\n"
+        "                              and writes state/dream_log.json\n"
+        "        [--dream-log PATH] [--crystals PATH] [--feedback-journal PATH]\n"
+        "        [--now-token N]       (default: advance the clock by one day)\n"
         "\n"
         "options:\n"
         "  --model PATH     model GGUF path (default: ./models/omniseed.gguf)\n"
@@ -1239,6 +1244,118 @@ int cmd_dream() {
 }
 
 // ===========================================================================
+// §47 — dream --nightly: the SCHEDULED consolidation pass
+// ===========================================================================
+namespace {
+
+// The previous pass's clock, read back out of its own log.
+//
+// Deliberately a scan rather than a JSON parser: the field is written by
+// DreamReport::to_json with a fixed spelling, and "file missing or garbled"
+// means "no previous clock" — which is exactly previous_token = 0, the value
+// that makes the pass claim NOTHING was used rather than guess.
+uint64_t read_previous_token(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t k = line.find("\"now_token\"");
+        if (k == std::string::npos) continue;
+        const size_t c = line.find(':', k);
+        if (c == std::string::npos) continue;
+        try {
+            return static_cast<uint64_t>(std::stoull(line.substr(c + 1)));
+        } catch (...) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+int cmd_dream_nightly(const std::string& log_path,
+                      const std::string& crystals_path,
+                      const std::string& journal_path,
+                      int64_t now_token) {
+    const uint64_t previous = read_previous_token(log_path);
+
+    // ---- the soul and the crystal store it owns ----------------------------
+    Soul::Config cfg;
+    if (!crystals_path.empty()) cfg.crystals_path = crystals_path;
+    Soul soul;
+    if (!soul.init(cfg)) {
+        platform::log_error("dream --nightly: soul init failed: %s",
+                            soul.error().c_str());
+        return 1;
+    }
+    const bool had_crystals = soul.load_memories();
+
+    // ---- the feedback journal (§38) ----------------------------------------
+    DecisionJournal journal;
+    const bool have_journal = journal.load(journal_path);
+
+    // ---- the clock ---------------------------------------------------------
+    // One night is one day, and the crystal clock's unit is TOKENS. The memory
+    // layer documents `tokens_per_day` as the conversion for exactly this, so a
+    // nightly pass advances the clock by one day rather than inventing a number.
+    // An explicit --now-token overrides it.
+    uint64_t now = 0;
+    if (now_token >= 0) {
+        now = static_cast<uint64_t>(now_token);
+    } else {
+        now = previous + static_cast<uint64_t>(soul.config().memory.tokens_per_day);
+    }
+
+    // ---- the pass ----------------------------------------------------------
+    SelfImprovement imp;
+    const bool had_traces = imp.load("./state/improve.bin");
+
+    DreamContext ctx;
+    ctx.soul           = &soul;
+    ctx.journal        = have_journal ? &journal : nullptr;
+    ctx.previous_token = previous;
+    ctx.now_token      = now;
+
+    const DreamReport r = imp.dream(ctx);
+
+    imp.save("./state/improve.bin");
+    soul.save_memories();
+    const bool wrote = write_dream_log(r, log_path);
+
+    std::printf("dream --nightly\n");
+    std::printf("  sources    : traces=%s crystals=%s journal=%s\n",
+                had_traces ? "loaded" : "none",
+                had_crystals ? "loaded" : "none",
+                have_journal ? journal_path.c_str() : "none");
+    std::printf("  clock      : %llu -> %llu (one day = %.0f tokens)\n",
+                static_cast<unsigned long long>(previous),
+                static_cast<unsigned long long>(now),
+                soul.config().memory.tokens_per_day);
+    std::printf("  traces     : %zu -> %zu  (pruned %zu, journal-pruned %zu, "
+                "journal-refreshed %zu, faded %zu, unsuccessful %zu)\n",
+                r.traces_before, r.traces_after, r.traces_pruned,
+                r.traces_pruned_by_journal, r.traces_reinforced_by_journal,
+                r.traces_faded, r.traces_dropped_unsuccessful);
+    std::printf("  crystals   : %zu -> %zu  (reinforced %zu, decayed %zu)\n",
+                r.crystals_before, r.crystals_after,
+                r.crystals_reinforced, r.crystals_decayed);
+    std::printf("  journal    : %s  (%zu predictions, %zu unresolved, "
+                "%zu verdicts, %zu hits)\n",
+                have_journal ? "read" : "absent",
+                r.journal_predictions, r.journal_unresolved,
+                r.journal_verdicts, r.journal_hits);
+    std::printf("  stream     : source=%s events=%zu valid=%zu committed=%zu "
+                "flips=%zu\n",
+                r.stream_source.c_str(), r.stream_events, r.stream_valid,
+                r.stream_committed, r.stream_flips);
+    std::printf("  log        : %s%s\n", log_path.c_str(),
+                wrote ? "" : "   <-- WRITE FAILED");
+
+    return wrote ? 0 : 1;
+}
+
+// ===========================================================================
 // Model-dependent commands
 // ===========================================================================
 struct Session {
@@ -1259,6 +1376,17 @@ struct Session {
     DecisionMode decision_mode      = DecisionMode::Off;
     float        decision_threshold = 0.85f;
     std::string  decision_head_path;   // fitted projection blob (optional)
+
+    // §47 — `dream --nightly`: the SCHEDULED consolidation pass. Kept separate
+    // from `omniseed dream`, which is a demo that fabricates history when the
+    // state is empty so the command always prints something. A scheduled pass
+    // must never do that: inventing a day's activity and then writing it to a
+    // log is how a record starts lying.
+    bool        nightly = false;
+    std::string dream_log_path   = "state/dream_log.json";
+    std::string crystals_path;                     // empty => the soul's default
+    std::string feedback_journal = "state/feedback_journal.bin";
+    int64_t     dream_now_token  = -1;             // < 0 => advance by one day
 
     Tokenizer tok;
     std::unique_ptr<RwkvModel> model;
@@ -1658,6 +1786,14 @@ int main(int argc, char** argv) {
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];
         else if (a == "--eval-tokens" && i + 1 < argc)
             s.eval_tokens = std::atoi(argv[++i]);
+        // §47 dream --nightly
+        else if (a == "--nightly") s.nightly = true;
+        else if (a == "--dream-log" && i + 1 < argc) s.dream_log_path = argv[++i];
+        else if (a == "--crystals" && i + 1 < argc) s.crystals_path = argv[++i];
+        else if (a == "--feedback-journal" && i + 1 < argc)
+            s.feedback_journal = argv[++i];
+        else if (a == "--now-token" && i + 1 < argc)
+            s.dream_now_token = std::strtoll(argv[++i], nullptr, 10);
         else if (a == "--quiet") platform::set_quiet(true);
         else if (!s.prompt.empty()) { /* positional handled below */ }
     }
@@ -1679,7 +1815,10 @@ int main(int argc, char** argv) {
     if (cmd == "demo-stream")   { return cmd_demo_stream(); }
     if (cmd == "demo-feedback") { return cmd_demo_feedback(); }
     if (cmd == "demo-vision")   { return cmd_demo_vision(); }
-    if (cmd == "dream")         { return cmd_dream(); }
+    if (cmd == "dream")         { return s.nightly
+        ? cmd_dream_nightly(s.dream_log_path, s.crystals_path,
+                            s.feedback_journal, s.dream_now_token)
+        : cmd_dream(); }
     if (cmd == "demo-audio")    {
         if (argc < 3) { std::printf("usage: omniseed demo-audio F.wav\n"); return 1; }
         return cmd_demo_audio(argv[2]);

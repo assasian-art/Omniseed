@@ -729,3 +729,113 @@ ADOPT and turns **2** checks red; the first run, carrying a *placeholder* lexica
 pin (0.6479 instead of the measured 0.7465), failed **4** checks. **No blob was
 fitted or changed** — nothing in §4.2's corrected table needs re-auditing.
 
+
+### 6.9 Track F — the LAST direction probe: a tiny NON-LINEAR probe on `h[E]`
+
+§6.5 killed the **linear** probe. One escape hatch remained open: maybe `h[E]`
+*does* encode the forward direction, but not linearly. Track F pre-registers a
+single non-linear probe, runs it once, and the program closes either way.
+
+#### The instrument, and why it took three attempts
+
+Reported in full, because a probe that fails its own controls cannot be used to
+pronounce on anything.
+
+| attempt | probe | leak control | non-linear control | usable? |
+| --- | --- | ---: | --- | --- |
+| v0 | plain SGD, 400 epochs, 768 raw dims | **0.61** ✗ | not recoverable | **NO** — instrument invalid, no verdict taken |
+| v1 | Adam, 2000 epochs, 768 raw dims | 0.81 ✓ | not recoverable | **NO** — too little power at N≈850 |
+| v2 | Adam, 2000 epochs, **PCA-32 (train)** | **1.0000** ✓ | **0.6967** vs linear **0.5519** ✓ | **YES** |
+
+v0's leak control injected the label *into* `h[E][:,0]` and the probe still
+reached only **0.61** on the holdout. That is a probe failure, not evidence about
+`h[E]`, so v0's candidate numbers (0.2787 / 0.2493) were **discarded as such** —
+they are recorded here and in the tool's history, not used. Adam (the optimiser
+`fit_softmax` already uses for every shipped head) and a train-split PCA
+projection fixed the conditioning.
+
+The projection does **not** weaken the comparison: a linear head on those
+components *is* a linear head on `h[E]` restricted to that subspace, so the
+non-linear probe remains a **strict superset** of the linear one it is
+contrasted with. The basis is fit on the TRAIN split only, and its signs are
+fixed so the seeded init — and therefore the whole fit — is reproducible.
+
+#### The pre-registration (`tools/edge_tracks.py`, constants frozen before the run)
+
+```
+input  : h[E] -> standardise(train) -> PCA(32, train, sign-fixed)
+hidden : exactly 1 layer, 64 units, tanh
+output : K-way softmax, inverse-frequency class weights (from TRAIN)
+fit    : full-batch Adam, 2000 epochs, lr 0.05, l2 1e-4, seeded init
+         the holdout is never read during the fit
+bar    : accuracy >= 2 x (majority-class rate of the holdout) AND n_holdout >= 30
+```
+
+Five rows, all pre-registered. **Control rows are not candidates**: they carry
+`control_floor` / `cleared_bar` instead of `floor` / `adopted`, so nothing can
+mistake a control for a head that cleared the bar.
+
+#### Result (`tools/edge_tracks.json`, `direction_program`)
+
+| row | role | target | n | acc | floor | ÷floor | required | got |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| **F1** | candidate | directional tertile — Track E's exact target, mask, split, holdout | 366 | **0.3197** | 0.3716 | **0.860x** | clear the bar | **NO-SIGNAL** |
+| **F2** | candidate | balanced 7-action teacher (§45) | 369 | **0.2114** | 0.3198 | **0.661x** | clear the bar | **NO-SIGNAL** |
+| Fleak | control | direction label injected into PC0 | 366 | **1.0000** | 0.3716 | 2.691x | must clear | ✓ |
+| Fcap | control | in-split tertiles of pc0·pc1 — **mlp** | 366 | **0.6967** | 0.3333 | 2.090x | must clear | ✓ |
+| Fcap | control | in-split tertiles of pc0·pc1 — **linear** | 366 | 0.5519 | 0.3333 | 1.656x | must NOT clear | ✓ |
+| Fctl | control | F1 with the TRAIN labels shuffled | 366 | 0.3716 | 0.3716 | 1.000x | must NOT clear | ✓ |
+
+`controls_valid = true`. Read the four controls as one sentence: the probe
+**recovers a signal that is present** (1.0000), it **fits and generalises a
+genuinely non-linear function that a linear probe on the same target cannot**
+(0.6967 vs 0.5519), and it **cannot clear the bar on shuffled labels** (exactly
+1.000x — it collapses onto the majority class).
+
+Both candidates sit **below their own floors**. The calibration did not
+manufacture that: F1 read **0.279 / 0.295 / 0.353 / 0.306 / 0.320** across the
+five probe budgets, never once approaching the 0.372 floor.
+
+F2 covers the other reading of "the balanced teacher" (the §45 balanced **action**
+teacher rather than the direction teacher); it fails harder, and it fails the way
+a skewed target should — 0.661x, with the classifier falling onto the majority
+class.
+
+---
+
+### 6.10 The direction-prediction program is CLOSED
+
+Every probe family has now been tried on the same frozen `h[E]`, the same
+holdouts and the same corrected bar.
+
+| track | probe family | target | best ÷floor | adopted |
+| --- | --- | --- | ---: | --- |
+| A | linear (7-action) | shipped + balanced teacher, 4 horizons | 0.926x | no |
+| B | linear, + 12 hand features | shipped + balanced teacher | 1.008x (z=0.11 — noise) | no |
+| C | linear, multi-asset pooled | shipped + balanced teacher | 0.902x | no |
+| D | linear, rank/quantile | forward-return rank | 0.789x | no |
+| **E** | **linear** | **perfectly balanced 3-class direction** | **0.885x** (below 1/3) | no |
+| **F** | **non-linear (64-unit, 1 hidden layer)** | **balanced 3-class direction** | **0.860x** | no |
+| F | non-linear | balanced 7-action teacher | 0.661x | no |
+
+**The direction-prediction program is closed.** `h[E]` does not carry the forward
+direction of the bar in a form any probe tried here can recover — not linearly
+(Track E, below exact chance on a balanced target), and not through a 64-unit
+non-linear head (Track F, 0.860x, with the instrument validated in both
+directions).
+
+**What that means for the product, stated plainly.** The system's trading edge
+does **not** come from predicting direction. It lives in exactly three places,
+all of which are already built and tested:
+
+1. **Rule-based engines** — the deterministic regime/strategy/signal layers, which
+   are the *only* components authorised to gate a trade (§2.2, §6.6).
+2. **Risk management** — position sizing, the C++-enforced limits, and the
+   regime veto that a learned label is now structurally unable to move.
+3. **Honest abstention** — the calibrated heads' measured inability to reach the
+   confidence bar, which makes them self-route to ABSTAIN rather than guess
+   (0 of 369 rows committed).
+
+No further direction experiment will be opened. Any future work on the heads
+must be about *calibration and abstention*, not about finding signal that six
+pre-registered tracks say is not there.

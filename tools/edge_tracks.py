@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # =============================================================================
 #  OmniSeed — tools/edge_tracks.py
-#  Run the FOUR pre-registered edge tracks in docs/EDGE_RESEARCH.md.
+#  Run the SIX pre-registered edge tracks in docs/EDGE_RESEARCH.md.
 #
 #  The adoption bar (§1 of that document), applied identically to every track:
-#      accuracy >= 2 x chance   AND   n_holdout >= 30
+#      accuracy >= 2 x (majority-class rate)   AND   n_holdout >= 30
 #  on a genuinely held-out split. A rejection is a RESULT and is recorded as one.
+#  (The bar was `2 x 1/K` in the original pre-registration; §1.1/§1.2 corrected
+#  it, because `1/K` is the wrong floor on a skewed label set and `acc > floor`
+#  is cleared by noise. See the constants below.)
+#
+#  Track F is the LAST direction probe. Whatever it says, the direction program
+#  closes: a pass sends DECISION 1 back through the D1 audit, a failure is final.
 #
 #  THIS TOOL DOES NOT REINVENT THE PIPELINE. It imports train_heads.py and calls
 #  the SAME fit_one / build_action_labels / chronological_split / stratified_split
@@ -702,6 +708,363 @@ def track_dir_control(H, ids, closes, args):
     return [row]
 
 
+# =============================================================================
+#  Track F — THE LAST DIRECTION PROBE: a tiny NON-LINEAR probe on frozen h[E]
+# =============================================================================
+# Pre-registered BEFORE the run (docs/EDGE_RESEARCH.md §6.9). Track E showed a
+# LINEAR probe on frozen h[E] cannot beat exact chance on a perfectly balanced
+# directional target. The one escape hatch left for the direction program is
+# that the signal exists but is NOT linearly decodable. Track F tests exactly
+# that, once, and then the program closes either way.
+#
+# THE PROBE, fixed in advance (no hyper-parameter search, no early stopping, no
+# holdout peeking):
+#
+#   * input  : frozen h[E] -> standardised with the TRAIN split's mean/std
+#              -> projected onto the TRAIN split's top PCA_COMPONENTS
+#              directions (sign-fixed). See `_pca_basis` for why the projection
+#              is part of the instrument, not a weakening of it.
+#   * hidden : exactly 1 layer, 64 units, tanh
+#   * output : K-way softmax, inverse-frequency class weights from the TRAIN split
+#   * fit    : full-batch ADAM (the project's own optimiser, as in fit_softmax),
+#              MLP_EPOCHS steps, lr MLP_LR, weight decay MLP_L2, seeded init.
+#              The holdout is never read during the fit.
+#   * bar    : accuracy >= 2 x (majority-class rate of the holdout), n >= 30
+#
+# FIVE ROWS, all pre-registered:
+#
+#   F1     candidate  the directional tertile — Track E's EXACT target, mask,
+#                     split and holdout. The purest "is there direction in h[E]?".
+#   F2     candidate  the §45 balanced 7-action teacher (`build_action_labels_
+#                     balanced`): "the balanced teacher" read as the ACTION
+#                     teacher rather than the direction teacher. Same probe, bar.
+#   Fleak  control    the direction label INJECTED into principal component 0.
+#                     MUST clear the bar — it is a signal that is present by
+#                     construction, so this is what proves the instrument can
+#                     recover signal at all. (It is a linear signal, which is the
+#                     point: the instrument must not fail on the easy case.)
+#   Fcap   control    a genuine NON-LINEAR function of h[E] — in-split tertiles
+#                     of pc0*pc1. The MLP MUST clear the bar while a LINEAR probe
+#                     on the SAME target must NOT. Those two together are the
+#                     evidence that the probe's non-linearity is real and usable,
+#                     so a failure on F1/F2 is about h[E], not about a broken or
+#                     under-trained optimiser.
+#   Fctl   control    F1 with the TRAIN labels SHUFFLED. Must NOT clear the bar —
+#                     if it did, the bar would be vacuous.
+#
+# Control rows carry `control_floor` / `cleared_bar` rather than `floor` /
+# `adopted`, because `adopted` means "this head cleared the bar as a CANDIDATE"
+# and a control is not a candidate. (The gate keys on `floor`+`adopted`, so this
+# keeps the two kinds of row from being confused for one another.)
+#
+# THE CALIBRATION HISTORY IS PART OF THE RESULT, and is reported in full in the
+# doc: the first probe (plain SGD, 400 epochs, 768 raw dims) FAILED its own leak
+# control (0.61 holdout on a signal that was literally in the input), so that run
+# was an invalid instrument and no verdict was taken from it. Adam and the PCA
+# projection were added to make the instrument valid — calibrated ON THE
+# CONTROLS ONLY. F1 read 0.279 / 0.295 / 0.353 / 0.306 across those budgets, i.e.
+# it never came near the 0.372 floor, so the calibration did not manufacture the
+# verdict.
+MLP_HIDDEN = 64
+MLP_EPOCHS = 2000
+MLP_LR = 0.05
+MLP_L2 = 1e-4
+PCA_COMPONENTS = 32
+F_TERM = ("h[E] carries no forward-direction signal that a 64-unit one-hidden-"
+          "layer probe can recover from frozen inputs")
+
+
+def _standardise(H, tr):
+    """Z-score using the TRAIN split only — the holdout's own mean/std must not
+    enter, or the probe would be reading the future it is scored on."""
+    mu = H[tr].mean(axis=0)
+    sd = H[tr].std(axis=0)
+    sd[sd < 1e-6] = 1.0                      # a constant dim carries no signal
+    return (H - mu) / sd
+
+
+def _pca_basis(Z, tr, ncomp=PCA_COMPONENTS):
+    """Top-`ncomp` principal directions of the TRAIN split, sign-fixed.
+
+    WHY THE PROJECTION IS PART OF THE INSTRUMENT, not a weakening of it. A
+    64-unit net trained on 768 raw dims with ~850 rows cannot generalise even a
+    signal that IS present: measured, a label injected into h[E][:,0] is
+    recovered to only 0.61 (SGD) / 0.81 (Adam) on the holdout, and no non-linear
+    target was recoverable at all. That is a property of the SAMPLE SIZE, not of
+    h[E], and a probe with that little power cannot be allowed to pronounce on
+    the direction hypothesis. Projecting onto the train split's top directions
+    fixes the conditioning. It does not weaken the comparison: a LINEAR head on
+    these components is exactly a linear head on h[E] restricted to that
+    subspace, so the non-linear probe remains a strict superset of the linear
+    one it is being contrasted with. The basis is fit on the TRAIN split only.
+
+    Signs are fixed (largest-magnitude loading positive) so the basis — and
+    therefore the seeded init and the whole fit — is reproducible.
+    """
+    _, S, Vt = np.linalg.svd(Z[tr], full_matrices=False)
+    P = Vt[:ncomp].T.copy()
+    for j in range(P.shape[1]):
+        if P[int(np.argmax(np.abs(P[:, j]))), j] < 0:
+            P[:, j] = -P[:, j]
+    ev = S ** 2
+    return P, float((ev[:ncomp] / ev.sum()).sum())
+
+
+def fit_mlp(Z, y, K, tr, hold, hidden=MLP_HIDDEN, epochs=MLP_EPOCHS, lr=MLP_LR,
+            l2=MLP_L2, seed=1234, shuffle_train_labels=False):
+    """One tiny non-linear probe. Deterministic: seeded init + full-batch Adam.
+
+    Returns a dict shaped like `train_heads.fit_one`'s for the fields the row
+    builders need, so the linear and non-linear probes are scored by the same
+    code path. `temperature` is reported as 1.0 and is UNUSED: the bar is on
+    argmax, which no positive rescaling of the logits can change.
+    """
+    rng = np.random.default_rng(seed)
+    D = Z.shape[1]
+    W1 = rng.normal(0.0, 1.0 / math.sqrt(D), (D, hidden))
+    b1 = np.zeros(hidden)
+    W2 = rng.normal(0.0, 1.0 / math.sqrt(hidden), (hidden, K))
+    b2 = np.zeros(K)
+
+    ytr = np.asarray(y[tr]).copy()
+    if shuffle_train_labels:
+        rng.shuffle(ytr)                     # destroy the input -> label relation
+    ntr = len(tr)
+    Y1 = np.zeros((ntr, K))
+    Y1[np.arange(ntr), ytr] = 1.0
+    w = TH.inverse_freq_weights(ytr, K)      # from the (possibly shuffled) TRAIN
+    w = w / max(float(w.mean()), 1e-12)      # mean weight 1, so lr is comparable
+    Wt = w[None, :]
+    Ztr = Z[tr]
+
+    params = [W1, b1, W2, b2]
+    m = [np.zeros_like(p) for p in params]
+    v = [np.zeros_like(p) for p in params]
+    bta1, bta2, eps = 0.9, 0.999, 1e-8
+    for t in range(1, epochs + 1):
+        A1 = np.tanh(Ztr @ W1 + b1)
+        P = TH.softmax(A1 @ W2 + b2)
+        G = (P - Y1) * Wt / ntr              # weighted-CE gradient
+        D1 = (G @ W2.T) * (1.0 - A1 * A1)    # tanh'
+        grads = [Ztr.T @ D1 + l2 * W1, D1.sum(axis=0),
+                 A1.T @ G + l2 * W2, G.sum(axis=0)]
+        c1, c2 = 1.0 - bta1 ** t, 1.0 - bta2 ** t
+        for i in range(4):
+            m[i] = bta1 * m[i] + (1.0 - bta1) * grads[i]
+            v[i] = bta2 * v[i] + (1.0 - bta2) * grads[i] * grads[i]
+            params[i] -= lr * (m[i] / c1) / (np.sqrt(v[i] / c2) + eps)
+
+    def pred(idx):
+        if len(idx) == 0:
+            return np.zeros(0, dtype=int)
+        return (np.tanh(Z[idx] @ W1 + b1) @ W2 + b2).argmax(axis=1)
+
+    ph, pt = pred(hold), pred(tr)
+    return {
+        "holdout_acc": round(float((ph == y[hold]).mean()), 5),
+        "holdout_macro_f1": round(TH.macro_f1(y[hold], ph, K), 4),
+        "train_acc": round(float((pt == y[tr]).mean()), 5),
+        "temperature": 1.0,
+    }
+
+
+def _probe_desc(explained):
+    return {"kind": "mlp", "hidden": MLP_HIDDEN, "activation": "tanh",
+            "optimiser": "adam", "epochs": MLP_EPOCHS, "lr": MLP_LR,
+            "l2": MLP_L2, "pca_components": PCA_COMPONENTS,
+            "pca_explained_var": round(float(explained), 4)}
+
+
+def _f_row(track, variant, role, r, chance, n_hold, y_hold, note, explained):
+    """A CANDIDATE row: carries `floor` + `adopted`, so the gate's A7 checks it."""
+    acc = float(r["holdout_acc"])
+    floor = _no_skill_floor(y_hold) if len(y_hold) else chance
+    verdict, cleared = _verdict(acc, floor, n_hold)
+    se = math.sqrt(max(floor * (1.0 - floor), 1e-12) / max(n_hold, 1))
+    return {
+        "track": track, "variant": variant, "role": role,
+        "probe": _probe_desc(explained),
+        "n_holdout": int(n_hold), "accuracy": acc, "chance": float(chance),
+        "ratio": round(_ratio(acc, chance), 4),
+        "floor": round(float(floor), 4),
+        "ratio_vs_floor": round(_ratio(acc, floor), 4),
+        "macro_f1": float(r["holdout_macro_f1"]),
+        "train_acc": float(r["train_acc"]),
+        "majority_rate": round(float(floor), 4),
+        "ratio_vs_majority": round(_ratio(acc, floor), 4),
+        "beats_majority": bool(acc > floor),
+        "clears_2x_floor": bool(_ratio(acc, floor) >= RATIO_BAR),
+        "constant_z": round((acc - floor) / se, 3) if se else None,
+        "verdict": verdict, "adopted": bool(cleared), "note": note,
+    }
+
+
+def _f_control_row(track, variant, kind, acc, chance, n_hold, y_hold, extra,
+                   explained):
+    """A CONTROL row. Deliberately NOT a candidate: no `adopted`, no `floor`
+    (it carries `control_floor`), so nothing can mistake it for a head."""
+    floor = _no_skill_floor(y_hold) if len(y_hold) else chance
+    row = {
+        "track": track, "variant": variant, "role": "control", "control": kind,
+        "probe": _probe_desc(explained),
+        "n_holdout": int(n_hold), "accuracy": float(acc),
+        "chance": float(chance), "ratio": round(_ratio(acc, chance), 4),
+        "control_floor": round(float(floor), 4),
+        "ratio_vs_control_floor": round(_ratio(acc, floor), 4),
+        "beats_control_floor": bool(acc > floor),
+        "clears_2x_floor": bool(_ratio(acc, floor) >= RATIO_BAR),
+    }
+    row.update(extra)
+    return row
+
+
+def _insplit_tertiles(s, tr, hold):
+    """3 classes, ~1/3 each, ON EACH SPLIT SEPARATELY.
+
+    A plain quantile taken on the train split drifts on the holdout under the
+    temporal shift and leaves one class holding 80%+ of the rows, which puts the
+    `2 x majority` bar out of reach for any probe. Ranking within each split
+    keeps the control's floor at exactly 1/3, so the bar is a real bar. This is a
+    property of the CONTROL's labels only — the direction labels are untouched.
+    """
+    y = np.zeros(len(s), dtype=int)
+    for idx in (tr, hold):
+        r = np.argsort(np.argsort(s[idx]))
+        y[idx] = (r * 3) // len(idx)
+    return y
+
+
+def track_f(H, ids, regime, closes, args):
+    """The last direction probe. Returns (rows, decision)."""
+    rows = []
+
+    # ---- F1: the directional tertile, Track E's exact target/split/holdout ----
+    y3 = TH.directional_quantile_labels(ids, closes, n_forward=5)
+    mask = y3 >= 0
+    H1, y1 = H[mask], y3[mask]
+    tr1, hold1 = TH.chronological_split(len(y1))
+    Z1 = _standardise(H1, tr1)
+    B1, evr1 = _pca_basis(Z1, tr1)
+    P1 = Z1 @ B1
+
+    r1 = fit_mlp(P1, y1, 3, tr1, hold1, seed=args.seed)
+    rows.append(_f_row(
+        "F", "F1 directional tertile (non-linear probe)", "candidate", r1,
+        1.0 / 3, len(hold1), y1[hold1],
+        "the non-linear twin of Track E: same target, same mask, same "
+        "chronological split, same holdout, same 2x-majority bar", evr1))
+    print("  Track F  F1 dir-tertile   n=%d acc=%.4f floor=%.4f ratio=%.3fx "
+          "macroF1=%.4f %s"
+          % (len(hold1), r1["holdout_acc"], rows[-1]["floor"],
+             rows[-1]["ratio_vs_floor"], r1["holdout_macro_f1"],
+             rows[-1]["verdict"]))
+
+    # ---- F2: the balanced 7-action teacher (the other reading of the brief) ---
+    ya2, names2, _d2 = TH.build_action_labels_balanced(ids, regime, closes,
+                                                       n_forward=5)
+    K2 = len(names2)
+    tr2, hold2 = TH.chronological_split(len(ya2))
+    Z2 = _standardise(H, tr2)
+    B2, evr2 = _pca_basis(Z2, tr2)
+    r2 = fit_mlp(Z2 @ B2, ya2, K2, tr2, hold2, seed=args.seed)
+    rows.append(_f_row(
+        "F", "F2 balanced 7-action teacher (non-linear probe)", "candidate", r2,
+        1.0 / K2, len(hold2), ya2[hold2],
+        "the §45 balanced ACTION teacher under the same non-linear probe — "
+        "covers 'the balanced teacher' read as the action teacher, not the "
+        "direction teacher", evr2))
+    print("  Track F  F2 balanced-7    n=%d acc=%.4f floor=%.4f ratio=%.3fx "
+          "macroF1=%.4f %s"
+          % (len(hold2), r2["holdout_acc"], rows[-1]["floor"],
+             rows[-1]["ratio_vs_floor"], r2["holdout_macro_f1"],
+             rows[-1]["verdict"]))
+
+    # ---- Fleak: the label IS in the input. Must clear the bar. ---------------
+    Pleak = P1.copy()
+    Pleak[:, 0] = y1.astype(float)
+    rleak = fit_mlp(Pleak, y1, 3, tr1, hold1, seed=args.seed)
+    rows.append(_f_control_row(
+        "F", "Fleak label-injected-into-PC0 (instrument-recovers-signal)",
+        "label-leak", rleak["holdout_acc"], 1.0 / 3, len(hold1), y1[hold1],
+        {"train_acc": float(rleak["train_acc"]),
+         "macro_f1": float(rleak["holdout_macro_f1"]),
+         "expect": "CLEARS the bar: a signal that is present by construction, so "
+                   "a failure here would mean the instrument is broken"},
+        evr1))
+    print("  Track F  Fleak leak       n=%d acc=%.4f floor=%.4f clears=%s"
+          % (len(hold1), rleak["holdout_acc"], rows[-1]["control_floor"],
+             rows[-1]["clears_2x_floor"]))
+
+    # ---- Fcap: the MLP MUST fit a non-linear target the LINEAR probe cannot ---
+    ycap = _insplit_tertiles(P1[:, 0] * P1[:, 1], tr1, hold1)
+    rcap_mlp = fit_mlp(P1, ycap, 3, tr1, hold1, seed=args.seed)
+    rcap_lin = _fit(P1, ycap, 3, tr1, hold1, args)
+    rows.append(_f_control_row(
+        "F", "Fcap pc0*pc1 (mlp)", "capacity-nonlinear",
+        rcap_mlp["holdout_acc"], 1.0 / 3, len(hold1), ycap[hold1],
+        {"train_acc": float(rcap_mlp["train_acc"]),
+         "macro_f1": float(rcap_mlp["holdout_macro_f1"]),
+         "expect": "CLEARS the bar: the probe can fit and GENERALISE a non-linear "
+                   "function of h[E], so a failure on F1/F2 is not a broken or "
+                   "under-trained optimiser"}, evr1))
+    rows.append(_f_control_row(
+        "F", "Fcap pc0*pc1 (linear)", "capacity-linear",
+        rcap_lin["holdout_acc"], 1.0 / 3, len(hold1), ycap[hold1],
+        {"train_acc": float(rcap_lin["train"]["acc"]),
+         "macro_f1": float(rcap_lin["holdout_macro_f1"]),
+         "expect": "does NOT clear the bar on the SAME target — which is what "
+                   "makes the mlp row evidence of non-linearity rather than of a "
+                   "control the linear head could also pass"}, evr1))
+    print("  Track F  Fcap cap-target  mlp=%.4f linear=%.4f (floor=%.4f)"
+          % (rows[-2]["accuracy"], rows[-1]["accuracy"],
+             rows[-1]["control_floor"]))
+
+    # ---- Fctl: shuffled TRAIN labels on F1. Must NOT clear the bar. ----------
+    rctl = fit_mlp(P1, y1, 3, tr1, hold1, seed=args.seed,
+                   shuffle_train_labels=True)
+    rows.append(_f_control_row(
+        "F", "Fctl shuffled-train-labels (bar-is-not-vacuous)", "shuffled-labels",
+        rctl["holdout_acc"], 1.0 / 3, len(hold1), y1[hold1],
+        {"train_acc": float(rctl["train_acc"]),
+         "macro_f1": float(rctl["holdout_macro_f1"]),
+         "expect": "does NOT clear the bar; if it did the bar would be vacuous"},
+        evr1))
+    print("  Track F  Fctl shuffled    n=%d acc=%.4f floor=%.4f clears=%s"
+          % (len(hold1), rctl["holdout_acc"], rows[-1]["control_floor"],
+             rows[-1]["clears_2x_floor"]))
+
+    # ---- the decision: any CANDIDATE clearing the bar is a SIGNAL -------------
+    cand = [r for r in rows if r.get("role") == "candidate"]
+    adopted = any(r["adopted"] for r in cand)
+    by = {r.get("control"): r for r in rows if r.get("role") == "control"}
+    ctl_ok = (not by["shuffled-labels"]["clears_2x_floor"] and
+              by["label-leak"]["clears_2x_floor"] and
+              by["capacity-nonlinear"]["clears_2x_floor"] and
+              not by["capacity-linear"]["clears_2x_floor"])
+    decision = {
+        "probe": "standardise(train) -> PCA(%d, train) -> 1 hidden layer, %d "
+                 "tanh units -> softmax; Adam, %d full-batch epochs, lr %g, "
+                 "l2 %g, inverse-frequency class weights"
+                 % (PCA_COMPONENTS, MLP_HIDDEN, MLP_EPOCHS, MLP_LR, MLP_L2),
+        "bar": "accuracy >= %g x majority_rate AND n_holdout >= %d"
+               % (RATIO_BAR, MIN_HOLDOUT),
+        "candidates": [r["variant"] for r in cand],
+        "adopted": bool(adopted),
+        "controls_valid": bool(ctl_ok),
+        "verdict": ("SIGNAL — re-run DECISION 1 and the D1 audit before any "
+                    "adoption" if adopted else
+                    "CLOSE — " + F_TERM),
+        "closed": bool(not adopted),
+    }
+    print("  Track F  DECISION: %s" % decision["verdict"])
+    print("  Track F  controls_valid=%s (leak=%s cap_mlp=%s cap_lin=%s ctl=%s)"
+          % (ctl_ok, by["label-leak"]["clears_2x_floor"],
+             by["capacity-nonlinear"]["clears_2x_floor"],
+             by["capacity-linear"]["clears_2x_floor"],
+             by["shuffled-labels"]["clears_2x_floor"]))
+    return rows, decision
+
+
 def _conversion_test(rD, Hq, yqq, hold, action_names):
     """Does the rank head move a downstream, already-tested engine?
 
@@ -737,7 +1100,7 @@ def main():
                     metavar="NAME=DIR",
                     help="per-asset market dump for Track C (repeatable)")
     ap.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 10, 21])
-    ap.add_argument("--tracks", nargs="+", default=["A", "B", "C", "D", "E"])
+    ap.add_argument("--tracks", nargs="+", default=["A", "B", "C", "D", "E", "F"])
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--teacher", choices=["v1", "balanced"], default="v1",
                     help="action teacher: v1 = shipped fixed-threshold rule; "
@@ -790,6 +1153,11 @@ def main():
     if "E" in args.tracks:
         print("\n--- Track E: balanced 3-class directional control ---")
         out["tracks"]["E"] = track_dir_control(H, ids, closes, args)
+    if "F" in args.tracks:
+        print("\n--- Track F: the LAST direction probe (non-linear) ---")
+        frows, fdecision = track_f(H, ids, regime, closes, args)
+        out["tracks"]["F"] = frows
+        out["direction_program"] = fdecision
 
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(out, f, indent=2)

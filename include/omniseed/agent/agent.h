@@ -14,6 +14,7 @@
 // =============================================================================
 #pragma once
 
+#include "omniseed/agent/dream.h"
 #include "omniseed/core/rwkv.h"
 #include "omniseed/core/tokenizer.h"
 #include "omniseed/core/uncertainty.h"
@@ -166,7 +167,22 @@ public:
 
     // Dream-State Consolidation: decay stale traces, prune failures,
     // promote frequently-successful ones. Called periodically (e.g. nightly).
+    //
+    // This is the TRACE-ONLY pass, unchanged since it was written, and it stays
+    // that way: a caller with no other subsystem in play must get exactly the
+    // behaviour it always got. The joint — crystals, the §38 journal and the
+    // §37 stream — is the overload below. See agent/dream.h.
     void dream();
+
+    // §47 — the dream JOINT. Runs the trace pass above, then:
+    //   * prunes a trace the journal has CORRECTED and refreshes one it has
+    //     CONFIRMED/REALISED (the journal outranks `success_count`),
+    //   * reinforces every crystal recalled since `previous_token`, then decays
+    //     the store,
+    //   * reports the §37 filter verdicts and the §38 journal's standings.
+    // Returns the counts; nothing is written to disk here (the caller decides
+    // where the log goes — see write_dream_log).
+    DreamReport dream(const DreamContext& ctx);
 
     size_t size() const { return traces_.size(); }
     const Config& config() const { return cfg_; }
