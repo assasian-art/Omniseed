@@ -5032,3 +5032,114 @@ their inputs are unchanged. The shipped trading blob still reproduces
 for a caller — it is the joint that consumes the soul, the crystals and the
 feedback journal, and it is schedulable. And the direction program is **closed**:
 six pre-registered tracks, two probe families, one answer.
+
+---
+
+## §48 — the external-signal layer, and the cross-asset fix (2026-10-03)
+
+**Directive.** Continue the master mandate. First item: the **hacker tools** —
+order-book, funding, on-chain, social, event calendar, commodities, and the
+sniper cross-asset fix.
+
+### 48.1 The audit first — most of it was already there, and §7 said which parts were not
+
+`docs/TRADING_LAB.md` §7 already carried the honest list, so the audit was a
+read, not a guess:
+
+| mandate item | state before §48 |
+|---|---|
+| funding | **exists** — `tools/monster/funding.py` (net-of-cost carry, risk flags) |
+| order-book | **half** — the exact CKS OFI + `beta = c/depth^λ` were implemented and tested, but **nothing consumed a depth feed** |
+| on-chain, social, event calendar | **absent** — "planned, not built" |
+| commodities | **half** — `correlation_matrix.DEFAULT_PAIRS` names `OIL`/`GOLD`/`COMMODITY_INDEX`, but no commodity series was ever supplied |
+| sniper cross-asset | **defective** — see 48.4 |
+
+So the work was, once again, mostly the **joint**: one layer that reads the five
+feeds, names its provenance, and refuses to invent what it did not see.
+
+### 48.2 The layer — `tools/monster/signals.py`
+
+Pure, offline, injectable-clock, stdlib-only — the same shape as
+`news_hunter.py` and `funding.py`. Five readers, five readings, one per-bar
+`SignalPack`.
+
+- **Order book.** `DepthBook` computes the **exact CKS OFI** from best-quote
+  snapshots (`strategies.ofi_from_snapshots`) and `strategies.impact_beta(depth,
+  c, λ)` when a book is present, and reports `source="cks"`. With no book it
+  falls back to the signed-volume proxy, `source="proxy"`, **discounted 30%** —
+  the proxy cannot see limit orders or cancellations, which is most of what the
+  CKS OFI measures. The two objects are never conflated.
+- **On-chain.** Exchange **inflow** = bearish, whale **accumulation** = bullish,
+  rising **stablecoin supply** = bullish. Each raw magnitude is squashed with
+  `tanh(raw/scale)` so one print cannot saturate the score. A reading older than
+  `max_age` is **stale**: `source="none"`, score `0`, and the age is reported.
+- **Social.** Attention is the **trailing** mention-volume z-score (strictly the
+  past — no look-ahead), squashed to `[0,1]`; bias is attention × sentiment, so a
+  loud but directionless crowd scores ~0. Fewer than 5 history rows → attention
+  `0`, because a z-score over 2 samples is an invention.
+- **Event calendar.** A **high-impact** event opens the blackout window
+  `[ts-pre, ts+post]`; a **low-impact** event never does. Post-event pressure is
+  reported as `decay = impact·exp(-dt/τ)` for context and gates nothing.
+- **Commodities.** `commodity_returns()` and `read_commodity_csv()` supply the
+  `OIL`/`GOLD`/`COPPER` legs the cross-asset matrix already had relations for.
+
+**The negative controls are the point.** `coverage` counts the live families per
+bar, so **"no signal" and "no feed" are never confused**; a stale feed is not a
+vote; a low-impact event is not a blackout; and the proxy is labelled AND
+discounted. Each of those is a pinned test, not a comment.
+
+### 48.3 The blackout is a fail-closed veto, and it is named
+
+`tools/monster_scan.py` gained `--signals DIR` and `--commodities CSV`. A
+blackout sets `veto=1` with `veto_reason="event-blackout"`, which reaches the
+engine-facing CSV's `veto` column — so the **C++ gate honours it with no C++
+change at all**. If another gate had already blocked the bar the reason becomes
+`<first-reason>+event-blackout`: a blackout that vanished behind an earlier veto
+would let the log claim the calendar was silent when it was not.
+
+**No external signal can raise `S`.** The readings are surfaced in `detail`
+(`sig[oc=…+soc=…+dep=cks…]`) and mirrored to `state/monster/signals.csv`; they
+never enter the mandate's weighted sum.
+
+### 48.4 The cross-asset fix — one index for every series
+
+`CorrelationMatrix.evaluate` indexed **every** series with the target's `i`. That
+is correct only when the symbols share a timeline. With different histories it
+correlates bar 100 of one against bar 100 of another — **two different moments**.
+
+The scanner now builds a `ts → index` map per symbol and passes `idx_by_symbol`:
+every peer is read at the index of the **same timestamp**, and a peer with no
+reading at that instant is **skipped** rather than mis-compared. `idx_by_symbol`
+defaults to `None`, which reproduces the old behaviour **exactly**, so nothing
+that worked changed. The test pins both directions: the positional read sees the
+wrong moment (invalidate), the aligned read sees the right one (confirm).
+
+### 48.5 Files
+
+- `tools/monster/signals.py` — **new**: the layer (`DepthBook`, `OnChainFlow`,
+  `SocialVolume`, `EventCalendar`, `commodity_returns`, `SignalPack`,
+  `SignalSet`).
+- `tools/monster/correlation_matrix.py` — `evaluate(..., idx_by_symbol=None)`;
+  `_rolling_corr(va, vb, ia, ib=None)`.
+- `tools/monster_scan.py` — `--signals` / `--commodities`; the blackout veto; the
+  `ts → index` alignment; `state/monster/signals.csv`; summary counts.
+- `tests/test_monster_signals.py` — **new**, 69 checks (registered
+  `omniseed_monster_signals`, venv-gated like its siblings).
+- `tools/monster/__init__.py`, `CMakeLists.txt`, `docs/TRADING_LAB.md` (§7,
+  new §7b, §8).
+
+### 48.6 Honest status
+
+**Nothing here claims an edge.** These are filters and context, and the layer is
+built so that its *absence* is as visible as its presence. No blob was fitted or
+shipped; the sniper's `S`, the `[1%,2%]` sizing band, and the 2%/3%/6% risk
+limits are untouched. The depth *reader* exists — a **free venue that publishes
+the book** still does not, which is a data problem, not a code one.
+
+Board: registered **49 → 50** (`omniseed_monster_signals`); default
+`ctest -LE slow` **46 → 47**.
+
+**The one-line result:** the Monster can now read the five external feeds the
+mandate named, it names the provenance of every reading, it blocks on a
+high-impact event without ever promoting on a signal, and its cross-asset matrix
+compares peers at the same instant instead of the same array position.

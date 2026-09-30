@@ -15,4 +15,5 @@ __all__ = [
     "correlation_matrix",
     "sizing",
     "state_vector",
+    "signals",
 ]

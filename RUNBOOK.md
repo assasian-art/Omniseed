@@ -134,7 +134,8 @@ Python suites only.** Run the rest by hand:
 for t in test_market_data test_market_feeds test_paper_loop test_paper_reports \
          test_monster_features test_monster_sniper test_monster_news \
          test_monster_regime test_monster_strategies test_monster_funding \
-         test_decision_bridge; do python tests/$t.py || echo "FAILED: $t"; done
+         test_monster_signals test_decision_bridge; do
+  python tests/$t.py || echo "FAILED: $t"; done
 ```
 
 This matters: a venv-gated suite that never runs **will** silently drift.
@@ -814,6 +815,36 @@ recorded in `docs/VISION_AUDIO_DATA.md` and asserted by
 `tests/test_modality_dump.cpp`. **Record now and the data is ready**; the fit
 lands the day an audio→E adapter exists. Do **not** substitute a random
 projection to make the number appear.
+
+---
+
+### Scan the Monster with external signals (§48)
+
+`tools/monster_scan.py` reads the watched symbols' provenance CSVs and writes
+the engine-facing `state/monster/<SYM>.csv`. Optional flags add the external
+layer (`tools/monster/signals.py`): on-chain flows, social volume, an event
+calendar, a real order-book depth path, and commodity legs for the cross-asset
+matrix.
+
+```bash
+# put <name>.csv files in one directory:
+#   depth.csv       ts,bid_px,bid_sz,ask_px,ask_sz
+#   onchain.csv     ts,exchange_netflow,whale_net,stablecoin_delta
+#   social.csv      ts,mentions,positive,negative
+#   calendar.csv    ts,kind,name,impact
+#   commodities.csv ts,symbol,close
+.venv/Scripts/python.exe tools/monster_scan.py \
+    --watch "equity:AAPL,crypto:BTCUSDT" \
+    --csv-dir models/market/paper --out-dir state/monster \
+    --signals state/signals --commodities state/signals/commodities.csv
+```
+
+A **high-impact calendar event opens a blackout window** `[ts-pre, ts+post]` and
+the scanner sets `veto=1` (`event-blackout`) for those bars — fail-closed, and
+never promoting: no external signal can raise `S`. The readings are surfaced in
+the feature CSV's `detail` (`sig[oc=…+soc=…+dep=cks…]`) and mirrored to
+`state/monster/signals.csv`. Fetching the feeds is the caller's job; nothing in
+the scanner opens a socket. See `docs/TRADING_LAB.md` §7b.
 
 ---
 

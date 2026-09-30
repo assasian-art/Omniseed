@@ -9,8 +9,15 @@
 #       correlation matrix).
 #    3. For every bar, assemble an EvalContext (cross-asset confirm/invalidate
 #       counts + event-driven flag) and score it with the Sniper Engine.
+#       The cross-asset matrix compares every peer at the SAME TIMESTAMP, not
+#       at the same array position (§48) — see `ts_index` below.
 #    4. Write  state/monster/<SYM>.csv   (ts,confidence,veto,regime,detail)
 #       and    state/monster/summary.json (per-symbol counts + top scores).
+#    5. OPTIONAL external signals (--signals DIR, --commodities CSV): on-chain,
+#       social, an event calendar and an order-book depth path.  A calendar
+#       blackout is applied as a FAIL-CLOSED veto; the readings are surfaced in
+#       `detail` and mirrored to state/monster/signals.csv.  No external signal
+#       can raise S — see docs/TRADING_LAB.md §7 and tools/monster/signals.py.
 #
 #  The C++ engine consumes exactly those CSVs (--monster-features). Heavy logic
 #  stays here. Honest scope: a filter, not a profit guarantee.
@@ -33,6 +40,7 @@ from monster import state_vector as SV                  # noqa: E402
 from monster import sniper_engine as SN                 # noqa: E402
 from monster import news_hunter as NH                   # noqa: E402
 from monster import correlation_matrix as CM            # noqa: E402
+from monster import signals as SG                       # noqa: E402
 
 DEFAULT_CSV_DIR = "models/market/paper"
 DEFAULT_OUT_DIR = "state/monster"
@@ -85,15 +93,26 @@ def parse_watch(spec):
 
 
 def scan_symbol(symbol, bars, rets_by_symbol, cfg, sz_cfg=None,
-                hunter=None, matrix=None, ticker_for_news=None):
-    """-> [StateVector] for every bar of `symbol`."""
+                hunter=None, matrix=None, ticker_for_news=None,
+                signals=None, ts_index=None, packs_out=None):
+    """-> [StateVector] for every bar of `symbol`.
+
+    `ts_index` maps symbol -> {ts: index} so the cross-asset matrix can compare
+    each peer at the SAME instant rather than at the same array position (§48).
+    `signals` is the external-signal layer; its calendar blackout is applied as
+    a fail-closed veto and its readings are surfaced in `detail` (they never
+    raise S).  If `packs_out` is a list it receives one SignalPack per bar.
+    """
     prep = SN.prepare(bars, cfg)
     vectors = []
     for i in range(prep.n):
         ts = prep.ts[i]
         ctx = SN.EvalContext()
         if matrix is not None:
-            cr = matrix.evaluate(symbol, +1, rets_by_symbol, i)
+            idx = None
+            if ts_index is not None:
+                idx = {s: m[ts] for s, m in ts_index.items() if ts in m}
+            cr = matrix.evaluate(symbol, +1, rets_by_symbol, i, idx)
             ctx.cross_confirm = cr.confirm
             ctx.cross_invalidate = cr.invalidate
             ctx.cross_active = cr.active
@@ -102,22 +121,43 @@ def scan_symbol(symbol, bars, rets_by_symbol, cfg, sz_cfg=None,
                              ticker=ticker_for_news or symbol)
             ctx.event_driven = m.event_driven
         v = SN.evaluate(prep, i, ctx, cfg)
+        pack = None
+        if signals is not None and not signals.empty():
+            pack = signals.pack(ts, bars, i)
+            # Fail-closed, and NAMED even when another gate already blocked the
+            # bar: a blackout that is swallowed by an earlier veto would make
+            # the log claim the calendar was silent when it was not.
+            if pack.blackout:
+                if not v.veto:
+                    v.veto, v.veto_reason = True, "event-blackout"
+                elif "event-blackout" not in v.veto_reason:
+                    v.veto_reason = v.veto_reason + "+event-blackout"
+            if packs_out is not None:
+                packs_out.append(pack)
         ap = prep.atr_pct[i]
         sv = SV.build(symbol, v,
                       atr_pct=ap if ap == ap else None, sz_cfg=sz_cfg)
         sv.event_driven = ctx.event_driven
+        if pack is not None and pack.detail() != "none":
+            sv.detail = (sv.detail + " sig[" + pack.detail() + "]").strip()
         vectors.append(sv)
     return vectors
 
 
 def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
              timeframe=DEFAULT_TIMEFRAME, cfg=None, sz_cfg=None,
-             news_items=None, news_cfg=None, matrix=None):
-    """-> summary dict (also writes the feature CSVs)."""
+             news_items=None, news_cfg=None, matrix=None,
+             signals=None, commodity_rows=None, signals_out=""):
+    """-> summary dict (also writes the feature CSVs).
+
+    `commodity_rows` is `{symbol: [(ts, close), ...]}` (e.g. from
+    `signals.read_commodity_csv`): the commodity legs are merged into the
+    cross-asset universe so OIL/GOLD/COMMODITY_INDEX relations go live.
+    """
     cfg = cfg or SN.SniperConfig()
     os.makedirs(out_dir, exist_ok=True)
 
-    bars_by_sym, rets_by_symbol = {}, {}
+    bars_by_sym, rets_by_symbol, ts_index = {}, {}, {}
     for item in watch:
         sym = item["symbol"]
         bars = read_bars(os.path.join(csv_dir, csv_name(sym, timeframe)))
@@ -125,6 +165,13 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
             continue
         bars_by_sym[sym] = bars
         rets_by_symbol[sym] = F.log_returns(F.closes(bars))
+        ts_index[sym] = {bars[k][0]: k for k in range(len(bars))}
+
+    for s, rows in (commodity_rows or {}).items():
+        if len(rows) < 2:
+            continue
+        rets_by_symbol[s] = F.log_returns([c for (_t, c) in rows])
+        ts_index[s] = {rows[k][0]: k for k in range(len(rows))}
 
     hunter = None
     if news_items:
@@ -135,14 +182,18 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
 
     summary = {"symbols": {}, "min_confidence": cfg.min_confidence,
                "regime_mode": cfg.regime_mode, "ensemble": bool(cfg.ensemble),
-               "news_events": len(hunter.events) if hunter else 0}
+               "news_events": len(hunter.events) if hunter else 0,
+               "signals": (signals.feeds() if signals is not None
+                           and not signals.empty() else {})}
+    all_packs = []
     for item in watch:
         sym = item["symbol"]
         if sym not in bars_by_sym:
             summary["symbols"][sym] = {"bars": 0, "error": "no-data"}
             continue
         vectors = scan_symbol(sym, bars_by_sym[sym], rets_by_symbol, cfg,
-                              sz_cfg, hunter, matrix)
+                              sz_cfg, hunter, matrix, signals=signals,
+                              ts_index=ts_index, packs_out=all_packs)
         path = os.path.join(out_dir, "%s.csv" % sym)
         SV.write_feature_csv(path, vectors)
         props = [v for v in vectors if v.propose(cfg.min_confidence)]
@@ -157,6 +208,8 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
             "proposed": len(props),
             "vetoed": veteos,
             "ensemble_vetoed": ens_vetoes,
+            "blackout_vetoed": sum(1 for v in vectors
+                                   if v.detail.find("event-blackout") >= 0),
             "event_driven": sum(1 for v in vectors if v.event_driven),
             "regimes": regimes,
             "mean_conviction": round(
@@ -166,6 +219,11 @@ def run_scan(watch, csv_dir=DEFAULT_CSV_DIR, out_dir=DEFAULT_OUT_DIR,
             "best_regime": best.regime if best else "",
             "csv": path,
         }
+    if signals is not None and signals_out and all_packs:
+        SG.write_csv(signals_out, all_packs)
+        summary["signals_csv"] = signals_out
+        summary["signal_rows"] = len(all_packs)
+        summary["signal_blackouts"] = sum(1 for p in all_packs if p.blackout)
     return summary
 
 
@@ -191,6 +249,11 @@ def main():
     ap.add_argument("--ensemble", action="store_true",
                     help="route the strategy zoo into a fail-closed veto")
     ap.add_argument("--summary", default="", help="summary json path override")
+    ap.add_argument("--signals", default="",
+                    help="dir with depth.csv/onchain.csv/social.csv/calendar.csv")
+    ap.add_argument("--commodities", default="",
+                    help="ts,symbol,close CSV — commodity legs for the "
+                         "cross-asset matrix")
     a = ap.parse_args()
 
     try:
@@ -202,9 +265,14 @@ def main():
     cfg = SN.SniperConfig(min_confidence=a.min_confidence,
                           regime_mode=a.regime_mode,
                           ensemble=a.ensemble)
+    sig = SG.SignalSet.from_dir(a.signals) if a.signals else None
+    comm = SG.read_commodity_csv(a.commodities) if a.commodities else None
     summary = run_scan(watch, csv_dir=a.csv_dir, out_dir=a.out_dir,
                        timeframe=a.timeframe, cfg=cfg,
-                       news_items=load_news(a.news))
+                       news_items=load_news(a.news),
+                       signals=sig, commodity_rows=comm,
+                       signals_out=(os.path.join(a.out_dir, "signals.csv")
+                                    if a.signals else ""))
 
     out = a.summary or os.path.join(a.out_dir, "summary.json")
     tmp = out + ".tmp"
@@ -214,6 +282,10 @@ def main():
 
     print("[monster] regime=%s ensemble=%s"
           % (summary["regime_mode"], summary["ensemble"]))
+    if summary.get("signals"):
+        print("[monster] signals %s | %d rows | %d blackouts"
+              % (summary["signals"], summary.get("signal_rows", 0),
+                 summary.get("signal_blackouts", 0)))
     for sym, s in summary["symbols"].items():
         if s.get("error"):
             print("[monster] %-10s %s" % (sym, s["error"]))

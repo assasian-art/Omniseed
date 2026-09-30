@@ -385,12 +385,15 @@ design doc §7.
 
 Tracked honestly so it is not mistaken for done:
 
-* On-chain flows (whale / exchange in-out), event-calendar and social-volume
-  signals (M7 extras) — planned, not built.
-* A **live depth provider** for the order-book path. The exact CKS OFI and the
-  `beta = c/depth^λ` impact coefficient are implemented and tested, but free
-  OHLCV feeds do not publish the book, so the shipped path is the signed-volume
-  proxy, which is labelled `NOT-cks` and discounted 30%.
+* ~~On-chain flows (whale / exchange in-out), event-calendar and social-volume
+  signals (M7 extras) — planned, not built.~~ **BUILT in §48** —
+  `tools/monster/signals.py`. See §7b below.
+* ~~A **live depth provider** for the order-book path.~~ **BUILT in §48.** The
+  layer now CONSUMES a depth feed when one is supplied (exact CKS OFI +
+  `beta = c/depth^λ`); when none is, it still falls back to the signed-volume
+  proxy, labelled `proxy` and discounted 30%. What is still absent is a *free
+  venue that publishes the book* — the reader exists, the feed is the caller's
+  job, exactly like news and funding.
 * The strategy factory with automatic promotion/retirement (M3) — planned.
 * Options-based volatility harvesting (selling implied vs realized). The
   volatility work here is the *vol-managed exposure* form (Moreira-Muir), which
@@ -399,6 +402,66 @@ Tracked honestly so it is not mistaken for done:
   Monster does not yet run its own background poller inside the loop.
 * Funding quotes are supplied by the caller (`funding.load_quotes_csv`); there is
   no live exchange poller wired.
+
+---
+
+## 7b. The external-signal layer (§48)
+
+`tools/monster/signals.py` is the "hacker tools" layer: the four signal families
+§7 used to list as planned, plus the order-book path. It is deliberately **one
+module with one contract**, because the recurring shape of this project is that
+the pieces exist and the *joint* does not.
+
+Three rules hold it together:
+
+1. **Pure and offline.** Every reader takes a path; nothing opens a socket.
+   Fetching stays the caller's job (`tools/fetch_news.py` and friends).
+2. **Provenance is named.** A depth-derived imbalance says `cks`; the
+   signed-volume fallback says `proxy` **and is discounted** — the proxy cannot
+   see limit orders or cancellations, which is most of what the CKS OFI
+   measures. A feed that is stale or absent says so and contributes **nothing**;
+   it is never silently zero-filled into a vote.
+3. **Fail-closed, never promoting.** The event calendar is a **blocker**. No
+   external signal can raise the sniper score `S` — `S` stays the mandate's
+   weighted sum of M/T/R/C.
+
+| family | input (`<name>.csv`) | reading |
+|---|---|---|
+| order book | `depth.csv` — `ts,bid_px,bid_sz,ask_px,ask_sz` | exact CKS OFI + `beta = c/depth^λ`; `source=cks`. No book → the proxy, `source=proxy`, discounted |
+| on-chain | `onchain.csv` — `ts,exchange_netflow,whale_net,stablecoin_delta` | exchange **inflow** = bearish, whale **accumulation** = bullish, rising **stablecoin supply** = bullish; each squashed with `tanh(raw/scale)` |
+| social | `social.csv` — `ts,mentions,positive,negative` | attention = **trailing** mention-volume z (no look-ahead), bias = attention × sentiment |
+| calendar | `calendar.csv` — `ts,kind,name,impact` | a **high-impact** event opens the blackout window `[ts-pre, ts+post]`; a low-impact one never does |
+| commodities | `commodities.csv` — `ts,symbol,close` | legs (`OIL`/`GOLD`/`COPPER`) merged into the cross-asset matrix |
+
+**Signs are written down so they can be argued with.** An exchange *inflow* is
+coins moving *to* venues, i.e. sell pressure; a positive *whale net* is
+accumulation. Both are one line of code and one test, and both are the part a
+reader should check first.
+
+**The blackout is a veto, and it is named even when it changes nothing.** If
+another gate already blocked the bar, the reason becomes
+`<first-reason>+event-blackout` rather than being swallowed — a blackout that
+disappeared behind an earlier veto would let the log claim the calendar was
+silent when it was not.
+
+`--signals DIR` (and `--commodities CSV`) wire it into `tools/monster_scan.py`.
+The per-bar readings are mirrored to `state/monster/signals.csv`
+(`ts,onchain,social,depth,depth_source,blackout,coverage`), and `coverage`
+counts the live families — so **"no signal" and "no feed" are never confused**,
+which is the whole point of the layer.
+
+### The cross-asset time-alignment fix (§48)
+
+`CorrelationMatrix.evaluate` used **one index for every series**. That is only
+correct when the symbols share a timeline; with different histories it compares
+bar 100 of one series against bar 100 of another, i.e. two different moments.
+The scanner now builds a `ts → index` map per symbol and passes `idx_by_symbol`,
+so every peer is read at the index of the **same timestamp**, and a peer with no
+reading at that instant is **skipped** rather than mis-compared. Omitting the
+map reproduces the old behaviour exactly, so nothing that worked changed.
+
+`tests/test_monster_signals.py` pins it both ways: the positional read sees the
+wrong moment, the aligned read sees the right one.
 
 ---
 
@@ -419,6 +482,7 @@ Tracked honestly so it is not mistaken for done:
 | `omniseed_monster_funding`   | funding-period arithmetic, the net-of-cost stack, direction on sign, every risk flag, history summary, **the memecoin trap**, CSV reader skipping malformed rows |
 | `omniseed_monster_sniper`    | layer arithmetic, every hard veto, **0.85 reachability**, `[1%,2%]` sizing band, cross-asset invalidation |
 | `omniseed_monster_news`      | keyword weights, recency decay, sentiment alignment, anomaly detection, event match requires BOTH halves, CSV round-trip, scan CLI |
+| `omniseed_monster_signals`   | the exact CKS OFI vs the labelled+discounted proxy, on-chain signs and staleness, social attention/bias, the high- vs low-impact blackout, pack CSV round-trip, the timestamp-aligned cross-asset matrix, and the scanner wiring the blackout into the engine-facing veto |
 
 Run the board with `ctest --test-dir build -C Release`.
 

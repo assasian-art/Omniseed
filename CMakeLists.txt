@@ -544,6 +544,18 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_funding.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_monster_funding PROPERTIES TIMEOUT 300)
+
+        # Monster external signals (§48): the order-book depth path (exact CKS
+        # OFI vs the labelled+discounted proxy), on-chain / social / calendar
+        # readings with their staleness controls, the fail-closed blackout, and
+        # the timestamp-aligned cross-asset matrix.
+        add_test(NAME omniseed_monster_signals
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_signals.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_signals PROPERTIES TIMEOUT 300)
     endif()
 
     # Decision bridge (T2 integration): the C++ DecisionResult JSON contract,

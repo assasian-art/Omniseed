@@ -79,12 +79,24 @@ class CorrelationMatrix:
                     out[(sa, sb)] = r
         return out
 
-    def _rolling_corr(self, va, vb, i):
+    def _rolling_corr(self, va, vb, ia, ib=None):
+        """Trailing Pearson over the last `window` readings.
+
+        `ia` / `ib` are the indices of the SAME instant in each series.  They
+        are equal whenever the two series share a timeline (the default); they
+        differ when the caller supplies `idx_by_symbol` for series that do not.
+        Comparing them at one shared index was the §48 cross-asset defect: two
+        symbols with different histories were correlated position-for-position,
+        i.e. bar 100 of one against bar 100 of the other, which is not the same
+        moment in time.
+        """
         w = self.window
-        if i + 1 < w or len(va) < i + 1 or len(vb) < i + 1:
+        if ib is None:
+            ib = ia
+        if ia + 1 < w or ib + 1 < w or len(va) < ia + 1 or len(vb) < ib + 1:
             return None
-        wa = va[i - w + 1:i + 1]
-        wb = vb[i - w + 1:i + 1]
+        wa = va[ia - w + 1:ia + 1]
+        wb = vb[ib - w + 1:ib + 1]
         ma, mb = sum(wa) / w, sum(wb) / w
         num = sum((wa[j] - ma) * (wb[j] - mb) for j in range(w))
         da = sum((x - ma) ** 2 for x in wa)
@@ -94,7 +106,7 @@ class CorrelationMatrix:
         return num / (da * db) ** 0.5
 
     # -- lead-lag evaluation ----------------------------------------------
-    def evaluate(self, target, direction, rets_by_symbol, i):
+    def evaluate(self, target, direction, rets_by_symbol, i, idx_by_symbol=None):
         """Evaluate every relation touching `target` at index `i`.
 
         `direction` is +1 for a long, -1 for a short. A relation is ACTIVE when
@@ -115,6 +127,19 @@ class CorrelationMatrix:
         def sgn(x):
             return 1 if x > 0 else (-1 if x < 0 else 0)
 
+        def ix(sym):
+            """The index of THIS instant in `sym`'s series.
+
+            Default (None) keeps the historical single-index behaviour, which is
+            correct when every series shares one timeline.  With `idx_by_symbol`
+            a peer is correlated at the index of the SAME timestamp, and a peer
+            that has no reading for this instant is skipped rather than compared
+            at the wrong moment.
+            """
+            if idx_by_symbol is None:
+                return i
+            return idx_by_symbol.get(sym, -1)
+
         for (driver, responder, expected, _why) in self.pairs:
             if target == driver:
                 leader, follower, sign = driver, responder, expected
@@ -126,13 +151,16 @@ class CorrelationMatrix:
                 continue
             rl = rets_by_symbol[leader]
             rf = rets_by_symbol[follower]
-            if i >= len(rl) or i >= len(rf):
+            il, ifr = ix(leader), ix(follower)
+            if il < 0 or ifr < 0:
+                continue                       # peer has no reading at this instant
+            if il >= len(rl) or ifr >= len(rf):
                 continue
-            r_leader, r_follower = rl[i], rf[i]
+            r_leader, r_follower = rl[il], rf[ifr]
             if not (r_leader == r_leader and r_follower == r_follower):
                 continue                       # NaN guard
             pr = PairResult(driver=driver, responder=responder, expected=expected)
-            pr.actual_corr = self._rolling_corr(rl, rf, i) or 0.0
+            pr.actual_corr = self._rolling_corr(rl, rf, il, ifr) or 0.0
             if abs(r_leader) < self.move_threshold:
                 pr.note = "leader flat"
                 res.pairs.append(pr)
