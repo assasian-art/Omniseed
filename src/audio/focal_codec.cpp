@@ -80,21 +80,17 @@ bool FocalCodec::encode(const PcmAudio& audio,
     out_codes.clear();
     out_codes.reserve(static_cast<size_t>(N));
 
-    // Deterministic codebook: quantize each band to 4 bits, pack 6 bands
-    // per 24-bit code, fold to codebook_size. This gives stable codes for
-    // identical audio (testable) and spread for different content.
     for (int64_t f = 0; f < N; ++f) {
         const float* row = frames.f32() + f * B;
-        uint32_t code = 0;
+        uint32_t h = 2166136261u;
         for (int64_t b = 0; b < B && b < 24; ++b) {
-            // log-energy in [-8, 2] -> 4-bit bucket
             const float v = std::min(2.0f, std::max(-8.0f, row[b]));
             const uint32_t q =
                 static_cast<uint32_t>((v + 8.0f) / 10.0f * 15.0f) & 0xFu;
-            code |= (q & 1u) << (b % 32);
+            h ^= q;
+            h *= 16777619u;
         }
-        out_codes.push_back(static_cast<int32_t>(code % 
-            static_cast<uint32_t>(cfg_.codebook_size)));
+        out_codes.push_back(static_cast<int32_t>(h % static_cast<uint32_t>(cfg_.codebook_size)));
     }
     return true;
 }

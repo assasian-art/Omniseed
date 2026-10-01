@@ -195,19 +195,17 @@ static void part_a_grammar() {
     // accepts() never consults complete_ and feed()'s recompute re-derives
     // complete_ from the buffer's first character alone.
     //
-    // NOT FIXED: accepts() is the gate in a constrained-generation loop, and
-    // tightening it changes what the model is allowed to emit. Pinned so it
-    // cannot drift, and reported in PROJECT_STATE §34.
+    // FIXED §49: accepts() now returns false after a complete object, and
+    // feed() marks the decoder failed if content follows a closed object.
     // -------------------------------------------------------------------------
-    TEST("A8 (PINNED DEFECT): trailing content after a complete object is accepted");
+    TEST("A8 (FIXED §49): trailing content after a complete object is rejected");
     {
         GrammarDecoder g;
         g.feed("{}");
         CHECK(g.complete());
-        CHECK(g.accepts("x"));           // <- should be false
+        CHECK(!g.accepts("x"));          // fixed: trailing content rejected
         g.feed("x");
-        CHECK(g.complete());             // <- "{}x" is not valid JSON
-        CHECK(g.text() == "{}x");
+        CHECK(g.failed());               // fixed: decoder is now failed
     }
 }
 
@@ -274,19 +272,21 @@ static void part_b_throttle() {
     // "no" inside "nothing"/"know", "ok" inside "book". A real trading question
     // is therefore classified Fast and gets the SHALLOWEST budget.
     //
-    // NOT FIXED: the thresholds are a tuned heuristic and word-boundary
-    // matching changes every classification. Pinned so the cost is visible.
+    // FIXED §49: keyword matching now uses word-boundary checks, so "hi"
+    // inside "which" and "no" inside "nothing" no longer fire.
     // -------------------------------------------------------------------------
-    TEST("B6 (PINNED DEFECT): 'hi' matches inside 'which', so a real question is Fast");
+    TEST("B6 (FIXED §49): word-boundary matching prevents substring false positives");
     {
-        // classify() lowercases internally, so the probe is lowercase too.
+        // "which" contains "hi" as a substring but not as a word.
         const std::string q = "which stock should i buy today";
         CHECK(q.size() >= 24);                                  // not Fast by length
-        CHECK(q.find("which") != std::string::npos);
-        CHECK(q.find("hi")    != std::string::npos);            // substring, not a word
-        CHECK(t.classify(q) == ComputeThrottle::Level::Fast);   // <- misclassified
-        // and the same trap on "no"
-        CHECK(t.classify("i have nothing to add here") == ComputeThrottle::Level::Fast);
+        CHECK(q.find("hi") != std::string::npos);               // substring present
+        CHECK(t.classify(q) == ComputeThrottle::Level::Balanced); // fixed: not Fast
+        // "nothing" contains "no" as a substring but not as a word.
+        CHECK(t.classify("i have nothing to add here") == ComputeThrottle::Level::Balanced);
+        // Real Fast keywords still work at word boundaries.
+        CHECK(t.classify("hi there") == ComputeThrottle::Level::Fast);
+        CHECK(t.classify("no") == ComputeThrottle::Level::Fast);
     }
 }
 
@@ -748,12 +748,20 @@ static void part_d_focal_codec() {
         CHECK(a != b);
     }
 
-    TEST("D4: silence maps to code 0 and every code is inside the codebook");
+    TEST("D4: silence produces a deterministic code and every code is inside the codebook");
     {
+        // With the FNV-1a codec, silence (all bands at log-floor -> q=0) hashes
+        // to a fixed non-zero value.  The important invariant is determinism and
+        // range, not "must be zero".
         std::vector<int32_t> s;
         CHECK(codec.encode(silence(2), s));
         CHECK(s.size() == 2);
-        for (int32_t c : s) CHECK(c == 0);     // log floor => every bucket 0
+        // Both frames must be identical (same silence content) and in range.
+        CHECK(s[0] == s[1]);
+        for (int32_t c : s) {
+            CHECK(c >= 0);
+            CHECK(c < codec.config().codebook_size);
+        }
 
         std::vector<int32_t> loud;
         CHECK(codec.encode(tone(440.0, 2, 0.9), loud));
@@ -761,6 +769,8 @@ static void part_d_focal_codec() {
             CHECK(c >= 0);
             CHECK(c < codec.config().codebook_size);
         }
+        // Silence and tone must differ.
+        CHECK(s[0] != loud[0]);
     }
 
     TEST("D5: audio shorter than one frame, or invalid, is refused");
@@ -778,21 +788,16 @@ static void part_d_focal_codec() {
     }
 
     // -------------------------------------------------------------------------
-    // PINNED DEFECT. The comment says "quantize each band to 4 bits, pack 6
-    // bands per 24-bit code". The code computes a 4-bit bucket `q` and then
-    // keeps ONLY its low bit: `code |= (q & 1u) << (b % 32)`. Three of every
-    // four bits are discarded, so the codec is a 24-bit SIGN PATTERN (is this
-    // band above or below the midpoint of [-8, 2] nats?), folded mod
-    // codebook_size — not the 4-bit-per-band quantizer it documents.
+    // D6: FNV-1a codec uses all 4 bits of each band's quantized value.
     //
-    // This test re-derives BOTH formulas from the front-end features and shows
-    // they disagree, so the loss is a measured fact rather than a reading.
-    //
-    // NOT FIXED: changing it changes every code the codec emits, and a fitted
-    // audio head would have to be re-trained against the new alphabet. Pinned
-    // and reported in PROJECT_STATE §34.
+    // The old codec kept only the low bit of each 4-bit bucket (q & 1u),
+    // discarding 3 of 4 bits per band.  Fixed in §49: the encode loop now
+    // runs FNV-1a over the full 4-bit q values, so all 16 levels contribute
+    // to the hash.  This test verifies the new behaviour:
+    //   - the emitted code matches the FNV-1a formula, not the old bit-pack
+    //   - the FNV-1a code and the old bit-pack code differ (confirming the fix)
     // -------------------------------------------------------------------------
-    TEST("D6 (PINNED DEFECT): 3 of every 4 quantization bits are discarded");
+    TEST("D6 (FIXED §49): FNV-1a codec uses all 4 bits per band");
     {
         const PcmAudio a = tone(440.0, 1, 0.8);
         Tensor frames;
@@ -800,26 +805,31 @@ static void part_d_focal_codec() {
         const float* row = frames.f32();
 
         const int32_t n_bands = 24;
-        uint32_t as_coded = 0, if_full_4bit = 0;
+        uint32_t fnv_code = 2166136261u;
+        uint32_t old_bitpack = 0;
         for (int32_t b = 0; b < n_bands; ++b) {
             const float v = std::min(2.0f, std::max(-8.0f, row[b]));
             const uint32_t q =
                 static_cast<uint32_t>((v + 8.0f) / 10.0f * 15.0f) & 0xFu;
-            as_coded     |= (q & 1u) << (b % 32);        // what the code does
-            if_full_4bit |= (q & 0xFu) << (4 * (b % 6));  // what the comment says
+            fnv_code  ^= q;
+            fnv_code  *= 16777619u;
+            old_bitpack |= (q & 1u) << (b % 32);   // old broken formula
         }
 
         std::vector<int32_t> codes;
         CHECK(codec.encode(a, codes));
         CHECK(codes.size() == 1);
+        // Must match the FNV-1a formula.
         CHECK(codes[0] == static_cast<int32_t>(
-              as_coded % static_cast<uint32_t>(codec.config().codebook_size)));
-        // the two formulas must disagree, or there is nothing to report
-        CHECK(as_coded != if_full_4bit);
+              fnv_code % static_cast<uint32_t>(codec.config().codebook_size)));
+        // Must NOT match the old bit-pack formula (confirms the fix is active).
+        const int32_t old_code = static_cast<int32_t>(
+            old_bitpack % static_cast<uint32_t>(codec.config().codebook_size));
+        CHECK(codes[0] != old_code);
         platform::log_info(
-            "  FocalCodec frame 0: low-bit-only code %u, full-4-bit code %u "
-            "(differ => 3 bits/band discarded)",
-            as_coded, if_full_4bit);
+            "  FocalCodec frame 0: FNV-1a code %u, old bit-pack code %u "
+            "(differ => fix confirmed)",
+            static_cast<uint32_t>(codes[0]), static_cast<uint32_t>(old_code));
     }
 }
 

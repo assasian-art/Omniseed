@@ -13,31 +13,33 @@ namespace omniseed {
 using platform::current_rss_bytes;
 
 ComputeThrottle::Level ComputeThrottle::classify(const std::string& in) const {
-    // normalize
     std::string low;
     low.reserve(in.size());
     for (const char c : in)
         low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    // Deep: planning / multi-step keywords or long complex input.
+    auto has = [&](const char* needle) -> bool {
+        const std::string n(needle);
+        size_t pos = 0;
+        while ((pos = low.find(n, pos)) != std::string::npos) {
+            const bool left_ok = pos == 0 || !std::isalpha(static_cast<unsigned char>(low[pos - 1]));
+            const size_t end = pos + n.size();
+            const bool right_ok = end >= low.size() || !std::isalpha(static_cast<unsigned char>(low[end]));
+            if (left_ok && right_ok) return true;
+            ++pos;
+        }
+        return false;
+    };
     static const char* kDeep[] = {
         "plan", "design", "build", "create", "analyze", "compare",
         "why", "how do", "how to", "step", "strategy", "research",
         "write a", "implement", "debug", "refactor",
     };
-    for (const char* k : kDeep) {
-        if (low.find(k) != std::string::npos) return Level::Deep;
-    }
-
-    // Fast: trivial lookups.
+    for (const char* k : kDeep) if (has(k)) return Level::Deep;
     static const char* kFast[] = {
         "what time", "time is it", "hi", "hello", "thanks", "ok",
         "yes", "no", "who are you", "help",
     };
-    for (const char* k : kFast) {
-        if (low.find(k) != std::string::npos) return Level::Fast;
-    }
-
+    for (const char* k : kFast) if (has(k)) return Level::Fast;
     if (in.size() < 24) return Level::Fast;
     if (in.size() > 160) return Level::Deep;
     return Level::Balanced;
