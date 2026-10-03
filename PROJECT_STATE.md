@@ -3355,15 +3355,16 @@ across runs**. Fixed with one shared `kMagic` constant; pinned by C9.
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
 | `load()` read `klen`/`ns`/`sl` straight from the file and never bounds-checked them against the mapping — a truncated `state/improve.bin` walked off the end of the mmap                                                              | **FIXED** (`need()` before every read, a trace-count cap so a 12-byte file cannot drive a 4-billion `reserve()`, and a local vector swapped in only on full success so a failed load keeps the previous traces) | C7  |
 | `task_key()` did not trim **leading** whitespace (`last_ws` started `false`, and the trim loop only strips the END), so `"  read a file"` and `"read a file"` were two different keys and the exact-match replay lookup missed        | **FIXED** (`last_ws = true`)                                                                                                                                                                                    | C1  |
-| `FocalCodec::encode()` computes a 4-bit bucket per band and then keeps **only its low bit** (`q & 1u`), discarding 3 of every 4 — the code is a 24-bit sign pattern, not the quantizer its comment describes                          | **PINNED** (changing it changes every emitted code; a fitted audio head would need retraining)                                                                                                                  | D6  |
-| `ComputeThrottle::classify()` matches Fast keywords by **substring**, so `"hi"` fires inside `"which"` — `classify("which stock should i buy today")` returns **Fast** and a real trading question gets 48 tokens / 0 thinking tokens | **PINNED** (thresholds are a tuned heuristic)                                                                                                                                                                   | B6  |
-| `GrammarDecoder::accepts()` allows content after a complete object: `accepts("x")` is true on a decoder holding `{}`, and `feed("x")` reports `complete()` on the invalid `"{}x"`                                                     | **PINNED** (it gates constrained generation)                                                                                                                                                                    | A8  |
+| `FocalCodec::encode()` computes a 4-bit bucket per band and then keeps **only its low bit** (`q & 1u`), discarding 3 of every 4 — the code is a 24-bit sign pattern, not the quantizer its comment describes                          | **FIXED** in §49 (FNV-1a over all 4 bits; the owner decision this table was waiting for)                                                                                                                          | D6  |
+| `ComputeThrottle::classify()` matches Fast keywords by **substring**, so `"hi"` fires inside `"which"` — `classify("which stock should i buy today")` returns **Fast** and a real trading question gets 48 tokens / 0 thinking tokens | **FIXED** in §49 (word-boundary match; thresholds unchanged)                                                                                                                                                    | B6  |
+| `GrammarDecoder::accepts()` allows content after a complete object: `accepts("x")` is true on a decoder holding `{}`, and `feed("x")` reports `complete()` on the invalid `"{}x"`                                                     | **FIXED** in §49 (`complete_` short-circuits; trailing content rejected)                                                                                                                                        | A8  |
 
-**Why three are pinned rather than fixed:** each has a behavioural contract  
+**Why three were pinned rather than fixed:** each has a behavioural contract  
 that something downstream depends on. Changing what a codec emits, what a  
 classifier returns, or what a generation loop is allowed to produce is a  
-decision for the owner, not a silent edit. They are asserted so they cannot  
-drift, and reported here so the cost is visible.
+decision for the owner, not a silent edit. They were asserted so they could not  
+drift, and reported here so the cost was visible. **§49 is that decision** — all  
+three are now fixed and the pins assert the correct behaviour instead.
 
 ### Tests
 
@@ -5143,3 +5144,114 @@ Board: registered **49 → 50** (`omniseed_monster_signals`); default
 mandate named, it names the provenance of every reading, it blocks on a
 high-impact event without ever promoting on a signal, and its cross-asset matrix
 compares peers at the same instant instead of the same array position.
+
+---
+
+## §49 — unpin and fix the three §34 defects (2026-10-01)
+
+**Directive.** §34 found four defects and fixed two immediately; the other
+three — FocalCodec D6, ComputeThrottle B6, GrammarDecoder A8 — were **pinned**
+because each had a behavioural contract something downstream depended on, and
+changing what a codec emits, what a classifier returns, or what a generation
+loop produces is an owner decision, not a silent edit. §49 **is that decision**:
+all three are fixed, and the pins now assert the correct behaviour instead of
+preserving the bug.
+
+### 49.1 FocalCodec (D6) — `q & 1u` → FNV-1a over all four bits
+
+`encode()` computes a 4-bit bucket per band and kept only its low bit — a
+24-bit sign pattern, not the quantizer the comment describes, and silence
+hashed to 0, indistinguishable from "no code". The fix hashes **all four bits
+of every q** with FNV-1a: silence now maps to a stable non-zero code, every
+code stays in `[0, codebook_size)`, and the map is deterministic. D4's pin
+changed with it — it now asserts determinism, range, and `silence ≠ tone`
+instead of the old `silence == 0`.
+
+**The honest cost stands:** this changes every emitted code, so any fitted
+audio head would need retraining. No fitted head is shipped; the change is
+payable now and only gets more expensive later.
+
+### 49.2 ComputeThrottle (B6) — `find()` → word boundaries
+
+Fast keywords matched by **substring**, so `"hi"` fired inside `"which"` and
+`"no"` inside `"nothing"`: `classify("which stock should i buy today")` returned
+**Fast** — a real trading question got 48 tokens and zero thinking. The fix is a
+word-boundary lambda: the thresholds themselves are untouched (they were never
+the defect). B6 now asserts **Balanced** for the substring traps and **Fast**
+for genuine keywords, so both directions are pinned.
+
+### 49.3 GrammarDecoder (A8) — trailing content after a closed object
+
+`accepts()` returned true after the object was complete, so `accepts("x")` held
+on a decoder already holding `{}`, and `feed("x")` reported `complete()` on the
+invalid `"{}x"` — trailing junk accepted by the loop that gates constrained
+generation. `accepts()` now returns **false when `complete_` is true** and
+re-simulates from `buf_ + text`, so anything appended after the closed object is
+rejected. A8 asserts `!accepts("x")` and `failed()` after the feed.
+
+### 49.4 Files
+
+- `src/audio/focal_codec.cpp` — FNV-1a over all 4-bit q values (12 lines).
+- `src/agent/compute_throttle.cpp` — the word-boundary keyword match (26 lines).
+- `src/agent/grammar_decoder.cpp` — `complete_` short-circuit + re-simulation (57 lines).
+- `tests/test_agent_modules.cpp` — D4, B6, A8 rewritten to assert the fixed
+  behaviour (90 lines).
+- `PROJECT_STATE.md` — §34's table updated: three rows **PINNED → FIXED**.
+
+### 49.5 Honest status
+
+**Re-verified on this session:** full board `ctest -LE slow` **47/47 passed**
+(1089.93 s), including `omniseed_agent_modules` **226/226** (was 222 pass + 4
+fail pinned). `omniseed_tests` 206, `router` 348, `heads` 481, `soul` 378 — all
+green.
+
+**The one-line result:** the three defects §34 was honest enough to pin instead
+of hide are now fixed, their pins assert the right behaviour, and the board is
+green with nothing pinned as broken.
+
+## 50. M3 — the strategy factory (promotion / retirement) is BUILT
+
+`state/m3_brief.md` was the contract: BLOCK ONLY, NO LOOK-AHEAD, FAIL CLOSED.
+This session implemented it.
+
+### 50.1 What was added
+
+- `tools/monster/router.py` — optional `kept=` name filter on `route()`
+  (internal local renamed `_kept`; `kept=None` is bit-identical to before).
+- `tools/monster/factory.py` (new, ~360 lines) — `FactoryConfig` (warmup,
+  horizon, retire_z=-2.0, retry_window, shrinkage=0.5; TypeError on unknown
+  kwargs), `Record` (wins/losses, z-score vs the 0.5 null,
+  `longest_promoted_run`, named `retire_reason`), `Factory` (pending-outcome
+  queues settled only when `j+horizon <= i`, per-bar state ladder
+  warmup -> probation -> promoted -> retired -> retry-at-`next_retry_i`),
+  `FactoryVerdict` with `detail()` and per-signal `states`.
+- `tools/monster/sniper_engine.py` — opt-in `SniperConfig.ensemble_factory`
+  (default False; the `ensemble=True` path is untouched, parity-safe). The
+  new branch builds signals via `ST.all_signals`, evaluates the Factory, and
+  reports factory vetoes as the existing `"ensemble-opposed"` reason.
+- `tests/test_monster_factory.py` — 10 required tests, house pattern.
+
+### 50.2 The invariant that needed code, not just a filter
+
+A pure eligibility filter CAN violate BLOCK ONLY: dropping the opposite-side
+signal raises `|conviction|` (observed 0.153 -> 0.463 on a synthetic run).
+The factory therefore CLAMPS: if the kept verdict flips the base sign or
+exceeds `|base| + 1e-9`, output falls back to the unfiltered base
+conviction/agreement. Veto remains `should_veto_long(base) OR
+should_veto_long(kept)` with `VETO=base|kept|both` — a kept-derived veto is
+by design, but a veto is never fabricated from nothing. Unknown strategies
+are excluded from weight entirely and named `unknown(not-in-zoo)`.
+
+### 50.3 Verification (all re-run green this session)
+
+- `tests/test_monster_factory.py` — **27/27** (no-look-ahead prefix
+  invariance, forward_return causality, warmup->promotion, retirement +
+  exact retry bar, block-only sign/magnitude/veto-traceability, shrinkage
+  equality with `route(shrunk signal)`, router `kept=` regression,
+  fail-closed unknown naming, end-to-end sniper on 120 bars).
+- `tests/test_monster_strategies.py` — **66/66**.
+- `tests/test_strategy_parity.py` — **38/38** (C++ vs Python oracles at
+  1e-9; the factory is Python-only and opt-in, so parity cannot drift).
+
+**The one-line result:** M3 is built, clamped to its own spec, and the whole
+trading board (131 checks) is green.

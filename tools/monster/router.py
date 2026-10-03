@@ -107,8 +107,16 @@ def regime_weight(fit, w_trend):
     return FIT_BOTH_WEIGHT
 
 
-def route(signals, regime=None, cfg=None, ts=0):
-    """Blend strategy signals into a single ensemble verdict."""
+def route(signals, regime=None, cfg=None, ts=0, kept=None):
+    """Blend strategy signals into a single ensemble verdict.
+
+    `kept`, when given, is a container of strategy NAMES. Signals whose name is
+    not in it are dropped AFTER the confidence/direction filters and are
+    excluded from every downstream aggregate. This is how the monster factory
+    expresses "only strategies with a live track record may speak"; it is a
+    restriction, never a boost. `kept=None` (the default) keeps every signal
+    and is bit-identical to the pre-factory behaviour.
+    """
     cfg = cfg or RouterConfig()
     ts_score = 0.5
     if regime is not None and getattr(regime, "trend_score", None) is not None:
@@ -120,11 +128,13 @@ def route(signals, regime=None, cfg=None, ts=0):
     total = 0.0
     signed = 0.0
     active = 0
-    kept = []
+    _kept = []
     for sig in signals:
         if sig is None or sig.confidence < cfg.min_confidence:
             continue
         if sig.direction == 0.0:
+            continue
+        if kept is not None and sig.name not in kept:
             continue
         w = regime_weight(sig.regime_fit, w_trend) * sig.confidence
         if w <= 0:
@@ -132,7 +142,7 @@ def route(signals, regime=None, cfg=None, ts=0):
         total += w
         signed += w * sig.direction
         active += 1
-        kept.append((sig, w))
+        _kept.append((sig, w))
 
     if total <= 0:
         return EnsembleVerdict(ts=ts, conviction=0.0, agreement=0.0, weight=0.0,
@@ -143,13 +153,13 @@ def route(signals, regime=None, cfg=None, ts=0):
         agreement = 0.0
     else:
         sgn = 1.0 if conviction > 0 else -1.0
-        agree_w = sum(w for sig, w in kept if sig.direction * sgn > 0)
+        agree_w = sum(w for sig, w in _kept if sig.direction * sgn > 0)
         agreement = agree_w / total
 
-    reasons = ["%s:%s" % (sig.name, sig.reason) for sig, _ in kept]
+    reasons = ["%s:%s" % (sig.name, sig.reason) for sig, _ in _kept]
     return EnsembleVerdict(ts=ts, conviction=conviction, agreement=agreement,
                            weight=total, w_trend=w_trend, active=active,
-                           signals=kept, reasons=reasons)
+                           signals=_kept, reasons=reasons)
 
 
 def should_veto_long(verdict, cfg=None):

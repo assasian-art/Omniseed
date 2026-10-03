@@ -394,7 +394,13 @@ Tracked honestly so it is not mistaken for done:
   proxy, labelled `proxy` and discounted 30%. What is still absent is a *free
   venue that publishes the book* — the reader exists, the feed is the caller's
   job, exactly like news and funding.
-* The strategy factory with automatic promotion/retirement (M3) — planned.
+* ~~The strategy factory with automatic promotion/retirement (M3) — planned.~~
+  **BUILT in §50** — `tools/monster/factory.py`, opt-in via
+  `SniperConfig(ensemble_factory=True)`. Tracks each strategy causally
+  (warmup → probation → promoted → retired → retry), filters the ensemble by
+  eligibility with probation shrinkage, and never amplifies conviction or
+  invents a veto (clamped to the unfiltered base). Parity-safe: the C++ and
+  default Python paths are bit-identical.
 * Options-based volatility harvesting (selling implied vs realized). The
   volatility work here is the *vol-managed exposure* form (Moreira-Muir), which
   is evidence-backed and needs no options venue.

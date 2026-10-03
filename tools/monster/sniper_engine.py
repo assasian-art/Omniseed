@@ -21,6 +21,7 @@
 import math
 from dataclasses import dataclass, field
 
+from . import factory as FA
 from . import features as F
 from . import regime as RG
 from . import router as RT
@@ -63,6 +64,12 @@ class SniperConfig:
     #   "legacy" — the original single-statistic SMA200-slope rule, kept so the
     #       behaviour can be reproduced and A/B compared.
     regime_mode: str = "advanced"
+    # --- strategy factory (opt-in; ensemble=True alone is untouched) --------
+    # ensemble_factory routes the ensemble through factory.py's causal track
+    # record (promotion/retirement = eligibility filter, BLOCK only). It is an
+    # opt-in flag so that plain `ensemble=True` stays bit-identical with the
+    # C++ omniseed_strategy_dump parity gate.
+    ensemble_factory: bool = False
     sma_regime: int = 200
     regime_slope_n: int = 20
     regime_slope_s: float = 0.01    # 1% SMA200 move over n bars
@@ -171,6 +178,7 @@ class Prepared:
         # --- advanced regime + strategy ensemble (optional, causal) ---------
         self.regimes = None
         self.ensemble = None
+        self.factory = None
         if cfg.regime_mode == "advanced":
             self.regimes = RG.scan(bars)
         if cfg.ensemble and self.regimes is not None:
@@ -180,6 +188,10 @@ class Prepared:
                 RT.RouterConfig(ensemble_veto=cfg.ensemble_veto,
                                 agreement_veto=cfg.ensemble_agreement,
                                 veto_min_weight=cfg.ensemble_min_weight))
+        if cfg.ensemble_factory and self.regimes is not None:
+            if not hasattr(self, "series"):
+                self.series = ST.prepare(bars)
+            self.factory = FA.Factory(bars)
 
 
 def prepare(bars, cfg=None):
@@ -349,7 +361,19 @@ def evaluate(p, i, ctx=None, cfg=None):
     # This is deliberately the last gate and it can only ever say no. An
     # ensemble that can talk you into a trade can talk you into a bad one, and
     # S must stay exactly the mandate's weighted sum.
-    if p.ensemble is not None:
+    if p.factory is not None:
+        st = p.regimes[i]
+        sigs = ST.all_signals(p.series, i, st, None, None)
+        fv = p.factory.evaluate(
+            sigs, i, st,
+            RT.RouterConfig(ensemble_veto=cfg.ensemble_veto,
+                            agreement_veto=cfg.ensemble_agreement,
+                            veto_min_weight=cfg.ensemble_min_weight),
+            ts=p.ts[i])
+        v.conviction, v.agreement = fv.conviction, fv.agreement
+        if not v.veto and fv.veto:
+            v.veto, v.veto_reason = True, "ensemble-opposed"
+    elif p.ensemble is not None:
         ev = p.ensemble[i]
         v.conviction, v.agreement = ev.conviction, ev.agreement
         if not v.veto and RT.should_veto_long(
