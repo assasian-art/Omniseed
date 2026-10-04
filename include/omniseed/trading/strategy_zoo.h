@@ -247,8 +247,26 @@ StrategySignal breakout(const StrategySeries& s, size_t i,
 StrategySignal ofi(const StrategySeries& s, size_t i, const RegimeState* regime,
                    const StrategyConfig& cfg, const std::vector<Snapshot>* snapshots);
 
+// M4 — volatility harvesting (option-chain strategies). The C++ Bar schema
+// (time, open, high, low, close, volume) carries no option chain, so these
+// six always take the oracle's FAIL-CLOSED path: an inactive signal whose
+// reason says why. Bit-exact with the oracle on tuple bars.
+StrategySignal vol_arb(const StrategySeries& s, size_t i,
+                       const RegimeState* regime, const StrategyConfig& cfg);
+StrategySignal butterfly_arb(const StrategySeries& s, size_t i,
+                             const RegimeState* regime, const StrategyConfig& cfg);
+StrategySignal skew_trend(const StrategySeries& s, size_t i,
+                          const RegimeState* regime, const StrategyConfig& cfg);
+StrategySignal calendar_spread(const StrategySeries& s, size_t i,
+                               const RegimeState* regime, const StrategyConfig& cfg);
+StrategySignal gex_regime(const StrategySeries& s, size_t i,
+                          const RegimeState* regime, const StrategyConfig& cfg);
+StrategySignal var_swap(const StrategySeries& s, size_t i,
+                        const RegimeState* regime, const StrategyConfig& cfg);
+
 // Every strategy's view of bar `i` (including the inactive ones), in the
-// oracle's order: momentum, mean_reversion, breakout, ofi.
+// oracle's order: momentum, mean_reversion, breakout, ofi, then the six
+// M4 vol strategies.
 std::vector<StrategySignal> all_signals(const StrategySeries& s, size_t i,
                                         const RegimeState* regime,
                                         const StrategyConfig& cfg,

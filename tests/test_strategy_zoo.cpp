@@ -297,7 +297,7 @@ void test_strategies() {
     {
         const RegimeState* r0 = &regs[0];
         const std::vector<StrategySignal> sigs = all_signals(s, 0, r0);
-        CHECK(sigs.size() == 4);
+        CHECK(sigs.size() == 10);
         for (const StrategySignal& x : sigs) {
             CHECK(!x.active());
             CHECK_NEAR(x.direction, 0.0, 0.0);
@@ -311,6 +311,21 @@ void test_strategies() {
         CHECK(sigs[1].name == "mean_reversion" && sigs[1].regime_fit == RegimeFit::Range);
         CHECK(sigs[2].name == "breakout" && sigs[2].regime_fit == RegimeFit::Both);
         CHECK(sigs[3].name == "ofi" && sigs[3].regime_fit == RegimeFit::Both);
+        // M4 vol harvesting: six more, each in its own regime fit, and each
+        // deactivated honestly on a chain-less bar.
+        CHECK(sigs[4].name == "vol_arb" && sigs[4].regime_fit == RegimeFit::Both);
+        CHECK(sigs[5].name == "butterfly_arb" && sigs[5].regime_fit == RegimeFit::Range);
+        CHECK(sigs[6].name == "skew_trend" && sigs[6].regime_fit == RegimeFit::Trend);
+        CHECK(sigs[7].name == "calendar_spread" && sigs[7].regime_fit == RegimeFit::Both);
+        CHECK(sigs[8].name == "gex_regime" && sigs[8].regime_fit == RegimeFit::Range);
+        CHECK(sigs[9].name == "var_swap" && sigs[9].regime_fit == RegimeFit::Both);
+        for (size_t k = 4; k < sigs.size(); ++k) {
+            CHECK(!sigs[k].active());
+            CHECK(sigs[k].reason != "");
+        }
+        // gex is floored to zero (no information), so it reaches its neutral
+        // branch rather than the chain-missing one — the reason must say so.
+        CHECK(sigs[8].reason == "gex-neutral gex=0.00");
     }
     // --- confidence is always inside [0,1] and direction inside [-1,1] ---
     {

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from monster import strategies as ST  # noqa: E402
 from monster import router as RT  # noqa: E402
 from monster import regime as R  # noqa: E402
+from monster import sniper_engine as SE  # noqa: E402
 
 PASSED = 0
 FAILED = 0
@@ -92,6 +93,37 @@ def gen_ou(n, seed, theta=0.30, sigma=0.006, mu=100.0):
         x = x + theta * (mu - x) + rnd.gauss(0, sigma * mu)
         out.append(x)
     return out
+
+
+def make_opt_bars(prices, seed=7, wick=0.0005, vol=1e6, chain=None):
+    """Dict bars: the same OHLCV as make_bars plus an option chain.
+
+    `chain` maps an option-chain field name (iv_30d, rv_30d, call_iv_90pct,
+    put_iv_90pct, skew_25d_delta, term_structure, gex) to a per-bar list.
+    Fields absent from `chain` are omitted entirely, which is how a real feed
+    that only publishes some of them behaves.
+    """
+    rnd = random.Random(seed)
+    chain = chain or {}
+    bars, prev = [], None
+    for i, p in enumerate(prices):
+        o = prev if prev is not None else p
+        c = p
+        band = max(abs(c - o), p * wick)
+        hi = max(o, c) + band * rnd.uniform(0.1, 0.6)
+        lo = min(o, c) - band * rnd.uniform(0.1, 0.6)
+        b = {"time": 1700000000 + i * 60, "open": o, "high": hi, "low": lo,
+             "close": c, "volume": vol * (1.0 + rnd.random())}
+        for name, series in chain.items():
+            b[name] = series[i]
+        bars.append(b)
+        prev = c
+    return bars
+
+
+def const(n, v):
+    """A flat option-chain series at value v (or a list already given)."""
+    return list(v) if isinstance(v, (list, tuple)) else [v] * n
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +554,255 @@ def test_no_lookahead():
           f"{mism} mismatches")
 
 
+def test_m4_vol_strategies():
+    """The six M4 vol strategies: thresholds, direction, confidence, fail-closed."""
+    print("\n[M4: the six volatility-harvesting strategies]")
+    N = 60
+    px = gen_ou(N, 11)
+
+    def sig(name, chain, i=None):
+        bars = make_opt_bars(px, seed=7, chain=chain)
+        s = ST.prepare(bars)
+        return getattr(ST, name)(s, N - 1 if i is None else i)
+
+    # --- vol_arb: ratio = iv/rv -------------------------------------------
+    g = sig("vol_arb", {"iv_30d": const(N, 0.30), "rv_30d": const(N, 0.20)})
+    check("vol_arb: iv/rv = 1.50 -> short vol", g.direction == -1.0, str(g))
+    check("vol_arb: conf = (1.5-1.0)/1.0 = 0.50", approx(g.confidence, 0.50), str(g))
+    check("vol_arb: regime_fit is 'both'", g.regime_fit == "both")
+
+    g = sig("vol_arb", {"iv_30d": const(N, 0.15), "rv_30d": const(N, 0.20)})
+    check("vol_arb: iv/rv = 0.75 -> long vol", g.direction == 1.0, str(g))
+    check("vol_arb: conf = (0.85-0.75)/0.85", approx(g.confidence, (0.85 - 0.75) / 0.85),
+          str(g))
+
+    g = sig("vol_arb", {"iv_30d": const(N, 0.21), "rv_30d": const(N, 0.20)})
+    check("vol_arb: iv/rv = 1.05 -> neutral", g.direction == 0.0 and g.confidence == 0.0,
+          str(g))
+    g = sig("vol_arb", {"iv_30d": const(N, 0.30)})  # no rv at all
+    check("vol_arb: missing rv fails closed", not g.active, str(g))
+    g = sig("vol_arb", {"iv_30d": const(N, 0.30), "rv_30d": const(N, 0.0)})
+    check("vol_arb: rv == 0 fails closed (no divide)", not g.active, str(g))
+
+    # --- butterfly_arb: curvature = wing_avg - iv_atm ----------------------
+    g = sig("butterfly_arb", {"call_iv_90pct": const(N, 0.35),
+                              "put_iv_90pct": const(N, 0.35),
+                              "iv_30d": const(N, 0.30)})
+    check("butterfly_arb: wings rich -> short wings", g.direction == -1.0, str(g))
+    check("butterfly_arb: conf = 0.05/0.05 = 1.0 (clamped)", approx(g.confidence, 1.0),
+          str(g))
+    check("butterfly_arb: regime_fit is 'range'", g.regime_fit == "range")
+
+    g = sig("butterfly_arb", {"call_iv_90pct": const(N, 0.25),
+                              "put_iv_90pct": const(N, 0.25),
+                              "iv_30d": const(N, 0.30)})
+    check("butterfly_arb: wings cheap -> long wings", g.direction == 1.0, str(g))
+
+    g = sig("butterfly_arb", {"call_iv_90pct": const(N, 0.305),
+                              "put_iv_90pct": const(N, 0.305),
+                              "iv_30d": const(N, 0.30)})
+    check("butterfly_arb: |curvature| < 0.02 -> neutral",
+          g.direction == 0.0 and g.confidence == 0.0, str(g))
+    g = sig("butterfly_arb", {"call_iv_90pct": const(N, 0.35)})
+    check("butterfly_arb: missing iv_atm fails closed", not g.active, str(g))
+
+    # --- skew_trend: put/call IV differential ------------------------------
+    g = sig("skew_trend", {"skew_25d_delta": const(N, 0.30)})
+    check("skew_trend: rich puts -> sell premium", g.direction == -1.0, str(g))
+    check("skew_trend: conf = 0.30/0.30 = 1.0", approx(g.confidence, 1.0), str(g))
+    check("skew_trend: regime_fit is 'trend'", g.regime_fit == "trend")
+
+    g = sig("skew_trend", {"skew_25d_delta": const(N, -0.30)})
+    check("skew_trend: cheap puts -> buy premium", g.direction == 1.0, str(g))
+
+    g = sig("skew_trend", {"skew_25d_delta": const(N, 0.05)})
+    check("skew_trend: |skew| < 0.15 -> neutral",
+          g.direction == 0.0 and g.confidence == 0.0, str(g))
+    g = sig("skew_trend", {"iv_30d": const(N, 0.20)})  # skew absent
+    check("skew_trend: missing skew fails closed", not g.active, str(g))
+
+    # --- calendar_spread: term structure x IV-RV gap -----------------------
+    g = sig("calendar_spread", {"term_structure": const(N, 1),
+                                "iv_30d": const(N, 0.25),
+                                "rv_30d": const(N, 0.20)})
+    check("calendar_spread: contango + iv rich -> sell front", g.direction == -1.0, str(g))
+    check("calendar_spread: conf = 0.05/0.05 = 1.0", approx(g.confidence, 1.0), str(g))
+    check("calendar_spread: regime_fit is 'both'", g.regime_fit == "both")
+
+    g = sig("calendar_spread", {"term_structure": const(N, -1),
+                                "iv_30d": const(N, 0.15),
+                                "rv_30d": const(N, 0.20)})
+    check("calendar_spread: backwardation + iv cheap -> buy front",
+          g.direction == 1.0, str(g))
+
+    g = sig("calendar_spread", {"term_structure": const(N, 1),
+                                "iv_30d": const(N, 0.20),
+                                "rv_30d": const(N, 0.20)})
+    check("calendar_spread: contango but iv == rv -> neutral",
+          g.direction == 0.0 and g.confidence == 0.0, str(g))
+    g = sig("calendar_spread", {"term_structure": const(N, 1),
+                                "iv_30d": const(N, 0.25)})  # no rv
+    check("calendar_spread: missing rv fails closed", not g.active, str(g))
+
+    # --- gex_regime: gamma exposure ----------------------------------------
+    g = sig("gex_regime", {"gex": const(N, 1.0)})
+    check("gex_regime: positive GEX -> sell premium", g.direction == -1.0, str(g))
+    check("gex_regime: conf = 1.0/2.0 = 0.50", approx(g.confidence, 0.50), str(g))
+    check("gex_regime: regime_fit is 'range'", g.regime_fit == "range")
+
+    g = sig("gex_regime", {"gex": const(N, -1.0)})
+    check("gex_regime: negative GEX -> hedge (dir=+0.5)", g.direction == 0.5, str(g))
+    check("gex_regime: hedge conf = 0.50", approx(g.confidence, 0.50), str(g))
+
+    g = sig("gex_regime", {"gex": const(N, 0.2)})
+    check("gex_regime: |gex| < 0.5 -> neutral",
+          g.direction == 0.0 and g.confidence == 0.0, str(g))
+
+    # --- var_swap: var_gap = rv - iv ----------------------------------------
+    g = sig("var_swap", {"iv_30d": const(N, 0.20), "rv_30d": const(N, 0.21)})
+    check("var_swap: variance cheap -> long variance", g.direction == 1.0, str(g))
+    check("var_swap: conf = |0.01|/0.001 clamped to 1.0", approx(g.confidence, 1.0),
+          str(g))
+    check("var_swap: regime_fit is 'both'", g.regime_fit == "both")
+
+    g = sig("var_swap", {"iv_30d": const(N, 0.21), "rv_30d": const(N, 0.20)})
+    check("var_swap: variance rich -> short variance", g.direction == -1.0, str(g))
+
+    g = sig("var_swap", {"iv_30d": const(N, 0.20005), "rv_30d": const(N, 0.20)})
+    check("var_swap: |gap| < 0.0001 -> fair",
+          g.direction == 0.0 and g.confidence == 0.0, str(g))
+    g = sig("var_swap", {"iv_30d": const(N, 0.20)})
+    check("var_swap: missing rv fails closed", not g.active, str(g))
+
+    # --- i < 1 warmup, and the no-option-chain fail-closed ------------------
+    bars = make_opt_bars(px, seed=7)  # NO option chain at all
+    s = ST.prepare(bars)
+    warm = [ST.vol_arb(s, 0), ST.butterfly_arb(s, 0), ST.skew_trend(s, 0),
+            ST.calendar_spread(s, 0), ST.gex_regime(s, 0), ST.var_swap(s, 0)]
+    check("all six return an inactive warmup signal at i=0",
+          all(not x.active for x in warm), str([x.reason for x in warm]))
+
+    flat = [ST.vol_arb(s, 30), ST.butterfly_arb(s, 30), ST.skew_trend(s, 30),
+            ST.calendar_spread(s, 30), ST.gex_regime(s, 30), ST.var_swap(s, 30)]
+    names = [x.name for x in flat]
+    check("all six stay inactive on bars with no option chain",
+          all(not x.active for x in flat), str([x.reason for x in flat]))
+    check("the six names are exactly the M4 set",
+          sorted(names) == sorted(SE.SniperConfig.vol_signals), str(sorted(names)))
+
+    # --- invariants over every bar, both regimes ---------------------------
+    obars = make_opt_bars(px, seed=7, chain={
+        "iv_30d": [0.18 + 0.05 * math.sin(k / 7) for k in range(N)],
+        "rv_30d": [0.16 + 0.06 * math.cos(k / 5) for k in range(N)],
+        "call_iv_90pct": [0.20 + 0.03 * math.sin(k / 9) for k in range(N)],
+        "put_iv_90pct": [0.24 + 0.03 * math.cos(k / 9) for k in range(N)],
+        "skew_25d_delta": [0.10 * math.sin(k / 11) for k in range(N)],
+        "term_structure": [1 if k % 4 < 2 else -1 for k in range(N)],
+        "gex": [0.8 * math.sin(k / 13) for k in range(N)],
+    })
+    so = ST.prepare(obars)
+    bad = []
+    for i in range(N):
+        for x in ST.all_signals(so, i, None):
+            if x.name not in SE.SniperConfig.vol_signals:
+                continue
+            if not (-1.0 <= x.direction <= 1.0):
+                bad.append((i, x.name, "direction", x.direction))
+            if not (0.0 <= x.confidence <= 1.0):
+                bad.append((i, x.name, "confidence", x.confidence))
+            if x.regime_fit not in ("trend", "range", "both"):
+                bad.append((i, x.name, "regime_fit", x.regime_fit))
+    check("every vol signal honours [-1,1]/[0,1] and a valid regime_fit",
+          not bad, str(bad[:3]))
+
+
+def test_m4_no_lookahead():
+    """Prefix invariance for the vol layer: no strategy may see past bar i."""
+    print("\n[M4: NO LOOK-AHEAD — prefix invariance of the vol layer]")
+    N = 120
+    px = gen_random(N, 31)
+    bars = make_opt_bars(px, seed=5, chain={
+        "iv_30d": [0.20 + 0.04 * math.sin(k / 6) for k in range(N)],
+        "rv_30d": [0.18 + 0.05 * math.cos(k / 4) for k in range(N)],
+        "call_iv_90pct": [0.22 + 0.03 * math.sin(k / 8) for k in range(N)],
+        "put_iv_90pct": [0.26 + 0.03 * math.cos(k / 8) for k in range(N)],
+        "skew_25d_delta": [0.12 * math.sin(k / 10) for k in range(N)],
+        "term_structure": [1 if k % 5 < 3 else -1 for k in range(N)],
+        "gex": [0.6 * math.sin(k / 12) for k in range(N)],
+    })
+    vol = set(SE.SniperConfig.vol_signals)
+    bad = []
+    for i in range(60, N):
+        sf, sp = ST.prepare(bars), ST.prepare(bars[:i + 1])
+        for a, b in zip(ST.all_signals(sf, i, None), ST.all_signals(sp, i, None)):
+            if a.name not in vol:
+                continue
+            if a.direction != b.direction or abs(a.confidence - b.confidence) > 1e-12:
+                bad.append((i, a.name, a.direction, b.direction, a.confidence,
+                            b.confidence))
+    check("every vol strategy is identical with and without future bars",
+          not bad, f"{len(bad)} mismatches, first={bad[:2]}")
+
+
+def test_m4_w_vol_regression_guard():
+    """w_vol=0 must be BIT-IDENTICAL to the pre-M4 engine.
+
+    Two independent claims:
+      1. with the layer off, adding an option chain to the bars cannot change a
+         single verdict -- pre-M4 the kernel did not know option chains existed;
+      2. with the layer ON it really does move the score, so the guard above is
+         not vacuous.
+    """
+    print("\n[M4: w_vol=0 regression guard]")
+    N = 300
+    px = gen_ou(N, 17)
+    plain = make_bars(px, seed=7)          # tuple OHLCV, no option chain
+    chain = make_opt_bars(px, seed=7, chain={   # same OHLCV + a live chain
+        "iv_30d": [0.22 + 0.05 * math.sin(k / 6) for k in range(N)],
+        "rv_30d": [0.17 + 0.06 * math.cos(k / 4) for k in range(N)],
+        "call_iv_90pct": [0.21 + 0.03 * math.sin(k / 8) for k in range(N)],
+        "put_iv_90pct": [0.27 + 0.03 * math.cos(k / 8) for k in range(N)],
+        "skew_25d_delta": [0.14 * math.sin(k / 10) for k in range(N)],
+        "term_structure": [1 if k % 5 < 3 else -1 for k in range(N)],
+        "gex": [0.7 * math.sin(k / 12) for k in range(N)],
+    })
+    # the two series must agree bar for bar on the OHLCV the guard compares on
+    check("fixtures agree on close/volume before the guard is meaningful",
+          all(approx(a[4], b["close"]) and approx(a[5], b["volume"])
+              for a, b in zip(plain, chain)))
+
+    cfg_off = SE.SniperConfig(w_vol=0.0)
+    cfg_on = SE.SniperConfig(w_vol=0.20)
+    p_plain = SE.prepare(plain, cfg_off)
+    p_chain_off = SE.prepare(chain, cfg_off)
+    p_chain_on = SE.prepare(chain, cfg_on)
+
+    check("the vol series is NOT built while w_vol == 0", p_chain_off.vol_series is None)
+    check("the vol series IS built once w_vol > 0", p_chain_on.vol_series is not None)
+    check("_vol_layer is inert while w_vol == 0",
+          SE._vol_layer(p_chain_off, 150, cfg_off) == 0.0)
+
+    mism = []
+    for i in range(200, N):
+        a = SE.evaluate(p_plain, i, cfg=cfg_off)
+        b = SE.evaluate(p_chain_off, i, cfg=cfg_off)
+        if (a.score != b.score or a.conviction != b.conviction
+                or a.veto != b.veto or a.regime != b.regime or a.votes != b.votes
+                or a.propose(cfg_off) != b.propose(cfg_off)):
+            mism.append((i, a.score, b.score, a.veto, b.veto))
+    check("w_vol=0: an option chain leaves every verdict bit-identical",
+          not mism, f"{len(mism)} mismatches, first={mism[:2]}")
+
+    moved = sum(1 for i in range(200, N)
+                if abs(SE.evaluate(p_chain_on, i, cfg=cfg_on).score
+                       - SE.evaluate(p_chain_off, i, cfg=cfg_off).score) > 1e-12)
+    print(f"       w_vol=0.20 moves the score on {moved}/{N - 200} bars")
+    check("w_vol>0 actually changes scores (the guard is not vacuous)", moved > 0)
+
+    s_on = [SE.evaluate(p_chain_on, i, cfg=cfg_on).score for i in range(200, N)]
+    check("w_vol>0 never leaves [-1,1]", all(-1.0 <= x <= 1.0 for x in s_on))
+
+
 def main():
     print("== monster strategies + router ==")
     test_cks_ofi_exact()
@@ -535,6 +816,9 @@ def main():
     test_router_veto_weight_floor()
     test_router_end_to_end()
     test_no_lookahead()
+    test_m4_vol_strategies()
+    test_m4_no_lookahead()
+    test_m4_w_vol_regression_guard()
     print(f"\nRESULT: {PASSED} passed, {FAILED} failed")
     for f in FAILURES:
         print(f"   - {f}")

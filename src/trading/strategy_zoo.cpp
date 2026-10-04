@@ -642,6 +642,29 @@ StrategySignal make(const char* name, double dir, double conf, RegimeFit fit,
     return s;
 }
 
+// M4 — the option-chain reader, mirroring features.read_option_chain().
+//
+// The C++ Bar schema is (time, open, high, low, close, volume) and carries no
+// option chain: slot 5 is VOLUME, so reading a chain off it would promote a
+// 1e6-share bar to 1e6 implied vol and every vol strategy would fire. The
+// reader therefore returns exactly what the oracle returns on a tuple bar —
+// every greek NaN, term_structure and gex floored to zero — and the six vol
+// strategies deactivate honestly instead of guessing. The day Bar gains chain
+// fields, this is the ONE place that changes.
+struct OptionChain {
+    double iv_30d         = kRegimeNaN;
+    double rv_30d         = kRegimeNaN;
+    double call_iv_90pct  = kRegimeNaN;
+    double put_iv_90pct   = kRegimeNaN;
+    double skew_25d_delta = kRegimeNaN;
+    double term_structure = 0.0;
+    double gex            = 0.0;
+};
+
+OptionChain read_option_chain(const Bar& /*bar*/) {
+    return OptionChain{};
+}
+
 } // namespace
 
 StrategySignal momentum(const StrategySeries& s, size_t i,
@@ -797,16 +820,150 @@ StrategySignal ofi(const StrategySeries& s, size_t i, const RegimeState* /*regim
     return make("ofi", d, conf, RegimeFit::Both, fmt("ofi-proxy(z=%.2f NOT-cks)", z));
 }
 
+// =============================================================================
+// M4 — volatility harvesting. The six strategies below mirror
+// tools/monster/strategies.py branch-for-branch, so the parity test holds them
+// to bit-exact agreement with the oracle. They read the option chain, and the
+// chain reader (above) fails closed on a Bar that carries none — which is every
+// Bar in this port — so each one deactivates and states why rather than
+// inventing a greek.
+// =============================================================================
+
+StrategySignal vol_arb(const StrategySeries& s, size_t i,
+                       const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // IV-RV spread arb: sell vol when IV overstates realized, buy when it
+    // understates. ratio = iv/rv; 1.3 / 0.85 are the oracle's bands.
+    if (i < 1) return make("vol_arb", 0.0, 0.0, RegimeFit::Both, "no-history");
+    const OptionChain oc = read_option_chain(s.bars()[i]);
+    const double iv = oc.iv_30d, rv = oc.rv_30d;
+    if (!fin(iv) || !fin(rv) || rv <= 0.0)
+        return make("vol_arb", 0.0, 0.0, RegimeFit::Both, "no-optchain");
+    const double ratio = iv / rv;
+    if (ratio > 1.3)
+        return make("vol_arb", -1.0, (ratio - 1.0) / 1.0, RegimeFit::Both,
+                    fmt("iv_rich ratio=%.2f", ratio));
+    if (ratio < 0.85)
+        return make("vol_arb", 1.0, (0.85 - ratio) / 0.85, RegimeFit::Both,
+                    fmt("iv_cheap ratio=%.2f", ratio));
+    return make("vol_arb", 0.0, 0.0, RegimeFit::Both,
+                fmt("iv_rv_neutral ratio=%.2f", ratio));
+}
+
+StrategySignal butterfly_arb(const StrategySeries& s, size_t i,
+                             const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // Vol surface curvature: short overpriced wings when the butterfly
+    // violates. curvature = wing_avg - iv_atm; positive wings = violation.
+    if (i < 1) return make("butterfly_arb", 0.0, 0.0, RegimeFit::Range, "no-history");
+    const OptionChain oc = read_option_chain(s.bars()[i]);
+    const double call_iv = oc.call_iv_90pct, put_iv = oc.put_iv_90pct;
+    const double iv_atm = oc.iv_30d;
+    if (!fin(call_iv) || !fin(put_iv) || !fin(iv_atm))
+        return make("butterfly_arb", 0.0, 0.0, RegimeFit::Range, "no-optchain");
+    const double wing_avg = (call_iv + put_iv) / 2.0;
+    const double curvature = wing_avg - iv_atm;
+    if (curvature > 0.02)
+        return make("butterfly_arb", -1.0, curvature / 0.05, RegimeFit::Range,
+                    fmt("wings-rich curvature=%.4f", curvature));
+    if (curvature < -0.02)
+        return make("butterfly_arb", 1.0, -curvature / 0.05, RegimeFit::Range,
+                    fmt("wings-cheap curvature=%.4f", curvature));
+    return make("butterfly_arb", 0.0, 0.0, RegimeFit::Range,
+                fmt("curvature-neutral curvature=%.4f", curvature));
+}
+
+StrategySignal skew_trend(const StrategySeries& s, size_t i,
+                          const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // Skew tilt: mean-revert an extreme put/call IV differential. Rich puts ->
+    // sell the premium; cheap puts -> buy it.
+    if (i < 1) return make("skew_trend", 0.0, 0.0, RegimeFit::Trend, "no-history");
+    const double skew = read_option_chain(s.bars()[i]).skew_25d_delta;
+    if (!fin(skew))
+        return make("skew_trend", 0.0, 0.0, RegimeFit::Trend, "no-optchain");
+    if (skew > 0.15)
+        return make("skew_trend", -1.0, skew / 0.30, RegimeFit::Trend,
+                    fmt("skew-rich skew=%.3f", skew));
+    if (skew < -0.15)
+        return make("skew_trend", 1.0, -skew / 0.30, RegimeFit::Trend,
+                    fmt("skew-cheap skew=%.3f", skew));
+    return make("skew_trend", 0.0, 0.0, RegimeFit::Trend,
+                fmt("skew-neutral skew=%.3f", skew));
+}
+
+StrategySignal calendar_spread(const StrategySeries& s, size_t i,
+                               const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // Term-structure arb: contango plus rich IV -> sell the front month;
+    // backwardation plus cheap IV -> buy it.
+    if (i < 1) return make("calendar_spread", 0.0, 0.0, RegimeFit::Both, "no-history");
+    const OptionChain oc = read_option_chain(s.bars()[i]);
+    const double ts = oc.term_structure, iv = oc.iv_30d, rv = oc.rv_30d;
+    if (!fin(iv) || !fin(rv))
+        return make("calendar_spread", 0.0, 0.0, RegimeFit::Both, "no-optchain");
+    const double iv_rv_diff = iv - rv;
+    if (ts > 0.0 && iv_rv_diff > 0.01)
+        return make("calendar_spread", -1.0, iv_rv_diff / 0.05, RegimeFit::Both,
+                    fmt("contango-iv-rich diff=%.3f", iv_rv_diff));
+    if (ts < 0.0 && iv_rv_diff < -0.01)
+        return make("calendar_spread", 1.0, -iv_rv_diff / 0.05, RegimeFit::Both,
+                    fmt("backward-iv-cheap diff=%.3f", iv_rv_diff));
+    return make("calendar_spread", 0.0, 0.0, RegimeFit::Both,
+                fmt("no-arb ts=%+d diff=%.3f", static_cast<int>(ts), iv_rv_diff));
+}
+
+StrategySignal gex_regime(const StrategySeries& s, size_t i,
+                          const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // Gamma exposure regime filter for vol harvesting. Positive GEX ->
+    // range-bound, sell premium. Negative GEX -> trending, hedge rather than
+    // harvest. The reader floors a chain-less bar at gex = 0, which is "no
+    // information" rather than "balanced book", so the signal says so.
+    if (i < 1) return make("gex_regime", 0.0, 0.0, RegimeFit::Range, "no-history");
+    double gex = read_option_chain(s.bars()[i]).gex;
+    if (!fin(gex)) gex = 0.0;
+    if (gex > 0.5)
+        return make("gex_regime", -1.0, gex / 2.0, RegimeFit::Range,
+                    fmt("pos-gex sell-premium gex=%.2f", gex));
+    if (gex < -0.5)
+        return make("gex_regime", 0.5, -gex / 2.0, RegimeFit::Range,
+                    fmt("neg-gex hedge gex=%.2f", gex));
+    return make("gex_regime", 0.0, 0.0, RegimeFit::Range,
+                fmt("gex-neutral gex=%.2f", gex));
+}
+
+StrategySignal var_swap(const StrategySeries& s, size_t i,
+                        const RegimeState* /*regime*/, const StrategyConfig& /*cfg*/) {
+    // Variance swap proxy: long variance when IV understates realized, short
+    // when it overstates. var_gap = rv - iv; positive = variance is cheap.
+    if (i < 1) return make("var_swap", 0.0, 0.0, RegimeFit::Both, "no-history");
+    const OptionChain oc = read_option_chain(s.bars()[i]);
+    const double iv = oc.iv_30d, rv = oc.rv_30d;
+    if (!fin(iv) || !fin(rv))
+        return make("var_swap", 0.0, 0.0, RegimeFit::Both, "no-optchain");
+    const double var_gap = rv - iv;
+    if (var_gap > 0.0001)
+        return make("var_swap", 1.0, std::fabs(var_gap) / 0.001, RegimeFit::Both,
+                    fmt("var-cheap gap=%.4f", var_gap));
+    if (var_gap < -0.0001)
+        return make("var_swap", -1.0, std::fabs(var_gap) / 0.001, RegimeFit::Both,
+                    fmt("var-rich gap=%.4f", var_gap));
+    return make("var_swap", 0.0, 0.0, RegimeFit::Both,
+                fmt("var-fair gap=%.4f", var_gap));
+}
+
 std::vector<StrategySignal> all_signals(const StrategySeries& s, size_t i,
                                         const RegimeState* regime,
                                         const StrategyConfig& cfg,
                                         const std::vector<Snapshot>* snapshots) {
     std::vector<StrategySignal> out;
-    out.reserve(4);
+    out.reserve(10);
     out.push_back(momentum(s, i, regime, cfg));
     out.push_back(mean_reversion(s, i, regime, cfg));
     out.push_back(breakout(s, i, regime, cfg));
     out.push_back(ofi(s, i, regime, cfg, snapshots));
+    out.push_back(vol_arb(s, i, regime, cfg));
+    out.push_back(butterfly_arb(s, i, regime, cfg));
+    out.push_back(skew_trend(s, i, regime, cfg));
+    out.push_back(calendar_spread(s, i, regime, cfg));
+    out.push_back(gex_regime(s, i, regime, cfg));
+    out.push_back(var_swap(s, i, regime, cfg));
     return out;
 }
 

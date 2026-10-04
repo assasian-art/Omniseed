@@ -5255,3 +5255,68 @@ are excluded from weight entirely and named `unknown(not-in-zoo)`.
 
 **The one-line result:** M3 is built, clamped to its own spec, and the whole
 trading board (131 checks) is green.
+
+## 51. M4 — options volatility harvesting is at parity
+
+`state/m4_brief.md` was the contract: six options strategies, each a
+`StrategySignal`, each honouring BLOCK ONLY / NO LOOK-AHEAD / FAIL CLOSED. The
+Python side was written last session and its three tuple-fallback defects fixed
+through one canonical `_optchain()` reader. The **C++ side was still emitting
+four signals to Python's ten**, so `omniseed_strategy_parity` failed 9 checks on
+signal count alone. This session closed that gap.
+
+### 51.1 What was added
+
+- `src/trading/strategy_zoo.cpp` — the C++ port of all six strategies
+  (`vol_arb`, `butterfly_arb`, `skew_trend`, `calendar_spread`, `gex_regime`,
+  `var_swap`), branch-for-branch against the oracle, including the `%.2f` /
+  `%.3f` / `%.4f` reason strings. An `OptionChain` reader mirrors
+  `features.read_option_chain()` field-for-field, and `all_signals()` now
+  reserves 10 and pushes in the oracle's fixed order.
+- `tests/test_strategy_zoo.cpp` — bumped to 10 signals and extended: the oracle
+  order, all six regime fits, each of the six **inactive with a non-empty
+  reason** on a chain-less bar, and `gex_regime`'s distinctive neutral string.
+- `docs/TRADING_LAB.md` — §6 gains "The volatility-harvesting layer (M4)" and
+  §8's evidence table gains the `omniseed_strategy_zoo` /
+  `omniseed_strategy_parity` rows.
+
+### 51.2 Why the chain-less behaviour is the design, not a stub
+
+The `Bar` struct is `(time, open, high, low, close, volume)` and carries no
+option chain — slot 5 is volume, so reading it as implied vol would promote a
+1 000 000-share bar to 1 000 000 % IV and every vol strategy would fire on
+noise. That is exactly the defect the Python side had (`skew_trend` read
+`rv_30d` as skew; `calendar_spread` read `iv_30d` as term structure). Both
+oracles now return `NAN` per greek on a chain-less bar, so failing closed is the
+*default* rather than something each strategy has to remember — and the day
+`Bar` gains chain fields, the reader is the one place that changes.
+
+`gex` is the deliberate exception: the oracle defaults it to `0.0`, not `NAN`,
+so `gex_regime` falls through to `gex-neutral gex=0.00` — inactive, but for a
+*stated* reason instead of `no-optchain`. The C++ port reproduces this exactly
+and the zoo test pins the string, because a silent reordering of the neutral
+branch would be invisible to every other check.
+
+Because the router drops `confidence < min_confidence` before weighting, the six
+additions are **blend-neutral**: at the default `w_vol = 0.0` the engine is
+bit-identical to pre-M4, which is asserted by `test_m4_w_vol_regression_guard`
+rather than assumed. At `w_vol = 0.20` the layer moves 100/100 bars, so it is
+wired rather than decorative.
+
+### 51.3 Verification (all re-run green this session)
+
+- `tests/test_monster_strategies.py` — **116/116**, including the six M4
+  thresholds, no-look-ahead, and the `w_vol` regression guard.
+- `tests/test_strategy_parity.py` — **38/38** (was 29 passed / 9 failed):
+  per-bar counts, then name / direction / confidence / exact `reason` for every
+  signal, at 1e-9, across trend / chop / squeeze / vol × tracked-and-raw, the
+  nine sniper comparisons, and the real feed when present.
+- `omniseed_strategy_zoo.exe` — **328/328**.
+- Full board `ctest -LE slow` — **47/47 passed** (891 s), including
+  `omniseed_strategy_parity` (no `slow` label, so it ran) and
+  `omniseed_strategy_zoo` (81 s). The three `slow`-labelled lora e2e tests are
+  excluded by the project's convention; nothing in M4 touches that path.
+
+**The one-line result:** M4 is built on both sides of the language line, the six
+strategies fail closed on chain-less bars by construction, and the two oracles
+agree to 1e-9 including their reason strings.

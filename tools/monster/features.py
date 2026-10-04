@@ -330,3 +330,73 @@ def bullish_divergence(rsi_vals, swing_lows, i, right=2, max_gap=60):
     if not (math.isfinite(r1) and math.isfinite(r2)):
         return False
     return p2 < p1 and r2 > r1
+
+
+# ---------------------------------------------------------------------------
+# Option-chain primitives (M4 — volatility harvesting)
+# ---------------------------------------------------------------------------
+
+def option_chain_fields(bars):
+    """Return the set of option-chain keys available in the first bar.
+
+    Expected keys (dict bars): iv_30d, rv_30d, call_iv_90pct, put_iv_90pct,
+    skew_25d_delta, term_structure, gex. Missing keys are silently ignored.
+    """
+    if not bars:
+        return set()
+    b = bars[0]
+    if isinstance(b, dict):
+        return set(b.keys())
+    return set()
+
+
+def read_option_chain(bar):
+    """Extract option-chain metrics from a single bar.
+
+    Returns a dict with keys: iv_30d, rv_30d, call_iv_90pct, put_iv_90pct,
+    skew_25d_delta, term_structure, gex. Missing values are NAN.
+
+    DICT BARS ONLY, deliberately. The OHLCV tuple schema used everywhere else
+    in the kernel is (time, open, high, low, close, volume), so index 5 is
+    VOLUME. Reading an option chain off a tuple would silently promote volume
+    to iv_30d -- a 1e6 share bar would look like 1e6 implied vol and every
+    vol strategy would fire. An option chain arrives either as dict bars or as
+    its own CSV stream (see the M4 brief), never packed into an OHLCV tuple,
+    so we FAIL CLOSED on tuples instead of guessing.
+    """
+    out = {"iv_30d": NAN, "rv_30d": NAN, "call_iv_90pct": NAN,
+           "put_iv_90pct": NAN, "skew_25d_delta": NAN,
+           "term_structure": 0.0, "gex": 0.0}
+    if not isinstance(bar, dict):
+        return out
+    for k in out:
+        if k in bar:
+            v = bar[k]
+            out[k] = float(v) if (v is not None and math.isfinite(float(v))) else NAN
+    return out
+
+
+def iv_rv_ratio(bars, i):
+    """IV_30d / RV_30d ratio at bar i. NAN if either is missing."""
+    if i < 0 or not bars:
+        return NAN
+    oc = read_option_chain(bars[i])
+    iv, rv = oc["iv_30d"], oc["rv_30d"]
+    if not math.isfinite(iv) or not math.isfinite(rv) or rv <= 0:
+        return NAN
+    return iv / rv
+
+
+def realized_variance(vals, n):
+    """Trailing realized variance of log-returns over `n` bars."""
+    if len(vals) < 2 or n < 2:
+        return NAN
+    r = []
+    for i in range(1, len(vals)):
+        if vals[i] > 0 and vals[i - 1] > 0:
+            r.append(math.log(vals[i] / vals[i - 1]))
+    if len(r) < n:
+        return NAN
+    w = r[-n:]
+    m = sum(w) / len(w)
+    return sum((x - m) ** 2 for x in w) / len(w)

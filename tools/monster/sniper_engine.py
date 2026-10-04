@@ -30,11 +30,19 @@ from . import strategies as ST
 
 @dataclass
 class SniperConfig:
-    # --- layer weights (must sum to ~1.0) ---------------------------------
+    # --- layer weights (must sum to ~1.0) --------------------------------
     w_micro: float = 0.25
     w_tech: float = 0.35
     w_regime: float = 0.25
     w_cross: float = 0.15
+    # --- optional vol-harvesting layer (M4) -----------------------------
+    # Opt-in: default 0.0 keeps M3 bit-identical. When w_vol > 0 the
+    # six vol strategies (vol_arb … var_swap) contribute a fifth
+    # signal blend. The total is renormalised so w_micro+w_tech+
+    # w_regime+w_cross+w_vol ≈ 1.0 when active.
+    w_vol: float = 0.0
+    vol_signals: tuple = ("vol_arb", "butterfly_arb", "skew_trend",
+                          "calendar_spread", "gex_regime", "var_swap")
     # --- decision bar -----------------------------------------------------
     min_confidence: float = 0.85
     min_factors: int = 3            # independent technical votes required
@@ -179,6 +187,7 @@ class Prepared:
         self.regimes = None
         self.ensemble = None
         self.factory = None
+        self.vol_series = None
         if cfg.regime_mode == "advanced":
             self.regimes = RG.scan(bars)
         if cfg.ensemble and self.regimes is not None:
@@ -192,6 +201,8 @@ class Prepared:
             if not hasattr(self, "series"):
                 self.series = ST.prepare(bars)
             self.factory = FA.Factory(bars)
+        if cfg.w_vol > 0.0:
+            self.vol_series = ST.prepare(bars)
 
 
 def prepare(bars, cfg=None):
@@ -326,6 +337,20 @@ def _mean_reversion_confirmed(p, i, cfg):
 
 
 # ---------------------------------------------------------------------------
+# M4 — VOL LAYER
+# ---------------------------------------------------------------------------
+def _vol_layer(p, i, cfg):
+    """Average confidence from active vol strategies at bar i."""
+    if not hasattr(p, "vol_series") or p.vol_series is None:
+        return 0.0
+    active = [sig for sig in ST.all_signals(p.vol_series, i, None, None)
+              if sig.name in cfg.vol_signals and sig.active]
+    if not active:
+        return 0.0
+    return sum(sig.confidence for sig in active) / len(active)
+
+
+# ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
 def evaluate(p, i, ctx=None, cfg=None):
@@ -338,8 +363,14 @@ def evaluate(p, i, ctx=None, cfg=None):
     v.regime, v.regime_score = _regime(p, i, cfg)
     v.cross = _cross(ctx, cfg)
 
+    # --- M4 vol-harvesting layer (opt-in, w_vol > 0) -------------
+    v_vol = 0.0
+    if cfg.w_vol > 0.0:
+        v_vol = _vol_layer(p, i, cfg)
+
     v.score = (cfg.w_micro * v.micro + cfg.w_tech * v.tech
-               + cfg.w_regime * v.regime_score + cfg.w_cross * v.cross)
+               + cfg.w_regime * v.regime_score + cfg.w_cross * v.cross
+               + cfg.w_vol * v_vol)
 
     # --- hard vetoes (before the score is even considered) ---------------
     if v.regime == "trend_down":

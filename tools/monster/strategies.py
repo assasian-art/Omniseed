@@ -34,6 +34,7 @@
 
 import math
 
+from . import features as F
 from .features import NAN, closes, highs, lows, volumes, atr, ema, sma
 
 # ---------------------------------------------------------------------------
@@ -414,7 +415,9 @@ def ofi(s, i, regime=None, cfg=None, snapshots=None):
                           "ofi-proxy(z=%.2f NOT-cks)" % z)
 
 
-ALL = ("momentum", "mean_reversion", "breakout", "ofi")
+ALL = ("momentum", "mean_reversion", "breakout", "ofi",
+       "vol_arb", "butterfly_arb", "skew_trend",
+       "calendar_spread", "gex_regime", "var_swap")
 
 
 def all_signals(s, i, regime=None, cfg=None, snapshots=None):
@@ -424,6 +427,12 @@ def all_signals(s, i, regime=None, cfg=None, snapshots=None):
         mean_reversion(s, i, regime, cfg),
         breakout(s, i, regime, cfg),
         ofi(s, i, regime, cfg, snapshots),
+        vol_arb(s, i, regime, cfg),
+        butterfly_arb(s, i, regime, cfg),
+        skew_trend(s, i, regime, cfg),
+        calendar_spread(s, i, regime, cfg),
+        gex_regime(s, i, regime, cfg),
+        var_swap(s, i, regime, cfg),
     ]
 
 
@@ -468,3 +477,191 @@ def vol_target_scale(s, i, cfg=None):
     scale = (rv_ref / rv_now) ** cfg.vol_target_power
     scale = _clamp(scale, cfg.vol_target_min_scale, cfg.vol_target_max_lev)
     return scale, rv_now, rv_ref
+
+
+# =============================================================================
+# M4 — OPTIONS VOLATILITY HARVESTING
+# =============================================================================
+
+def _optchain(bar):
+    """Option-chain metrics for one bar, via the ONE canonical reader.
+
+    Option chains are carried on DICT bars (see features.read_option_chain):
+    packing them into an OHLCV tuple would collide with the volume slot, so
+    tuple bars return all-NAN and every vol strategy fails closed. Fields with
+    no slot in the tuple schema (skew_25d_delta, term_structure) likewise come
+    back NAN / 0.0 rather than silently substituting a neighbouring column --
+    which is what the pre-fix code did (skew_trend read rv_30d as skew;
+    calendar_spread read iv_30d as term structure).
+    """
+    return F.read_option_chain(bar)
+
+
+def vol_arb(s, i, regime=None, cfg=None):
+    """IV-RV spread arb: sell vol when IV rich, buy when IV cheap.
+
+    ratio = iv_30d / rv_30d
+    ratio > 1.3 -> short vol (IV overstates realized)
+    ratio < 0.85 -> long vol (IV understates realized)
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("vol_arb", 0.0, 0.0, "both", "no-history")
+    oc = _optchain(s.bars[i])
+    iv, rv = oc["iv_30d"], oc["rv_30d"]
+    if not math.isfinite(iv) or not math.isfinite(rv) or rv <= 0:
+        return StrategySignal("vol_arb", 0.0, 0.0, "both", "no-optchain")
+    ratio = iv / rv
+    if ratio > 1.3:
+        d = -1.0
+        conf = _clamp((ratio - 1.0) / 1.0, 0.0, 1.0)
+        reason = "iv_rich ratio=%.2f" % ratio
+    elif ratio < 0.85:
+        d = 1.0
+        conf = _clamp((0.85 - ratio) / 0.85, 0.0, 1.0)
+        reason = "iv_cheap ratio=%.2f" % ratio
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "iv_rv_neutral ratio=%.2f" % ratio
+    return StrategySignal("vol_arb", d, conf, "both", reason)
+
+
+def butterfly_arb(s, i, regime=None, cfg=None):
+    """Vol surface curvature: short overpriced wings when butterfly violates.
+
+    curvature = wing_avg - iv_atm  (positive = wings richer = violation)
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("butterfly_arb", 0.0, 0.0, "range", "no-history")
+    oc = _optchain(s.bars[i])
+    call_iv, put_iv, iv_atm = oc["call_iv_90pct"], oc["put_iv_90pct"], oc["iv_30d"]
+    if not all(math.isfinite(v) for v in [call_iv, put_iv, iv_atm]):
+        return StrategySignal("butterfly_arb", 0.0, 0.0, "range", "no-optchain")
+    wing_avg = (call_iv + put_iv) / 2.0
+    curvature = wing_avg - iv_atm
+    if curvature > 0.02:
+        d = -1.0
+        conf = _clamp(curvature / 0.05, 0.0, 1.0)
+        reason = "wings-rich curvature=%.4f" % curvature
+    elif curvature < -0.02:
+        d = 1.0
+        conf = _clamp(-curvature / 0.05, 0.0, 1.0)
+        reason = "wings-cheap curvature=%.4f" % curvature
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "curvature-neutral curvature=%.4f" % curvature
+    return StrategySignal("butterfly_arb", d, conf, "range", reason)
+
+
+def skew_trend(s, i, regime=None, cfg=None):
+    """Skew tilt: mean-revert extreme put/call IV differential.
+
+    Rich puts (skew > 0.15) -> sell put premium
+    Cheap puts (skew < -0.15) -> buy put premium
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("skew_trend", 0.0, 0.0, "trend", "no-history")
+    skew = _optchain(s.bars[i])["skew_25d_delta"]
+    if not math.isfinite(skew):
+        return StrategySignal("skew_trend", 0.0, 0.0, "trend", "no-optchain")
+    if skew > 0.15:
+        d = -1.0
+        conf = _clamp(skew / 0.30, 0.0, 1.0)
+        reason = "skew-rich skew=%.3f" % skew
+    elif skew < -0.15:
+        d = 1.0
+        conf = _clamp(-skew / 0.30, 0.0, 1.0)
+        reason = "skew-cheap skew=%.3f" % skew
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "skew-neutral skew=%.3f" % skew
+    return StrategySignal("skew_trend", d, conf, "trend", reason)
+
+
+def calendar_spread(s, i, regime=None, cfg=None):
+    """Term structure arb: contango vs backwardation vs IV-RV gap.
+
+    Contango + IV rich -> sell front
+    Backwardation + IV cheap -> buy front
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("calendar_spread", 0.0, 0.0, "both", "no-history")
+    oc = _optchain(s.bars[i])
+    ts, iv, rv = oc["term_structure"], oc["iv_30d"], oc["rv_30d"]
+    if not math.isfinite(iv) or not math.isfinite(rv):
+        return StrategySignal("calendar_spread", 0.0, 0.0, "both", "no-optchain")
+    iv_rv_diff = iv - rv
+    if ts > 0 and iv_rv_diff > 0.01:
+        d = -1.0
+        conf = _clamp(iv_rv_diff / 0.05, 0.0, 1.0)
+        reason = "contango-iv-rich diff=%.3f" % iv_rv_diff
+    elif ts < 0 and iv_rv_diff < -0.01:
+        d = 1.0
+        conf = _clamp(-iv_rv_diff / 0.05, 0.0, 1.0)
+        reason = "backward-iv-cheap diff=%.3f" % iv_rv_diff
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "no-arb ts=%+d diff=%.3f" % (ts, iv_rv_diff)
+    return StrategySignal("calendar_spread", d, conf, "both", reason)
+
+
+def gex_regime(s, i, regime=None, cfg=None):
+    """Gamma exposure regime filter for vol harvesting.
+
+    Positive GEX -> range-bound, sell premium
+    Negative GEX -> trending, avoid or hedge
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("gex_regime", 0.0, 0.0, "range", "no-history")
+    gex = _optchain(s.bars[i])["gex"]
+    if not math.isfinite(gex):
+        gex = 0.0
+    if gex > 0.5:
+        d = -1.0
+        conf = _clamp(gex / 2.0, 0.0, 1.0)
+        reason = "pos-gex sell-premium gex=%.2f" % gex
+    elif gex < -0.5:
+        d = 0.5
+        conf = _clamp(-gex / 2.0, 0.0, 1.0)
+        reason = "neg-gex hedge gex=%.2f" % gex
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "gex-neutral gex=%.2f" % gex
+    return StrategySignal("gex_regime", d, conf, "range", reason)
+
+
+def var_swap(s, i, regime=None, cfg=None):
+    """Variance swap proxy: long variance when IV < realized, short when IV > realized.
+
+    var_gap = rv_30d - iv_30d  (positive = variance cheap)
+    """
+    cfg = cfg or s.cfg
+    if i < 1:
+        return StrategySignal("var_swap", 0.0, 0.0, "both", "no-history")
+    oc = _optchain(s.bars[i])
+    iv, rv = oc["iv_30d"], oc["rv_30d"]
+    if not math.isfinite(iv) or not math.isfinite(rv):
+        return StrategySignal("var_swap", 0.0, 0.0, "both", "no-optchain")
+    var_gap = rv - iv
+    if var_gap > 0.0001:
+        d = 1.0
+        conf = _clamp(abs(var_gap) / 0.001, 0.0, 1.0)
+        reason = "var-cheap gap=%.4f" % var_gap
+    elif var_gap < -0.0001:
+        d = -1.0
+        conf = _clamp(abs(var_gap) / 0.001, 0.0, 1.0)
+        reason = "var-rich gap=%.4f" % var_gap
+    else:
+        d = 0.0
+        conf = 0.0
+        reason = "var-fair gap=%.4f" % var_gap
+    return StrategySignal("var_swap", d, conf, "both", reason)

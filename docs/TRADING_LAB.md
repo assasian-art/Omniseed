@@ -369,6 +369,46 @@ score 1.00 and veto every long (observed live, now a regression test).
 `--monster-features` also accepts `--monster-min-conf`, and the ensemble summary
 appears in `state/monster/summary.json`.
 
+### The volatility-harvesting layer (M4)
+
+The zoo gained six **options** strategies, so the ensemble has something to say
+about *volatility* rather than only about price. Each is a `StrategySignal` like
+the other four — direction, confidence, a regime fit, a written reason — so the
+router, the weight floor and the `ensemble-opposed` veto apply to them
+unchanged.
+
+| strategy | fit | reads | fires when |
+|---|---|---|---|
+| `vol_arb` | both | `iv_30d / rv_30d` | ratio > 1.30 → short vol (IV overstates realized); < 0.85 → long vol |
+| `butterfly_arb` | range | `(call_iv_90pct + put_iv_90pct)/2 − iv_30d` | surface curvature beyond ±0.02 — wings priced above the belly |
+| `skew_trend` | trend | `skew_25d_delta` | tilt beyond ±0.15, mean-reverting the put/call differential |
+| `calendar_spread` | both | `term_structure` **and** `iv_30d − rv_30d` | contango + IV rich → sell the front; backwardation + IV cheap → buy it |
+| `gex_regime` | range | `gex` | positive gamma → sell premium; negative → hedge at half size |
+| `var_swap` | both | `rv_30d − iv_30d` | variance cheap / rich beyond ±0.0001 |
+
+The interesting part is what they do **without** a chain. Option chains ride on
+*dict* bars (`features.read_option_chain`); an OHLCV tuple has no chain slot —
+slot 5 is volume, so reading it as implied vol would turn a 1 000 000-share bar
+into 1 000 000 % IV and every strategy would fire. The pre-fix code did exactly
+this by accident: `skew_trend` read `rv_30d` as skew and `calendar_spread` read
+`iv_30d` as term structure. Every strategy now goes through the one canonical
+reader, which returns `NAN` for each greek on a tuple bar, and the strategies
+**fail closed** with reason `no-optchain` instead of substituting a neighbouring
+column. `gex` is the exception that proves the rule: it defaults to `0.0`, which
+is finite and inside the neutral band, so `gex_regime` reaches its
+`gex-neutral gex=0.00` branch — honest about having no information, and still
+inactive.
+
+Because inactive signals are dropped by `min_confidence` before weighting, the
+six additions are **blend-neutral**: with the default `w_vol = 0.0` the engine
+is bit-identical to its pre-M4 output, which is a regression test rather than a
+claim. Setting `w_vol = 0.20` moves 100/100 bars on the synthetic feed, i.e. the
+layer is wired rather than decorative.
+
+The C++ port mirrors all six branch-for-branch, including the fail-closed
+reader — the `Bar` struct carries no chain either — so `test_strategy_parity.py`
+diffs the two oracles at 1e-9, reasons included.
+
 ### Funding-rate carry
 
 `tools/monster/funding.py` is the one **non-directional** piece: delta-neutral
@@ -484,11 +524,13 @@ wrong moment, the aligned read sees the right one.
 | `omniseed_paper_reports`     | journal parsing, book replay, day P&L, Markdown/HTML rendering, opt-in SMTP config |
 | `omniseed_monster_features`  | indicator correctness + the **no-look-ahead proof** (prefix invariance) |
 | `omniseed_monster_regime`    | **calibration against known ground truth** (trend / OU / random walk): VR, Hurst, ER, ADX, choppiness, ρ(1), MA consistency, Yang-Zhang, OU half-life recovery, the degenerate-vol guards, hysteresis, prefix invariance |
-| `omniseed_monster_strategies`| **exact CKS order-flow imbalance vs hand-computed values**, the OFI proxy labelled as a proxy, Donchian excludes the current bar, squeeze vs no-squeeze confidence, vol-target band, router continuity, **the veto weight floor (regression)**, prefix invariance |
+| `omniseed_monster_strategies`| **exact CKS order-flow imbalance vs hand-computed values**, the OFI proxy labelled as a proxy, Donchian excludes the current bar, squeeze vs no-squeeze confidence, vol-target band, router continuity, **the veto weight floor (regression)**, prefix invariance, **the six M4 vol strategies: thresholds, reasons, no-look-ahead, and `w_vol=0` bit-identical to pre-M4** |
 | `omniseed_monster_funding`   | funding-period arithmetic, the net-of-cost stack, direction on sign, every risk flag, history summary, **the memecoin trap**, CSV reader skipping malformed rows |
 | `omniseed_monster_sniper`    | layer arithmetic, every hard veto, **0.85 reachability**, `[1%,2%]` sizing band, cross-asset invalidation |
 | `omniseed_monster_news`      | keyword weights, recency decay, sentiment alignment, anomaly detection, event match requires BOTH halves, CSV round-trip, scan CLI |
 | `omniseed_monster_signals`   | the exact CKS OFI vs the labelled+discounted proxy, on-chain signs and staleness, social attention/bias, the high- vs low-impact blackout, pack CSV round-trip, the timestamp-aligned cross-asset matrix, and the scanner wiring the blackout into the engine-facing veto |
+| `omniseed_strategy_zoo`      | the C++ zoo: all ten strategies present in oracle order, each in its declared regime fit, and on a chain-less bar each of the six M4 strategies **inactive with a non-empty reason** — including `gex_regime`'s distinctive `gex-neutral gex=0.00` neutral branch |
+| `omniseed_strategy_parity`   | **the C++↔Python oracle diff at 1e-9** across trend / chop / squeeze / vol × tracked-and-raw feeds: per-bar signal counts, then name, direction, confidence and the exact `reason` string for every signal, plus the nine sniper comparisons and the real feed when present |
 
 Run the board with `ctest --test-dir build -C Release`.
 
