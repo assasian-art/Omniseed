@@ -1030,6 +1030,20 @@ if(OMNISEED_BUILD_TESTS)
         set_tests_properties(omniseed_monster_chart PROPERTIES TIMEOUT 300)
     endif()
 
+    # §54 — nightly recalibration + corpus provenance (Phase 4.2/4.3).
+    # Pins the acceptance gate (chronological holdout Brier, worst case
+    # keep-old), the silence-is-not-an-outcome journal contract, and the
+    # corpus fingerprint. Stdlib-only, CI-visible.
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_nightly_refit
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nightly_refit.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_nightly_refit PROPERTIES TIMEOUT 300)
+    endif()
+
     # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper
     # log-mel filterbank is built for 16 kHz; before the fix a 48 kHz file
     # produced a spectrogram whose bins meant something else, SILENTLY. This

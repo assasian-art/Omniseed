@@ -175,7 +175,7 @@ def chart_signals(bars, i, lookback=20):
                 ll = bj[2] if ll is None else min(ll, bj[2])
             if hh is not None and ll is not None:
                 # the reason reports the bars ACTUALLY scanned, not the
-                # nominal lookback — "20dbar-high" over 10 existing bars
+                # nominal lookback — "20bar-high" over 10 existing bars
                 # would overstate the channel's depth.
                 if c > hh:
                     sig = StrategySignal(

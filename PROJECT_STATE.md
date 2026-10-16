@@ -5386,3 +5386,93 @@ config field (TypeError-guarded like the rest).
 defect under CPU starvation (fixed, RUN_SERIAL), and Phase 2's two missing
 capabilities — time-lag lead-lag and cross-exchange funding — are now built,
 fail-closed, and pinned.
+
+## 53. PHASE 3 — the chart reader, and what the modality audit actually said (2026-10-16)
+
+A re-audit of Phase 3 against the tree changed the shape of the work: most of
+"multi-modal" already exists and the two genuinely missing halves are
+DATA-blocked or DESIGN-blocked, not code-blocked.
+
+### 53.1 What the audit found (evidence, not vibes)
+
+- **vision extractor EXISTS** — MobileNetV4 VisionEncoder + 768-wide projector
+  (`models/vision-proj.gguf`), MultimodalBridge vision→tokens→h[E], dump mode
+  wired. `vision.scene`/`vision.anomaly` are **INSUFFICIENT-DATA** (no images
+  in tree; CIFAR fetch abandoned, retried 2026-10-16, host unreachable —
+  recorded in state/blocked.md, not papered over).
+- **audio pipeline EXISTS** — FocalCodec is the only audio→E path by design
+  (the mel codec is REFUSED with a written reason: Whisper has no E
+  projection; the refusal message names the missing adapter). `audio.emotion`
+  is FITTED (§44b). `audio.wake`/`audio.speaker` are **deliberately
+  enrollment-based** — `tools/get_modality_data.py` documents why a
+  third-party speaker head misses the point ("the whole point of a speaker
+  head is that it keys on YOUR voice"), and `omniseed enroll-audio` +
+  `WakeWordDetector::enroll` are that path. NOT gaps to close by fitting
+  strangers' voices.
+- **UnifiedPipeline wiring EXISTS** — vision/audio reach h[E] upstream via
+  MultimodalBridge; `run(hidden)` consumes the same h[E] for every head.
+- **chart reading was MISSING** — built this session (§53.2).
+
+### 53.2 The chart reader (Phase 3.1, chart path)
+
+`tools/monster/chart_reader.py`: six candlestick verdicts (engulfing, hammer/
+shooting-star, marubozu, doji, inside-bar compression, channel breakout),
+each a `StrategySignal` so the router/factory/veto chain applies unchanged.
+Parity-safe by construction: NOT in `strategies.all_signals` (the 10-signal
+oracle order is pinned at 1e-9 by `omniseed_strategy_parity`), and it never
+amplifies S. The tests found two real defects during development — an
+unbounded `bars[i-1]` read (IndexError at out-of-range i) and a breakout
+reason that claimed the nominal lookback instead of the bars actually
+scanned — both fixed and pinned. `omniseed_monster_chart` **32/32**.
+
+**The one-line result:** chart reading is built and pinned; vision/audio are
+where the audit said they were — extractors live, two heads await data, two
+heads await the owner's own voice, and every one of those facts is written
+down where it cannot drift.
+
+## 54. PHASE 4 — the loop that re-fits (within what the record can support) (2026-10-16)
+
+`docs/FEEDBACK.md` §9 said "The runtime never trains... nothing re-fits."
+§54 closes the half of that gap the DATA can honestly support, and names the
+half it cannot.
+
+### 54.1 What the journal can and cannot re-fit
+
+The feedback journal records `(confidence, predicted, realised)` for
+COMMITTED rows — not h[E] inputs. Without inputs, softmax weights cannot be
+re-fit, and a tool that pretended otherwise would be the fabrication this
+project keeps refusing. What the pairs DO support is **recalibration**: is
+"confidence 0.8" on this task family actually right 80% of the time?
+
+### 54.2 `tools/nightly_refit.py`
+
+- **Isotonic (PAVA) confidence→accuracy map** per pass, binned on train,
+  applied by nearest-bin on holdout.
+- **The acceptance gate is the whole design**: the holdout is the LAST
+  slice (chronological, never shuffled — a random split would leak the
+  future, the same look-ahead discipline the trading layer enforces), the
+  metric is Brier vs the IDENTITY map, and the map is written ONLY on a
+  real improvement. Worst case: `keep-old`, previous map untouched
+  (atomic tmp+os.replace).
+- **Silence is not an outcome** (FEEDBACK.md's own contract): held/implicit
+  rows never score; malformed rows are skipped, never guessed.
+- **Corpus provenance** (`digest_files`/`corpus_fingerprint`): every
+  accepted map embeds sha256 digests of the corpus tree, so a calibration
+  fitted on last month's corpus is VISIBLE as stale rather than assumed
+  fresh. Fail-closed: < min_n(30) committed pairs -> `insufficient`, no file.
+
+### 54.3 Verification
+
+`tests/test_nightly_refit.py` — **20/20**, registered `omniseed_nightly_refit`:
+PAVA against hand-computed pools, the keep-old gate in both directions
+(well-calibrated stays untouched; overconfident 0.9-but-50% IS recalibrated
+with the holdout numbers proving it), the chronological split, the
+journal-contract checks, the fail-closed file write, and the corpus-fingerprint
+drift. Two real defects the tests caught during development: a `\r`-polluted
+last column on Windows text-mode writes (now `rstrip("\r\n")`) and dead code
+in the isotonic expansion.
+
+**The one-line result:** the nightly loop now re-fits what the record can
+support, gates every write on beating the identity map on a chronological
+holdout, and stamps corpus provenance — while the softmax-weight half of
+"self-refit" stays openly open in FEEDBACK.md §9.

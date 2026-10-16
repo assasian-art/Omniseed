@@ -140,7 +140,7 @@ def test_breakout_no_lookahead():
     s = sigs_at(bars, 10)["chart.breakout"]
     check("a close above the prior channel fires +", s.direction == 1.0)
     check("the reason names the channel with the bars ACTUALLY scanned",
-          "10dbar-high 110.00" in s.reason, s.reason)
+          "above 10bar-high 110.00" in s.reason, s.reason)
     # the CURRENT bar's high must NOT be the channel (self-inclusion)
     bars2 = [bar(100 + i, 101 + i, 99 + i, 100.5 + i) for i in range(10)]
     bars2.append(bar(110, 130, 109, 105))        # spikes to 130 but CLOSES low

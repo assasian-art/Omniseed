@@ -318,6 +318,25 @@ or random** — every count in the log is a deterministic function of the inputs
 which is what makes the log diffable night to night. The single non-deterministic
 field is `generated_ms`.
 
+### The nightly recalibration pass (§54)
+
+Pairs with the dream log as the other scheduled job:
+
+```bash
+python tools/nightly_refit.py                        # journal -> state/calibration_map.json
+python tools/nightly_refit.py --min-n 50             # stricter data bar
+python tools/nightly_refit.py --corpus models/corpus # embed corpus fingerprint
+```
+
+It reads `state/feedback_journal.tsv` (committed+realised rows only — held
+rows never score), fits an isotonic confidence→accuracy map, and writes
+`state/calibration_map.json` **only** when the map beats the identity map on a
+chronological-holdout Brier score. The worst case is `keep-old`: the previous
+map is left untouched (atomic tmp+`os.replace`). Below `--min-n` committed
+pairs it refuses and writes nothing. Schedule it exactly like `omniseed
+dream --nightly` (Task Scheduler / cron); exit code is 0 on a clean pass
+including a legitimate keep-old.
+
 ---
 
 ## 5. The unified pipeline (library API)

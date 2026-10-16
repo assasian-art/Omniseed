@@ -270,9 +270,14 @@ against `metrics.tsv`.
   calls `FeedbackHook`. The only caller is `demo-feedback`. This is the same
   recurring gap §30–§37 each ended with: the capability and its evidence exist,
   the consumer does not.
-- **The runtime never trains.** `to_tsv()` makes re-fitting *possible*; nothing
-  re-fits. `tools/train_heads.py` is still the only thing that writes a `.bin`,
-  and it reads its own fixtures, not this journal.
+- ~~**The runtime never trains.**~~ **Bounded partial close (§54):**
+  `tools/nightly_refit.py` now re-fits *what the journal can support* — a
+  monotone confidence→accuracy calibration (isotonic/PAVA) per task family —
+  accepted ONLY on a chronological-holdout Brier improvement (worst case
+  `keep-old`), with the corpus fingerprint embedded so a stale map is visible.
+  Softmax weights still cannot be re-fit from the journal, because it records
+  (confidence, predicted, realised), not h[E] inputs; that half of "self-refit"
+  remains open and is *not claimed*.
 - **The fitted head is well-calibrated AND weak.** Accuracy 0.2439, ECE 0.0555.
   The two are independent, and calibration makes a weak head **safe**, not good.
   Nothing here changes that, and `CLOSE` / `HEDGE` still have zero holdout
