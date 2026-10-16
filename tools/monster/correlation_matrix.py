@@ -13,6 +13,7 @@
 # =============================================================================
 """Rolling cross-asset correlation + lead-lag confirmation."""
 
+import math
 from dataclasses import dataclass, field
 
 from . import features as F
@@ -38,6 +39,26 @@ class PairResult:
     active: bool = False
     confirming: bool = False
     invalidating: bool = False
+    note: str = ""
+
+
+@dataclass
+class LagResult:
+    """Best-lag correlation for one (driver, responder) pair.
+
+    `lag > 0`  -> the driver leads (driver[t-lag] matches responder[t]).
+    `lag < 0`  -> the responder leads — the assumed direction was wrong.
+    `lag == 0` -> co-instant; no temporal ordering is measurable.
+    `leader` is EMPTY below the linkage floor: naming a leader at r=0.05
+    would be the same class of mistake as promoting a noisy backtest.
+    """
+    driver: str = ""
+    responder: str = ""
+    lag: int = 0
+    corr: float = float("nan")
+    corr0: float = float("nan")
+    n: int = 0
+    leader: str = ""
     note: str = ""
 
 
@@ -104,6 +125,87 @@ class CorrelationMatrix:
         if da <= 0 or db <= 0:
             return 0.0
         return num / (da * db) ** 0.5
+
+    # -- time-lag detection (§48 / Phase 2.3) ------------------------------
+    #
+    # `evaluate` answers "is the complex coherent RIGHT NOW".  This answers a
+    # different question: "does the driver actually MOVE FIRST, and by how
+    # many bars?"  Rolling correlation at lag 0 cannot tell a leader from a
+    # follower — both look like r ≈ 1 — so a lead-lag claim needs a lag scan.
+    #
+    # Convention: lag k > 0 means the DRIVER leads, i.e. driver[t-k] lines up
+    # with responder[t].  NO LOOK-AHEAD: for lag k the driver window ends at
+    # i-k and the responder window ends at i, so the scan never reads past
+    # the evaluation bar in either series.
+    def lag_scan(self, driver_returns, responder_returns, i, max_lag=5):
+        """-> LagResult: best |corr| over lags -max_lag..max_lag.
+
+        The scan is deliberately symmetric: a negative best lag means the
+        responder leads the driver, which is the honest reading when the
+        assumed direction of information flow is wrong.
+        """
+        max_lag = int(max_lag)
+        w = self.window
+        best = None            # (|corr|, -|lag|, lag, corr)
+        corr0 = None
+        n = 0
+        for k in range(-max_lag, max_lag + 1):
+            # BOTH windows must end at or before i (no look-ahead):
+            #   k >= 0: driver[t-k] vs responder[t]  -> driver ends early
+            #   k <  0: driver[t]   vs responder[t-|k|] -> responder ends early
+            if k >= 0:
+                r = self._rolling_corr(driver_returns, responder_returns,
+                                       i - k, i)
+            else:
+                r = self._rolling_corr(driver_returns, responder_returns,
+                                       i, i + k)
+            if r is None:
+                continue
+            if k == 0:
+                corr0 = r
+            cand = (abs(r), -abs(k), k, r)
+            if best is None or cand > best:
+                best = cand
+            n += 1
+        if best is None:
+            return LagResult(lag=0, corr=float("nan"),
+                             corr0=float("nan"), n=0)
+        _, _, k, r = best
+        return LagResult(lag=k, corr=r,
+                         corr0=corr0 if corr0 is not None else float("nan"),
+                         n=n)
+
+    def lead_lag(self, driver, responder, rets_by_symbol, i, max_lag=5,
+                 min_corr=0.20):
+        """Name the leader for one pair at bar `i`.
+
+        Fails closed: below `min_corr` there is no measurable linkage and the
+        leader is left EMPTY rather than guessed.  Naming a leader at r=0.05
+        would be the same class of mistake as promoting a noisy backtest.
+        """
+        if driver not in rets_by_symbol or responder not in rets_by_symbol:
+            return LagResult(driver=driver, responder=responder,
+                             lag=0, corr=float("nan"), corr0=float("nan"),
+                             n=0, note="no-data")
+        lr = self.lag_scan(rets_by_symbol[driver], rets_by_symbol[responder],
+                           i, max_lag=max_lag)
+        lr.driver, lr.responder = driver, responder
+        if lr.n == 0 or not math.isfinite(lr.corr):
+            lr.note = "insufficient-history"
+            return lr
+        if abs(lr.corr) < min_corr:
+            lr.note = "no-linkage"
+            return lr
+        if lr.lag > 0:
+            lr.leader = driver
+        elif lr.lag < 0:
+            lr.leader = responder
+        else:
+            lr.leader = "coincident"
+        lr.note = ("driver-leads-by-%d" % lr.lag if lr.lag > 0 else
+                   "responder-leads-by-%d" % (-lr.lag) if lr.lag < 0 else
+                   "co-instant")
+        return lr
 
     # -- lead-lag evaluation ----------------------------------------------
     def evaluate(self, target, direction, rets_by_symbol, i, idx_by_symbol=None):

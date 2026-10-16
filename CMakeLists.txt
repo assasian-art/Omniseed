@@ -1008,7 +1008,11 @@ if(OMNISEED_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         # Generous: half B re-runs A/B/D/E (four fits each) twice — v1 and
         # balanced — plus Track F's non-linear probe (~6 fits) on its own.
-        set_tests_properties(omniseed_edge_tracks_gate PROPERTIES TIMEOUT 1200)
+        # RUN_SERIAL (§52): measured 328 s alone but > 1200 s when starved by
+        # omniseed_lora_i8 under -j4 — the regen is CPU-bound numpy fits, so
+        # it must not compete for cores with the board's heaviest C++ suite.
+        set_tests_properties(omniseed_edge_tracks_gate PROPERTIES
+                             TIMEOUT 2400 RUN_SERIAL TRUE)
     endif()
 
     # §42 — the audio resample contract. RAVDESS ships 48 kHz while the Whisper

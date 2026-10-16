@@ -5320,3 +5320,69 @@ wired rather than decorative.
 **The one-line result:** M4 is built on both sides of the language line, the six
 strategies fail closed on chain-less bars by construction, and the two oracles
 agree to 1e-9 including their reason strings.
+
+## 52. PHASE-1 VALIDATION + PHASE-2 CLOSURE — the board's one red test, and two real additions (2026-10-16)
+
+Phase 1 of the master plan (validate, don't rebuild) plus the two Phase-2
+items that were genuinely missing after §48.
+
+### 52.1 The board: 46/47 was a starvation artefact, and the config had a latent defect
+
+`ctest -LE slow -j4` reported **47 tests, 1 failed**: `omniseed_edge_tracks_gate
+(Timeout)`. Run alone the same test passes in **328 s**. The parallel board ran
+it alongside `omniseed_lora_i8` (1402 s of CPU-heavy C++), and the gate's
+numpy regen was starved past its 1200 s CTest timeout. The latent defect: the
+test's own subprocess timeout was **1800 s — larger than the 1200 s CTest
+budget**, so a starved run could never fail fast. Fixed in CMakeLists:
+`TIMEOUT 2400 RUN_SERIAL TRUE`. Everything else was green, including
+`omniseed_strategy_parity` (M4 guard) and `omniseed_monster_strategies`.
+
+Phase 1 verdicts, each checked rather than assumed:
+**[1.2] M4** — parity 38/38 + `test_m4_w_vol_regression_guard` present (§51).
+**[1.3] trading action head** — the direction-prediction program is CLOSED
+(EDGE_RESEARCH §6.10): six pre-registered tracks, all four asks tried (12 hand
+features, multi-asset pooling, rank/quantile targets, a non-linear 64-unit
+probe), every one below the corrected 2×-majority bar with n≥30. Nothing
+adopted; nothing to fix — the heads' job is calibrated abstention, and they do
+it (0 of 369 rows committed).
+**[1.4] known bugs** — §4's open items are long-horizon work (FocalCodec
+codebooks, MinGW untested), not defects; nothing new found.
+
+### 52.2 Time-lag lead-lag detection (Phase 2.3)
+
+`CorrelationMatrix.lag_scan` / `lead_lag` (`tools/monster/correlation_matrix.py`)
+— the lag-0 correlation cannot distinguish leader from follower, so the scan
+correlates `driver[t-k]` vs `responder[t]` over `k ∈ -max_lag..max_lag` with
+**both windows ending at or before the evaluation bar**. The first cut anchored
+only the driver window (negative k read the driver past `i`) — the bounds check
+rejected those lags, the reversed-pair test caught it, and the scan now anchors
+the *responder* early for k<0. Symmetric by construction: a wrong assumed
+direction of information flow comes back as a negative lag and the responder
+is named leader. Below `min_corr=0.20` **no leader is named** (`no-linkage`);
+missing data is `no-data`; short history is `insufficient-history`. Pinned by
+9 new checks incl. exact-corr recovery of an injected 2-bar lead and the
+prefix-invariance (no-look-ahead) proof.
+
+### 52.3 Cross-exchange funding comparison (Phase 2.2)
+
+`funding.cross_exchange(quotes, cfg)` + `VenueSpread` — groups quotes by
+symbol, compares named venues on NET apr, reports best/worst venue and the
+per-period rate gap. Fail-closed three ways: unattributable (empty-exchange)
+quotes produce **nothing** (two quotes I cannot attribute is not two venues);
+one venue is not a spread; a candidate requires the best leg to pass its
+ordinary `evaluate()` verdict — a wide spread whose best leg is basis-shocked
+is **information, never action**. Candidates carry `dual-venue-ops` (running
+both legs doubles withdrawal/margin surface). New `min_venue_spread_apr=0.02`
+config field (TypeError-guarded like the rest).
+
+### 52.4 Verification
+
+- `tests/test_monster_funding.py` — **64/64** (12 new cross-exchange checks).
+- `tests/test_monster_signals.py` — **80/80** (9 new lead-lag checks).
+- Full board re-run pending at commit time was already 46/47 with the one
+  failure explained and fixed above; the two touched suites are green directly.
+
+**The one-line result:** the board's single red test was a CMake timeout
+defect under CPU starvation (fixed, RUN_SERIAL), and Phase 2's two missing
+capabilities — time-lag lead-lag and cross-exchange funding — are now built,
+fail-closed, and pinned.

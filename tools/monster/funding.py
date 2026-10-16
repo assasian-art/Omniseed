@@ -93,6 +93,8 @@ class FundingConfig:
     min_rate_bps: float = 0.5       # below this the carry is not worth the ops
     flip_lookback: int = 21         # settlements inspected for sign flips
     max_spot_spread_bps: float = 50.0
+    min_venue_spread_apr: float = 0.02   # cross-exchange: 2% net gap to call
+                                         # it a candidate rather than noise
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -259,6 +261,100 @@ def scan(quotes, cfg=None):
 
 def takeable(trades):
     return [t for t in trades if not t.blocked]
+
+
+# ---------------------------------------------------------------------------
+# cross-exchange comparison (Phase 2.2)
+# ---------------------------------------------------------------------------
+class VenueSpread:
+    """One symbol's venue-to-venue disagreement, in NET apr terms.
+
+    The same perpetual on two exchanges is the same trade with two prices:
+    the funding rate differs, so the carry does too. The spread is the
+    information; the ACTION (which venue, which side) comes from the
+    ordinary evaluate() verdict on each venue. A symbol quoted without a
+    venue name cannot be compared at all and is skipped, because
+    "two quotes I cannot attribute" is not "two venues".
+    """
+
+    __slots__ = ("symbol", "venues", "best_exchange", "best_net_apr",
+                 "best_direction", "worst_exchange", "worst_net_apr",
+                 "net_spread_apr", "rate_gap_bps", "candidate", "risks")
+
+    def __init__(self, symbol, venues, best_exchange, best_net_apr,
+                 best_direction, worst_exchange, worst_net_apr,
+                 net_spread_apr, rate_gap_bps, candidate, risks):
+        self.symbol = symbol
+        self.venues = venues
+        self.best_exchange = best_exchange
+        self.best_net_apr = best_net_apr
+        self.best_direction = best_direction
+        self.worst_exchange = worst_exchange
+        self.worst_net_apr = worst_net_apr
+        self.net_spread_apr = net_spread_apr
+        self.rate_gap_bps = rate_gap_bps
+        self.candidate = candidate
+        self.risks = risks
+
+    def detail(self):
+        return ("%s %d venues best=%s net=%.2f%% vs worst=%s net=%.2f%% "
+                "spread=%.2f%% %s"
+                % (self.symbol, self.venues, self.best_exchange,
+                   self.best_net_apr * 100, self.worst_exchange,
+                   self.worst_net_apr * 100, self.net_spread_apr * 100,
+                   ("CANDIDATE" if self.candidate else "info-only")))
+
+    def __repr__(self):
+        return "VenueSpread(%s)" % self.detail()
+
+
+def cross_exchange(quotes, cfg=None):
+    """Compare venues for the same symbol -> [VenueSpread], widest first.
+
+    FAIL-CLOSED in three places, each of which has bitten real desks:
+
+    * a symbol with NO venue names produces nothing (unattributable quotes
+      cannot establish that two venues disagree);
+    * a symbol on one venue produces nothing (a spread needs two numbers);
+    * the candidate flag requires the BEST venue to be takeable on its own
+      ordinary verdict — a wide spread whose best leg is basis-shocked or
+      below-hurdle is information, not an action.
+
+    Running carry on BOTH legs of a wide spread doubles the operational
+    surface (two venues' withdrawal risk, two margin books), so
+    `dual-venue-ops` is flagged on every candidate rather than assumed away.
+    """
+    cfg = cfg or FundingConfig()
+    by_symbol = {}
+    for q in quotes:
+        if not (q.exchange or "").strip():
+            continue                       # unattributable -> no comparison
+        by_symbol.setdefault(q.symbol, {}).setdefault(q.exchange, q)
+
+    out = []
+    for sym, venues in sorted(by_symbol.items()):
+        if len(venues) < 2:
+            continue                       # one venue is not a spread
+        trades = [(ex, evaluate(q, cfg)) for ex, q in venues.items()]
+        trades.sort(key=lambda t: -t[1].net_apr)
+        (best_ex, best), (worst_ex, worst) = trades[0], trades[-1]
+        rates_bps = [q.rate * 10000.0 for q in venues.values()]
+        gap = max(rates_bps) - min(rates_bps)
+
+        risks = []
+        candidate = (not best.blocked) and \
+            (best.net_apr - worst.net_apr) >= cfg.min_venue_spread_apr
+        if candidate:
+            risks.append("dual-venue-ops")
+        if gap < cfg.min_rate_bps:
+            risks.append("venues-agree")
+
+        out.append(VenueSpread(
+            sym, len(venues), best_ex, best.net_apr, best.direction,
+            worst_ex, worst.net_apr, best.net_apr - worst.net_apr,
+            gap, candidate, risks))
+    out.sort(key=lambda v: (-v.candidate, -v.net_spread_apr))
+    return out
 
 
 def load_quotes_csv(path, interval_hours=8.0):

@@ -419,6 +419,15 @@ The test suite's worked example: a memecoin showing 21.90% gross is blocked
 that nets 2.22%. Delta-neutral is not risk-free; the flags are listed in the
 design doc §7.
 
+`cross_exchange(quotes, cfg)` adds the venue dimension (Phase 2.2): quotes are
+grouped by symbol, only **named** venues count (unattributable quotes cannot
+establish that two venues disagree), one venue is not a spread, and a symbol's
+row names the best/worst venue by NET apr plus the per-period rate gap. A
+spread ≥ `min_venue_spread_apr` (default 2 %) with a takeable best leg is a
+`candidate` — flagged `dual-venue-ops`, because running both legs doubles the
+withdrawal and margin surface. A wide spread whose best leg is itself blocked
+(basis-shock, below-hurdle) is reported as **information, never action**.
+
 ---
 
 ## 7. What is *not* here yet
@@ -495,6 +504,22 @@ The per-bar readings are mirrored to `state/monster/signals.csv`
 (`ts,onchain,social,depth,depth_source,blackout,coverage`), and `coverage`
 counts the live families — so **"no signal" and "no feed" are never confused**,
 which is the whole point of the layer.
+
+### Time-lag lead-lag detection (Phase 2.3)
+
+`CorrelationMatrix.lag_scan` / `lead_lag` answer the question the lag-0
+correlation cannot: *does the driver actually move first, and by how many
+bars?* The scan correlates `driver[t-k]` against `responder[t]` for
+`k ∈ -max_lag..max_lag` with **both windows ending at or before the evaluation
+bar** (a negative lag anchors the responder's window early instead of reading
+the driver past `i` — the first cut did the latter and the bounds check
+rejected it, which is how the look-ahead was caught). A positive best lag names
+the driver as leader, a negative one names the responder — the scan is
+symmetric, so a wrong assumed direction of information flow is *reported*, not
+papered over. Below `min_corr` (default 0.20) **no leader is named at all**:
+naming a leader at r=0.05 would be the same class of mistake as promoting a
+noisy backtest. Pinned in `tests/test_monster_signals.py::test_lead_lag`,
+including the prefix-invariance (no-look-ahead) proof.
 
 ### The cross-asset time-alignment fix (§48)
 

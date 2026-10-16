@@ -266,6 +266,84 @@ def test_no_guarantee_language():
           "found guarantee language on a BasisTrade")
 
 
+def test_cross_exchange():
+    print("\n[cross-exchange comparison]")
+    # carry-desk cfg: the default 10% net hurdle would block the documented
+    # worked example (net 2.22%); a 2% hurdle is what makes it takeable, and
+    # the point of the test is the SPREAD logic, not the hurdle.
+    cfg = FD.FundingConfig(hurdle_apr=0.02)
+    # same symbol, two venues, both otherwise clean.
+    # worked example: venue A 0.012%/8h -> net 2.22%; venue B 0.003%/8h.
+    qa = FD.FundingQuote("BTCUSDT", 0.00012, 8.0, "Binance",
+                         65000, 65010, 1.0, 2.0)
+    qb = FD.FundingQuote("BTCUSDT", 0.00003, 8.0, "Bybit",
+                         65000, 65010, 1.0, 2.0)
+    vs = FD.cross_exchange([qa, qb], cfg)
+    check("two named venues produce one spread row", len(vs) == 1,
+          str(len(vs)))
+    if vs:
+        v = vs[0]
+        check("the best venue is the high-rate one", v.best_exchange == "Binance")
+        check("the worst venue is the low-rate one",
+              v.worst_exchange == "Bybit")
+        check("net spread equals netA - netB (0.0986)",
+              abs(v.net_spread_apr - 0.09855) < 1e-9, "%.6f" % v.net_spread_apr)
+        # 0.012% = 1.2 bps, 0.003% = 0.3 bps -> gap 0.9 bps
+        check("rate gap is 0.9 bps", abs(v.rate_gap_bps - 0.9) < 1e-9,
+              str(v.rate_gap_bps))
+        check("a clean 9.9% net spread IS a candidate", v.candidate is True)
+        check("the candidate names the dual-venue operational risk",
+              "dual-venue-ops" in v.risks, str(v.risks))
+        check("best venue direction follows its funding sign",
+              v.best_direction == "short-perp", v.best_direction)
+
+    # one venue is not a spread
+    check("a single-venue symbol produces no row",
+          FD.cross_exchange([qa], cfg) == [])
+    # unattributable quotes cannot establish venue disagreement
+    qn = FD.FundingQuote("ETHUSDT", 0.00012, 8.0, "",
+                         3000, 3001, 1.0, 2.0)
+    qn2 = FD.FundingQuote("ETHUSDT", 0.0005, 8.0, "",
+                          3000, 3001, 1.0, 2.0)
+    check("quotes without venue names produce no comparison",
+          FD.cross_exchange([qn, qn2], cfg) == [])
+    # duplicate rows on ONE exchange are one venue, not two
+    qa2 = FD.FundingQuote("BTCUSDT", 0.00013, 8.0, "Binance",
+                          65000, 65010, 1.0, 2.0)
+    check("two quotes on the same exchange are ONE venue",
+          FD.cross_exchange([qa, qa2], cfg) == [])
+    # a wide spread whose BEST leg is blocked is information, not action
+    qbasis = FD.FundingQuote("SOLUSDT", 0.00012, 8.0, "Binance",
+                             150, 158, 1.0, 2.0)   # basis ~533bps > 300 cap
+    qbbad = FD.FundingQuote("SOLUSDT", 0.00003, 8.0, "Bybit",
+                            150, 150.5, 1.0, 2.0)  # net far below hurdle
+    vs2 = FD.cross_exchange([qbasis, qbbad], cfg)
+    check("a basis-shocked best leg still REPORTS the spread", len(vs2) == 1)
+    if vs2:
+        check("...but is not a candidate", vs2[0].candidate is False)
+        check("...and carries no dual-venue flag",
+              "dual-venue-ops" not in vs2[0].risks, str(vs2[0].risks))
+    # candidates sort before info-only rows
+    qs = FD.FundingQuote("ADAUSDT", 0.00012, 8.0, "Binance",
+                         0.4, 0.4, 1.0, 2.0)
+    qs2 = FD.FundingQuote("ADAUSDT", 0.00003, 8.0, "Bybit",
+                          0.4, 0.4, 1.0, 2.0)
+    rows = FD.cross_exchange([qbasis, qbbad, qs, qs2], cfg)
+    check("candidates sort before info-only rows",
+          len(rows) == 2 and rows[0].candidate and not rows[1].candidate,
+          str([r.symbol for r in rows]))
+    # a venues-agreeing pair is reported but flagged, not promoted
+    qag = FD.FundingQuote("XRPUSDT", 0.00012, 8.0, "Binance",
+                          0.5, 0.5, 1.0, 2.0)
+    qag2 = FD.FundingQuote("XRPUSDT", 0.000125, 8.0, "Bybit",
+                           0.5, 0.5, 1.0, 2.0)
+    vs3 = FD.cross_exchange([qag, qag2], cfg)
+    check("a 0.5bps venue gap is flagged venues-agree",
+          vs3 and "venues-agree" in vs3[0].risks,
+          str(vs3[0].risks if vs3 else None))
+    check("...and the spread is below the candidate floor",
+          vs3 and not vs3[0].candidate)
+
 def main():
     print("== monster funding ==")
     test_periods_and_annualization()
@@ -276,6 +354,7 @@ def main():
     test_memecoin_trap()
     test_scan_sorting_and_reader()
     test_no_guarantee_language()
+    test_cross_exchange()
     print(f"\nRESULT: {PASSED} passed, {FAILED} failed")
     for f in FAILURES:
         print(f"   - {f}")

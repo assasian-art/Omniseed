@@ -447,6 +447,73 @@ def test_scan_integration():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_lead_lag():
+    print("\n[time-lag lead-lag detection]")
+    cm = CM.CorrelationMatrix(window=20)
+    # deterministic pseudo-random walk (LCG) -> leader returns
+    x, s = [], 42
+    for _ in range(60):
+        s = (s * 1103515245 + 12345) % (2 ** 31)
+        x.append(((s >> 16) % 1000) / 1000.0 - 0.5)
+    # follower is the leader delayed by exactly 2 bars
+    y = [0.0, 0.0] + x[:-2]
+
+    lr = cm.lag_scan(x, y, 59, max_lag=5)
+    check("lag scan finds the injected 2-bar lead",
+          lr.lag == 2, "lag=%d corr=%.4f" % (lr.lag, lr.corr))
+    check("the matched corr is exact (copy, no noise)",
+          abs(lr.corr - 1.0) < 1e-9, "%.12f" % lr.corr)
+    check("co-instant corr is much lower (lag 0 cannot see the lead)",
+          abs(lr.corr0) < 1.0, "%.6f" % lr.corr0)
+
+    # the scan is SYMMETRIC: reading the pair the wrong way round must name
+    # the responder as leader rather than invent a positive lag
+    lr2 = cm.lag_scan(y, x, 59, max_lag=5)
+    check("the reversed pair yields the negative lag", lr2.lag == -2,
+          "lag=%d" % lr2.lag)
+
+    res = {"BTC": x, "ETH": y}
+    ll = cm.lead_lag("BTC", "ETH", res, 59, max_lag=5)
+    check("lead_lag names the DRIVER as leader when it leads",
+          ll.leader == "BTC", "%s (%s)" % (ll.leader, ll.note))
+    ll2 = cm.lead_lag("ETH", "BTC", res, 59, max_lag=5)
+    check("lead_lag names the RESPONDER as leader when it leads",
+          ll2.leader == "BTC", "%s (%s)" % (ll2.leader, ll2.note))
+
+    # coincident series: no temporal ordering is measurable
+    ll3 = cm.lead_lag("BTC", "BTC2", {"BTC": x, "BTC2": list(x)}, 59,
+                      max_lag=5)
+    check("identical series are reported co-instant",
+          ll3.leader == "coincident" and ll3.lag == 0,
+          "%s lag=%d" % (ll3.leader, ll3.lag))
+
+    # flat responder: zero variance -> no measurable linkage, leader EMPTY
+    flat = [0.0] * 60
+    ll4 = cm.lead_lag("BTC", "FLAT", {"BTC": x, "FLAT": flat}, 59, max_lag=5)
+    check("a flat series names NO leader (fail closed)",
+          ll4.leader == "" and ll4.note == "no-linkage",
+          "%r %r" % (ll4.leader, ll4.note))
+
+    # missing series
+    ll5 = cm.lead_lag("BTC", "GONE", {"BTC": x}, 59, max_lag=5)
+    check("a missing series is no-data, not a guess",
+          ll5.note == "no-data" and ll5.leader == "")
+
+    # insufficient history
+    ll6 = cm.lead_lag("BTC", "ETH", res, 10, max_lag=5)
+    check("insufficient history says so", ll6.note == "insufficient-history",
+          ll6.note)
+
+    # NO LOOK-AHEAD: scanning at bar i must be invariant to everything
+    # after bar i — recompute on the truncated series.
+    a = cm.lag_scan(x, y, 40, max_lag=5)
+    b = cm.lag_scan(x[:41], y[:41], 40, max_lag=5)
+    check("prefix invariance: the scan reads nothing after bar i",
+          a.lag == b.lag and abs(a.corr - b.corr) < 1e-12
+          and abs((a.corr0 if a.corr0 == a.corr0 else 0)
+                  - (b.corr0 if b.corr0 == b.corr0 else 0)) < 1e-12,
+          "a=(%d,%.6f) b=(%d,%.6f)" % (a.lag, a.corr, b.lag, b.corr))
+
 def main():
     print("== monster external signals ==")
     test_readers()
@@ -456,6 +523,7 @@ def main():
     test_calendar()
     test_commodities_and_pack()
     test_cross_alignment()
+    test_lead_lag()
     test_scan_integration()
     print(f"\nRESULT: {PASSED} passed, {FAILED} failed")
     for f in FAILURES:
