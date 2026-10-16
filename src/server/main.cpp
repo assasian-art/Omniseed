@@ -3,7 +3,8 @@
 //  Optional HTTP server (OMNISEED_HTTP). Vendored minimal socket loop —
 //  no external dependencies. Endpoints:
 //    GET  /               -> one-page HTML demo console (talks to /gen)
-//    GET  /health         -> {"ok":true,"model":bool,"peak_rss":MB}
+//    GET  /health         -> {"ok":true,"model":bool,"paused":bool,
+//                             "auth":bool,"peak_rss":MB}
 //    POST /ask            -> one agent turn (json body: {"task": "...",
 //                           "repeat_penalty": 1.2, "repeat_window": 64,
 //                           "stop": ["\\nUser:"], "stop_defaults": true,
@@ -17,6 +18,12 @@
 //                           audio/wav or application/octet-stream) or JSON
 //                           {"wav_b64": "..."}. Returns {"text": ..., 
 //                           "seconds": ...}; clean error on silence/too-short
+//    POST /control        -> {"action":"pause"|"resume"|"status"}; while
+//                           paused, /gen and /ask refuse with
+//                           {"error":"paused"}. In-flight generations finish.
+//    AUTH: when OMNISEED_API_TOKEN is set in the environment, every endpoint
+//    except / and /health requires `Authorization: Bearer <token>` (401
+//    otherwise; timing-safe compare). Unset = open (edge default).
 //                           audio (the mel trim leaves < 2 frames).
 //
 //  Assistant-behavior LoRA: attach a sidecar at startup with
@@ -37,8 +44,10 @@
 #include "omniseed/core/tensor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -242,6 +251,11 @@ const char* demo_page() {
            color:#fff; font:inherit; cursor:pointer; }
   button:disabled { background:#243247; cursor:wait; }
   .err { color:#ff8484; font-size:12px; margin:-8px 0 14px; }
+  #ctl { display:flex; gap:8px; margin:10px 0; }
+  #ctl input { flex:1; padding:8px 10px; border:1px solid #2a3a52;
+               border-radius:8px; background:#101a2b; color:#dbe4f3;
+               font:inherit; font-size:13px; }
+  #ctl button { padding:8px 14px; }
 </style>
 </head>
 <body>
@@ -255,9 +269,18 @@ const char* demo_page() {
   <input id="p" placeholder="Say something&hellip;" autofocus>
   <button id="b">Send</button>
 </form>
+<div id="ctl">
+  <input id="tok" type="password" placeholder="API token (if required)" autocomplete="off">
+  <button id="pause" type="button" title="pause/resume generation">&#9208;</button>
+</div>
 <script>
 const log = document.getElementById('log'), p = document.getElementById('p'),
-      b = document.getElementById('b'), health = document.getElementById('health');
+      b = document.getElementById('b'), health = document.getElementById('health'),
+      tok = document.getElementById('tok'), pauseBtn = document.getElementById('pause');
+function authHdr() {
+  // token kept in this page's memory only; sent as a Bearer header
+  return tok.value ? { 'Authorization': 'Bearer ' + tok.value } : {};
+}
 function add(cls, text) {
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
@@ -266,14 +289,36 @@ function add(cls, text) {
   log.scrollTop = log.scrollHeight;
   return d;
 }
+let serverPaused = false;
 async function checkHealth() {
   try {
     const h = await (await fetch('/health')).json();
+    serverPaused = !!h.paused;
+    pauseBtn.textContent = serverPaused ? '\u25B6' : '\u23F8';
     health.textContent = 'model: ' + (h.model ? 'loaded' : 'missing') +
+                         (h.auth ? ' | auth: on' : '') +
+                         (serverPaused ? ' | PAUSED' : '') +
                          ' | peak RSS: ' + h.peak_rss + ' MB';
   } catch { health.textContent = 'unreachable'; }
 }
 checkHealth(); setInterval(checkHealth, 30000);
+
+pauseBtn.addEventListener('click', async () => {
+  pauseBtn.disabled = true;
+  try {
+    const r = await fetch('/control', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHdr()),
+      body: JSON.stringify({ action: serverPaused ? 'resume' : 'pause' })
+    });
+    const j = await r.json();
+    if (j.error) add('bot', 'control: ' + j.error);
+    serverPaused = !!j.paused;
+    pauseBtn.textContent = serverPaused ? '\u25B6' : '\u23F8';
+  } catch (err) { add('bot err', 'control error: ' + err); }
+  pauseBtn.disabled = false;
+  checkHealth();
+});
 
 document.getElementById('f').addEventListener('submit', async e => {
   e.preventDefault();
@@ -286,7 +331,7 @@ document.getElementById('f').addEventListener('submit', async e => {
   try {
     const r = await fetch('/gen', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHdr()),
       body: JSON.stringify({ prompt: text })
     });
     const j = await r.json();
@@ -435,6 +480,72 @@ bool base64_decode(const std::string& in, std::string& out) {
         }
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// API auth + control (Phase 8): bearer-token gate and the pause toggle.
+//
+// Auth is OFF unless OMNISEED_API_TOKEN is set in the environment — an edge
+// box behind Render's network boundary keeps today's behavior exactly, and a
+// public deployment turns it on with one env var. The token is never logged
+// and never echoed. Protected: /ask /gen /asr /control. Open: / (console
+// HTML — it must load before it can ask for the token) and /health
+// (readiness probes must not need secrets).
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_server_paused{false};
+
+// Case-insensitive header value for `name`, or "" — same portable walk as
+// the Content-Length scan (no locale-dependent string ops).
+std::string header_value(const std::string& headers, const char* name) {
+    const size_t nlen = std::strlen(name);
+    for (size_t p = 0; p + nlen < headers.size(); ++p) {
+        bool hit = true;
+        for (size_t j = 0; j < nlen; ++j) {
+            if (std::tolower(static_cast<unsigned char>(headers[p + j])) !=
+                name[j]) { hit = false; break; }
+        }
+        if (!hit) continue;
+        // must be at line start (or request line — names here never collide)
+        if (p > 0 && headers[p - 1] != '\n') continue;
+        size_t v = p + nlen;
+        while (v < headers.size() && (headers[v] == ' ' || headers[v] == ':'))
+            ++v;
+        size_t e = headers.find('\r', v);
+        if (e == std::string::npos) e = headers.find('\n', v);
+        if (e == std::string::npos) e = headers.size();
+        return headers.substr(v, e - v);
+    }
+    return "";
+}
+
+// Timing-safe equality: XOR-accumulate over the FULL longer length so the
+// work done does not depend on where a mismatch occurs.
+bool token_equal(const std::string& a, const std::string& b) {
+    const size_t n = a.size() > b.size() ? a.size() : b.size();
+    unsigned char diff = static_cast<unsigned char>(a.size() ^ b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char ca = i < a.size()
+            ? static_cast<unsigned char>(a[i]) : 0u;
+        const unsigned char cb = i < b.size()
+            ? static_cast<unsigned char>(b[i]) : 0u;
+        diff = static_cast<unsigned char>(diff | (ca ^ cb));
+    }
+    return diff == 0;
+}
+
+// true when the request carries a valid `Authorization: Bearer <token>`.
+// An EMPTY configured token means auth is disabled (open by design).
+bool bearer_authorized(const std::string& headers,
+                       const std::string& configured) {
+    if (configured.empty()) return true;
+    const std::string auth = header_value(headers, "authorization");
+    static const char kBear[] = "bearer ";   // BOTH sides compared lowercased
+    if (auth.size() <= 7) return false;
+    for (size_t j = 0; j < 7; ++j) {
+        if (std::tolower(static_cast<unsigned char>(auth[j])) != kBear[j])
+            return false;
+    }
+    return token_equal(auth.substr(7), configured);
 }
 
 // Attach a LoRA sidecar to the model, or detach it. Returns true when a
@@ -609,6 +720,17 @@ int main(int argc, char** argv) {
         }
     }
 
+    // API token (Phase 8): read ONCE from the environment; never logged,
+    // never echoed. Empty = auth disabled (today's behavior, by design).
+    const char* tok_env = std::getenv("OMNISEED_API_TOKEN");
+    const std::string api_token = tok_env ? tok_env : "";
+    if (!api_token.empty())
+        platform::log_info("api token: SET — /ask /gen /asr /control now "
+                           "require Authorization: Bearer ...");
+    else
+        platform::log_info("api token: unset — endpoints open (set "
+                           "OMNISEED_API_TOKEN to require auth)");
+
     while (true) {
         Socket_t client = ::accept(listener, nullptr, nullptr);
         if (client == kInvalidSocket) continue;
@@ -632,6 +754,20 @@ int main(int argc, char** argv) {
             (sp1 == std::string::npos || sp2 == std::string::npos)
                 ? "" : req.substr(sp1 + 1, sp2 - sp1 - 1);
 
+        // ---- auth gate (Phase 8) ------------------------------------------
+        // / and /health stay open (the console must load before it can ask
+        // for the token; probes must not need secrets). Everything that
+        // computes or mutates is protected when a token is configured.
+        const bool is_open = (path == "/" || path == "/index.html" ||
+                              path == "/health");
+        if (!is_open && !bearer_authorized(req, api_token)) {
+            respond(client,
+                    "{\"error\":\"unauthorized\",\"hint\":\"Authorization: "
+                    "Bearer <OMNISEED_API_TOKEN>\"}");
+            close_socket(client);
+            continue;
+        }
+
         if (path == "/" || path == "/index.html") {
             respond(client, demo_page(), "text/html; charset=utf-8");
         } else if (path == "/health") {
@@ -644,6 +780,10 @@ int main(int argc, char** argv) {
                                  ? (server_whisper->decoder_loaded()
                                         ? "\"real\"" : "\"fallback\"")
                                  : "false") +
+                            ",\"auth\":" +
+                            (api_token.empty() ? "false" : "true") +
+                            ",\"paused\":" +
+                            (g_server_paused ? "true" : "false") +
                             ",\"decision_mode\":\"" +
                             decision_mode_name(cfg.decision_mode) + "\"" +
                             ",\"decision_head\":" +
@@ -655,7 +795,32 @@ int main(int argc, char** argv) {
                             std::to_string(platform::peak_rss_bytes() / 1048576) +
                             "}";
             respond(client, b);
+        } else if (path == "/control" && method == "POST") {
+            // The stop toggle (console + API): pause/refuse new generations
+            // WITHOUT killing the process — an in-flight generation finishes,
+            // new /gen and /ask requests get {"error":"paused"} until resume.
+            const std::string action = json_field(body, "action");
+            if (action == "pause") {
+                g_server_paused.store(true);
+                platform::log_info("server PAUSED via /control");
+            } else if (action == "resume") {
+                g_server_paused.store(false);
+                platform::log_info("server resumed via /control");
+            } else if (action != "status") {
+                respond(client,
+                        "{\"error\":\"unknown-action\",\"expected\":"
+                        "[\"pause\",\"resume\",\"status\"]}");
+                close_socket(client);
+                continue;
+            }
+            respond(client, std::string("{\"paused\":") +
+                            (g_server_paused ? "true" : "false") + "}");
         } else if (path == "/ask" && method == "POST" && have_model) {
+            if (g_server_paused.load()) {
+                respond(client, "{\"error\":\"paused\",\"paused\":true}");
+                close_socket(client);
+                continue;
+            }
             const std::string task = json_field(body, "task");
             // Optional per-request sampling overrides (Phase 13):
             //   "repeat_penalty": 1.2   (1.0 = off, >1 breaks text loops)
@@ -681,6 +846,11 @@ int main(int argc, char** argv) {
             b += "}";
             respond(client, b);
         } else if (path == "/gen" && method == "POST" && have_model) {
+            if (g_server_paused.load()) {
+                respond(client, "{\"error\":\"paused\",\"paused\":true}");
+                close_socket(client);
+                continue;
+            }
             const std::string prompt = json_field(body, "prompt");
             loop.set_sampling(json_num_field(body, "repeat_penalty", 1.0f),
                               static_cast<int32_t>(

@@ -82,10 +82,22 @@ Options: `--model PATH`, `--prompt TEXT`, `--max-tokens N`, `--quiet`.
 
 | Endpoint | Method | Body | Result |
 |---|---|---|---|
-| `/health` | GET | — | `{"ok":true,"model":true,"assistant_lora":false,"peak_rss":42}` |
+| `/health` | GET | — | `{"ok":true,"model":true,"assistant_lora":false,"auth":false,"paused":false,"peak_rss":42}` |
 | `/ask` | POST | `{"task":"what is 2+2","repeat_penalty":1.2,"repeat_window":64,"stop":["\\nUser:"],"stop_defaults":true}` | `{"reply":"..."}` |
 | `/gen` | POST | `{"prompt":"hello","repeat_penalty":1.2,"repeat_window":64,"stop":["\\nUser:"],"stop_defaults":true}` | `{"text":"..."}` |
 | `/asr` | POST | raw 16 kHz mono 16-bit WAV bytes, or `{"wav_b64":"<base64>"}` | `{"text":"<|0.00|> ...<|4.00|>","seconds":4.3}`; `{"error":"..."}` on silence/noise/too-short clips |
+| `/control` | POST | `{"action":"pause"\|"resume"\|"status"}` | `{"paused":true}` — while paused, `/gen` and `/ask` refuse with `{"error":"paused"}`; in-flight generations finish |
+
+**API authentication (§55).** Set `OMNISEED_API_TOKEN` in the server's
+environment and every endpoint **except** `/` (the console must load before
+it can ask for the token) and `/health` (readiness probes must not need
+secrets) requires `Authorization: Bearer <token>`; anything else gets
+`{"error":"unauthorized"}` (401 semantics). The compare is timing-safe, the
+token is never logged or echoed, and `/health` reports `"auth":true` so a
+deployment can verify the gate is on. Unset = open — the default keeps the
+single-box edge deployment exactly as it was; a public deployment sets the
+one env var. The console has a token field (kept in page memory) and a
+pause/resume button wired to `/control`.
 
 **Stop strings (mirrors the CLI `--stop` / `--stop-defaults`):** decoding
 halts as soon as the decoded tail matches any `"stop": [...]` entry (the
