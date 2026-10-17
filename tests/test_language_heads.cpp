@@ -301,6 +301,43 @@ static void part_b_language() {
         // Bengali SCRIPT still wins over the romanised branch
         CHECK(c.classify("আমি ভালো আছি").language == Lang::Bn);
     }
+
+    TEST("C1 (T083): Hindi / Arabic / Chinese scripts are detected");
+    {
+        const IntentClassifier c;
+        CHECK(c.classify("\u0928\u092E\u0938\u094D\u0924\u0947 "
+                         "\u0926\u0941\u0928\u093F\u092F\u093E").language ==
+              Lang::Hi);
+        CHECK(std::string(lang_name(Lang::Hi)) == "hi");
+        CHECK(c.classify("\u0645\u0631\u062D\u0628\u0627 \u0628\u0627\u0644"
+                         "\u0639\u0627\u0644\u0645").language == Lang::Ar);
+        // Urdu shares the Arabic block — reported as "ar", NOT distinguished
+        // by script alone (documented honest limit in language_heads.h).
+        CHECK(c.classify("\u0627\u0646 \u0645\u06CC\u06BA \u062E\u0648"
+                         "\u0634 \u062D\u0627\u0644 \u06C1\u0648\u0646").language ==
+              Lang::Ar);
+        CHECK(c.classify("\u4F60\u597D\u4E16\u754C\u6211\u55E8\u544A\u8BC9"
+                         "\u4F60").language == Lang::Zh);
+        CHECK(std::string(lang_name(Lang::Zh)) == "zh");
+    }
+
+    TEST("C2 (T083): code-switching -> Mixed, borrowing -> dominant script");
+    {
+        const IntentClassifier c;
+        // balanced English + Chinese => code-switching, not one language
+        CHECK(c.classify("hello \u4E16\u754C bye \u518D"
+                         "\u89C1").language == Lang::Mixed);
+        // balanced English + Hindi => Mixed
+        CHECK(c.classify("hi \u0928\u092E\u0938\u094D\u0924\u0947").language ==
+              Lang::Mixed);
+        // a single foreign word below the 20% margin is borrowing:
+        // 9 English letters vs 2 CJK -> En (dominance rule preserved)
+        CHECK(c.classify("adventures in \u4E16\u754C").language == Lang::En);
+        // stats carry every block
+        const ScriptStats s = scan_utf8("\u0928\u092E\u0938\u094D\u0924\u0947"
+                                        "\u4E16\u754C\u0645\u0631\u062D\u0628\u0627");
+        CHECK(s.devanagari == 6 && s.cjk == 2 && s.arabic == 5);
+    }
 }
 
 // =============================================================================

@@ -43,7 +43,8 @@ namespace language {
 // script to see). Appended last so the numeric values of the original
 // members stay stable.
 // ---------------------------------------------------------------------------
-enum class Lang : int32_t { En = 0, Bn, Mixed, Unknown, BnRomanized, COUNT };
+enum class Lang : int32_t { En = 0, Bn, Mixed, Unknown, BnRomanized,
+                            Hi, Ar, Zh, COUNT };
 constexpr int32_t kLangCount = static_cast<int32_t>(Lang::COUNT);
 const char* lang_name(Lang l);
 
@@ -67,6 +68,11 @@ const char* intent_name(Intent i);
 struct ScriptStats {
     int32_t ascii_letters = 0;
     int32_t bengali       = 0;   // U+0980..U+09FF
+    int32_t devanagari    = 0;   // U+0900..U+097F (Hindi + Nepali, ...)
+    int32_t arabic        = 0;   // U+0600..U+06FF (+ presentation forms)
+                               // — Urdu shares this block; script alone
+                               // cannot tell them apart (honest limit).
+    int32_t cjk           = 0;   // U+4E00..U+9FFF (+ ext-A)
     int32_t digits        = 0;
     int32_t codepoints    = 0;
     int32_t invalid_bytes = 0;

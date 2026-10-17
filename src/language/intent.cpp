@@ -75,6 +75,16 @@ inline bool is_ascii_letter(int32_t cp) {
 }
 inline bool is_ascii_digit(int32_t cp) { return cp >= '0' && cp <= '9'; }
 inline bool is_bengali(int32_t cp)     { return cp >= 0x0980 && cp <= 0x09FF; }
+inline bool is_devanagari(int32_t cp)  { return cp >= 0x0900 && cp <= 0x097F; }
+inline bool is_arabic(int32_t cp) {  // Arabic + Urdu share this block (T083)
+    return (cp >= 0x0600 && cp <= 0x06FF) ||
+           (cp >= 0x0750 && cp <= 0x077F) ||
+           (cp >= 0x08A0 && cp <= 0x08FF) ||
+           (cp >= 0xFB50 && cp <= 0xFDFF) ||
+           (cp >= 0xFE70 && cp <= 0xFEFF);
+}
+inline bool is_cjk(int32_t cp)      { return (cp >= 0x4E00 && cp <= 0x9FFF) ||
+                                            (cp >= 0x3400 && cp <= 0x4DBF); }
 
 float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
@@ -265,6 +275,15 @@ ScriptStats scan_utf8(const std::string& text) {
             // Bengali digits U+09E6..U+09EF also count as digits.
             ++s.bengali;
             if (cp >= 0x09E6 && cp <= 0x09EF) ++s.digits;
+        } else if (is_devanagari(cp)) {          // T083 — Hindi + friends
+            ++s.devanagari;
+            if (cp >= 0x0966 && cp <= 0x096F) ++s.digits;
+        } else if (is_arabic(cp)) {              // T083 — Arabic/Urdu block
+            ++s.arabic;
+            if (cp >= 0x0660 && cp <= 0x0669) ++s.digits;
+            if (cp >= 0x06F0 && cp <= 0x06F9) ++s.digits;  // Eastern digits
+        } else if (is_cjk(cp)) {                 // T083 — Chinese
+            ++s.cjk;
         }
     }
     return s;
@@ -349,6 +368,10 @@ const char* lang_name(Lang l) {
         case Lang::Mixed:   return "mixed";
         case Lang::Unknown: return "unknown";
         case Lang::BnRomanized: return "bn-romanized";
+        case Lang::Hi:      return "hi";
+        // "ar" covers Urdu too — they share the Arabic block (header note).
+        case Lang::Ar:      return "ar";
+        case Lang::Zh:      return "zh";
         case Lang::COUNT:   break;
     }
     return "unknown";
@@ -375,15 +398,30 @@ const char* intent_name(Intent i) {
 namespace {
 
 Lang detect_lang(const ScriptStats& s) {
-    const int32_t a = s.ascii_letters;
-    const int32_t b = s.bengali;
-    if (a == 0 && b == 0) return Lang::Unknown;
-    if (a == 0) return Lang::Bn;
-    if (b == 0) return Lang::En;
-    const int32_t minority = a < b ? a : b;
-    const int32_t majority = a < b ? b : a;
-    // A minority script below 20% of the letters is treated as noise/borrowing.
-    if (minority * 5 <= majority) return a > b ? Lang::En : Lang::Bn;
+    // T083 — generalized to every registered script. Same rule as the original
+    // En/Bn pair: the script with the most letters wins UNLESS the runners-up
+    // together reach 20% of it (that is code-switching, i.e. Mixed).
+    struct E { int32_t n; Lang l; };
+    const E present[] = {
+        {s.ascii_letters, Lang::En},
+        {s.bengali,       Lang::Bn},
+        {s.devanagari,    Lang::Hi},
+        {s.arabic,        Lang::Ar},
+        {s.cjk,           Lang::Zh},
+    };
+    const E* top = nullptr;
+    int32_t top_n = 0, total = 0;
+    int count = 0;
+    for (const E& e : present) {
+        if (e.n <= 0) continue;
+        ++count;
+        total += e.n;
+        if (!top || e.n > top_n) { top = &e; top_n = e.n; }
+    }
+    if (count == 0) return Lang::Unknown;
+    if (count == 1) return top->l;
+    const int32_t others = total - top_n;
+    if (others * 5 <= top_n) return top->l;  // <20% => borrowing, not mixing
     return Lang::Mixed;
 }
 
