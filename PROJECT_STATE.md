@@ -524,6 +524,12 @@ file/console I/O. All work verified: Release build zero warnings (/W4),
 
 ## 4. UNRESOLVED ISSUES / BUGS
 
+> **2026-10-17 re-verification (T005/T006):** §4 re-read against the tree —
+> no actionable defect remains; the open items below are long-horizon work
+> (matching §52.1 [1.4]). Board evidence: `omniseed_monster_strategies`
+> 116/116 (incl. `test_m4_w_vol_regression_guard`), `omniseed_monster_signals`
+> + `omniseed_strategy_parity` green, `omniseed_edge_tracks_gate` green alone.
+
 - **Sense fallbacks largely retired**: whisper-tiny encoder + vision projection  
   load real weights (sidecars); remaining fallbacks are the whisper *decoder*  
   and FocalCodec codebooks (NEXT STEPS #2/#3).
