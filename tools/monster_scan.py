@@ -40,6 +40,7 @@ from monster import state_vector as SV                  # noqa: E402
 from monster import sniper_engine as SN                 # noqa: E402
 from monster import news_hunter as NH                   # noqa: E402
 from monster import correlation_matrix as CM            # noqa: E402
+from monster import funding as FD                       # noqa: E402
 from monster import signals as SG                       # noqa: E402
 
 DEFAULT_CSV_DIR = "models/market/paper"
@@ -254,6 +255,9 @@ def main():
     ap.add_argument("--commodities", default="",
                     help="ts,symbol,close CSV — commodity legs for the "
                          "cross-asset matrix")
+    ap.add_argument("--funding", default="",
+                    help="funding quotes CSV — non-directional carry panel "
+                         "(research only, never joins the directional scan)")
     a = ap.parse_args()
 
     try:
@@ -274,6 +278,23 @@ def main():
                        signals_out=(os.path.join(a.out_dir, "signals.csv")
                                     if a.signals else ""))
 
+    if a.funding:
+        # Fail-closed research panel: a missing/unreadable CSV is an explicit
+        # error, never an implicit empty opinion; the panel never touches the
+        # directional scan above.
+        try:
+            trades = FD.scan(FD.load_quotes_csv(a.funding))
+            keep = FD.takeable(trades)
+            summary["funding"] = {
+                "quotes": len(trades),
+                "takeable": len(keep),
+                "best_symbol": keep[0].symbol if keep else "",
+                "best_direction": keep[0].direction if keep else "",
+                "best_net_apr": keep[0].net_apr if keep else None,
+            }
+        except OSError as e:
+            summary["funding"] = {"error": str(e)}
+
     out = a.summary or os.path.join(a.out_dir, "summary.json")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -286,6 +307,17 @@ def main():
         print("[monster] signals %s | %d rows | %d blackouts"
               % (summary["signals"], summary.get("signal_rows", 0),
                  summary.get("signal_blackouts", 0)))
+    fp = summary.get("funding")
+    if fp is not None:
+        if "error" in fp:
+            print("[monster] funding error: %s" % fp["error"])
+        elif fp["takeable"]:
+            print("[monster] funding %d/%d takeable | best %s %s net_apr=%+.2f%%"
+                  % (fp["takeable"], fp["quotes"], fp["best_symbol"],
+                     fp["best_direction"], fp["best_net_apr"] * 100))
+        else:
+            print("[monster] funding 0/%d takeable (all blocked)"
+                  % fp["quotes"])
     for sym, s in summary["symbols"].items():
         if s.get("error"):
             print("[monster] %-10s %s" % (sym, s["error"]))
