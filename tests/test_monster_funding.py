@@ -344,6 +344,56 @@ def test_cross_exchange():
     check("...and the spread is below the candidate floor",
           vs3 and not vs3[0].candidate)
 
+def test_scan_cli_panel():
+    """monster_scan --funding: the research panel fails closed (T015b)."""
+    import json as _json
+    import subprocess
+    import tempfile
+
+    print("\n[scan CLI funding panel]")
+    with tempfile.TemporaryDirectory() as td:
+        csv_path = os.path.join(td, "funding.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("symbol,rate,exchange,spot_price,perp_price\n")
+            f.write("BTCUSDT,0.002,Binance,100,100\n")   # above hurdle
+            f.write("ETHUSDT,0.00001,Binance,100,100\n")  # rate-near-zero
+        out_dir = os.path.join(td, "out")
+        cmd = [sys.executable, os.path.join(ROOT, "tools", "monster_scan.py"),
+               "--watch", "crypto:XX", "--csv-dir", os.path.join(td, "no_bars"),
+               "--out-dir", out_dir, "--funding", csv_path]
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                           cwd=ROOT, timeout=180)
+        check("scan CLI exits 0 with a funding panel", p.returncode == 0,
+              (p.stderr or p.stdout)[-300:])
+        summary = os.path.join(out_dir, "summary.json")
+        fp = {}
+        if os.path.exists(summary):
+            with open(summary, "r", encoding="utf-8") as f:
+                fp = (_json.load(f) or {}).get("funding") or {}
+            check("summary carries the funding panel", "error" not in fp,
+                  str(fp))
+            check("both quotes counted", fp.get("quotes") == 2, str(fp))
+            check("only the healthy quote is takeable",
+                  fp.get("takeable") == 1, str(fp))
+            check("best leg named with direction",
+                  fp.get("best_symbol") == "BTCUSDT" and
+                  fp.get("best_direction") == "short-perp", str(fp))
+        else:
+            check("summary.json written", False, (p.stdout or "")[-300:])
+        # fail-closed: a missing CSV is an EXPLICIT error, never a silent zero
+        cmd2 = cmd[:-1] + [os.path.join(td, "missing.csv")]
+        p2 = subprocess.run(cmd2, capture_output=True, text=True, env=env,
+                            cwd=ROOT, timeout=180)
+        check("missing funding CSV still exits 0 (panel is non-fatal)",
+              p2.returncode == 0, (p2.stderr or p2.stdout)[-200:])
+        if os.path.exists(summary):
+            with open(summary, "r", encoding="utf-8") as f:
+                s2 = (_json.load(f) or {}).get("funding") or {}
+            check("missing CSV -> explicit error key, not an empty opinion",
+                  "error" in s2, str(s2))
+
+
 def main():
     print("== monster funding ==")
     test_periods_and_annualization()
@@ -355,6 +405,7 @@ def main():
     test_scan_sorting_and_reader()
     test_no_guarantee_language()
     test_cross_exchange()
+    test_scan_cli_panel()
     print(f"\nRESULT: {PASSED} passed, {FAILED} failed")
     for f in FAILURES:
         print(f"   - {f}")
