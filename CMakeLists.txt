@@ -133,6 +133,9 @@ set(OMNISEED_CORE_SOURCES
     src/trading/strategy_zoo.cpp
     src/trading/router.cpp
     src/trading/sniper.cpp
+    # LEVEL-2 routing (T072): which specialist action space owns this bar.
+    # Default OFF (enable=false) => pre-T072 bit-parity, the w_vol pattern.
+    src/trading/sub_router.cpp
     src/runtime/introspection.cpp
     src/runtime/cloud_bridge.cpp
     src/agent/sub_agents.cpp
@@ -422,6 +425,21 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_market_perception COMMAND omniseed_market_perception
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_market_perception PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # LEVEL-2 routing (T072): specialist slot table + default-off parity guard.
+    add_executable(omniseed_sub_router tests/test_sub_router.cpp)
+    target_include_directories(omniseed_sub_router PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_sub_router PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_sub_router PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_sub_router PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_sub_router COMMAND omniseed_sub_router
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_sub_router PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Multi-asset paper session (M5): merged-timeline replay over several
     # streams sharing one cash account + one daily/weekly kill-switch, with
