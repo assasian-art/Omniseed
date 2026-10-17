@@ -371,6 +371,27 @@ def load_corpus(path):
     return pairs
 
 
+def refuse_uncovered(pairs, tok):
+    """T082 — bilingual corpus GUARD (fail-closed).
+
+    A pair whose text does NOT roundtrip through the vocab would train the
+    adapter to emit U+FFFD replacement garbage. Measured 2026-10-17: the world
+    vocab covers SOME Bengali characters exactly (U+09AE, U+09BF, U+09B2,
+    U+09BE) but NOT others (U+0986, U+09AD encode to a token that decodes to
+    FFFD), so native-Bengali corruption is SILENT per-word. Romanised
+    (ASCII) Bengali roundtrips exactly — that is the honest bilingual path
+    until the vocab is extended. Returns the offending (index, text) list;
+    empty == corpus is trainable.
+    """
+    bad = []
+    for i, (u, r) in enumerate(pairs, 1):
+        for txt in (u, r):
+            if txt and tok.decode(tok.encode(txt)) != txt:
+                bad.append((i, txt))
+                break
+    return bad
+
+
 FETCH_DEFAULT_PAIRS = 3000
 _FETCH_URL = ('https://datasets-server.huggingface.co/rows'
               '?dataset=databricks%2Fdatabricks-dolly-15k'
@@ -626,6 +647,14 @@ def main():
     if not pairs:
         raise SystemExit('[lora] FATAL: 0 usable chat pairs — refusing to '
                          'train on an empty corpus')
+    uncovered = refuse_uncovered(pairs, tok)
+    if uncovered:
+        show = '; '.join('line %d: %r' % (n, t[:40]) for n, t in uncovered[:3])
+        raise SystemExit(
+            '[lora] REFUSED: %d pair(s) do not roundtrip through the vocab '
+            '(%s) — training on them would teach U+FFFD corruption. Use '
+            'romanised Bengali (ASCII) or extend the vocab.' % (
+                len(uncovered), show))
     _aw = sum(len(r.split()) for _, r in pairs)
     print(f'[lora] corpus: {args.corpus_file or "builtin set"} — '
           f'{len(pairs)} pairs, mean answer '

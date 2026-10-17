@@ -603,6 +603,17 @@ if(OMNISEED_BUILD_TESTS)
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_self_modify.py"
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_self_modify PROPERTIES TIMEOUT 300)
+
+        # Bilingual LoRA corpus honesty (T082): roundtrip guard against the
+        # measured vocab gaps (native Bengali chars -> U+FFFD), romanised
+        # path trainable. Tokenizer only — no training run.
+        add_test(NAME omniseed_lora_bilingual
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lora_bilingual.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_lora_bilingual PROPERTIES TIMEOUT 300)
     endif()
 
     # Decision bridge (T2 integration): the C++ DecisionResult JSON contract,
