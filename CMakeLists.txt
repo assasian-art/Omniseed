@@ -110,6 +110,9 @@ set(OMNISEED_CORE_SOURCES
     # This joins the §37 event log to a persisted (prediction, outcome) pair and
     # to UserFeedbackLoop's trust ledger. See docs/FEEDBACK.md.
     src/feedback_hook.cpp
+    # CROSS-HEAD VOTING (T073): shared-ballot combiner for the decision,
+    # classify and score heads. Default OFF (enable=false), w_vol pattern.
+    src/agent/ensemble_vote.cpp
     src/agent/grammar_decoder.cpp
     src/agent/tool_registry.cpp
     src/agent/agent_loop.cpp
@@ -440,6 +443,21 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_sub_router COMMAND omniseed_sub_router
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_sub_router PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # CROSS-HEAD VOTING (T073): shared-ballot combiner + default-off parity.
+    add_executable(omniseed_ensemble_vote tests/test_ensemble_vote.cpp)
+    target_include_directories(omniseed_ensemble_vote PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_ensemble_vote PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_ensemble_vote PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_ensemble_vote PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_ensemble_vote COMMAND omniseed_ensemble_vote
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_ensemble_vote PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Multi-asset paper session (M5): merged-timeline replay over several
     # streams sharing one cash account + one daily/weekly kill-switch, with
