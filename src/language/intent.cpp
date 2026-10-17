@@ -348,6 +348,7 @@ const char* lang_name(Lang l) {
         case Lang::Bn:      return "bn";
         case Lang::Mixed:   return "mixed";
         case Lang::Unknown: return "unknown";
+        case Lang::BnRomanized: return "bn-romanized";
         case Lang::COUNT:   break;
     }
     return "unknown";
@@ -386,6 +387,40 @@ Lang detect_lang(const ScriptStats& s) {
     return Lang::Mixed;
 }
 
+// T081 — romanised Bengali: pure-ASCII transliteration, so SCRIPT cannot see
+// it. Fail-closed by design: only a CONCENTRATION of distinctive markers
+// (>= 2 DISTINCT words from the lexicon, exact after lowercasing) claims the
+// label; one stray word never does. This branch runs only when the text is
+// already classified En (no Bengali script present at all).
+const char* const kRomanizedBnMarkers[] = {
+    "ami", "amar", "amra", "amake", "tumi", "tomar", "tomake", "apni",
+    "bhalo", "valo", "ache", "ase", "achi", "achen", "korte", "koro",
+    "koren", "korbo", "korbe", "hobe", "hoye", "kemon", "khub", "onek",
+    "sob", "sobai", "dekh", "dekho", "dekhen", "bolbo", "bolen", "jani",
+    "janen", "lagbe", "lagbo", "kothay", "kothai"};
+
+bool romanized_bengali(const std::vector<std::string>& toks) {
+    std::vector<int> hit;  // distinct marker indices, not word counts
+    for (const std::string& raw : toks) {
+        std::string w;
+        for (char c : raw) {
+            if (std::isalpha(static_cast<unsigned char>(c)))
+                w += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (w.empty()) continue;
+        for (size_t m = 0; m < sizeof(kRomanizedBnMarkers) / sizeof(*kRomanizedBnMarkers); ++m) {
+            if (w == kRomanizedBnMarkers[m]) {
+                bool seen = false;
+                for (int h : hit) seen = seen || (h == static_cast<int>(m));
+                if (!seen) hit.push_back(static_cast<int>(m));
+                break;
+            }
+        }
+        if (hit.size() >= 2) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -397,6 +432,10 @@ IntentResult IntentClassifier::classify(const std::string& text) const {
     const std::vector<std::string> toks = tokenize(text);
     const ScriptStats stats = scan_utf8(text);
     r.language = detect_lang(stats);
+    // T081: a pure-ASCII transliteration cannot be caught by script, so a
+    // concentrated romanised-Bengali marker set overrides the En verdict.
+    if (r.language == Lang::En && romanized_bengali(toks))
+        r.language = Lang::BnRomanized;
 
     if (toks.empty()) {
         r.intent = Intent::Unknown;

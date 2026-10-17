@@ -281,16 +281,25 @@ static void part_b_language() {
         CHECK(c2.classify(bn_with_ok).language == Lang::Bn);
     }
 
-    TEST("B4: KNOWN GAP — romanised Bengali reads as En");
+    TEST("B4: romanised Bengali is DETECTED (T081) — and stays fail-closed");
     {
-        // Detection is by SCRIPT. "ami bhalo achi" is pure ASCII, so it is
-        // indistinguishable from English without a transliteration model this
-        // tree does not have. docs/JEV_FEATURES.md records this rather than
-        // pretending otherwise; the test pins the actual behaviour so a future
-        // fix is a deliberate, visible change.
+        // Fixed in T081. Script cannot see pure ASCII, so detection is a
+        // concentrated lexical-marker set: >= 2 DISTINCT transliteration
+        // markers claim `bn-romanized`; fewer never do. The previous pinned
+        // behaviour (reads as En) was the honest pre-fix state; this block is
+        // the deliberate, visible change that comment asked for.
         const IntentClassifier c;
-        CHECK(c.classify("ami bhalo achi").language == Lang::En);
+        CHECK(c.classify("ami bhalo achi").language == Lang::BnRomanized);
         CHECK(c.classify("ami bhalo achi").intent == Intent::Statement);
+        CHECK(std::string(lang_name(c.classify("ami bhalo achi").language)) ==
+              "bn-romanized");
+        // one marker is NOT enough (fail-closed)
+        CHECK(c.classify("ami said hello").language == Lang::En);
+        // ordinary English with no markers stays En
+        CHECK(c.classify("the cat sat on the mat").language == Lang::En);
+        CHECK(c.classify("do you know what ki means").language == Lang::En);
+        // Bengali SCRIPT still wins over the romanised branch
+        CHECK(c.classify("আমি ভালো আছি").language == Lang::Bn);
     }
 }
 

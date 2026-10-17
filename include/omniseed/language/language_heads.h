@@ -38,8 +38,12 @@ namespace language {
 
 // ---------------------------------------------------------------------------
 // Language of a piece of text.
+// BnRomanized (T081): pure-ASCII transliteration of Bengali — detected by a
+// concentrated lexical-marker set, NEVER by script (there is no Bengali
+// script to see). Appended last so the numeric values of the original
+// members stay stable.
 // ---------------------------------------------------------------------------
-enum class Lang : int32_t { En = 0, Bn, Mixed, Unknown, COUNT };
+enum class Lang : int32_t { En = 0, Bn, Mixed, Unknown, BnRomanized, COUNT };
 constexpr int32_t kLangCount = static_cast<int32_t>(Lang::COUNT);
 const char* lang_name(Lang l);
 
