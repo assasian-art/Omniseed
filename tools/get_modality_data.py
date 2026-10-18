@@ -311,17 +311,42 @@ def fetch_ravdess(max_mb):
 
 
 def fetch_cifar10(max_mb):
-    url = next(p["url"] for p in PLAN if p["fetch"] == "cifar10")
+    # Primary is the canonical UofT host; it has been UNREACHABLE from this
+    # network before (2026-10-16) and timed out again 2026-10-18, so the
+    # fetcher walks a verified byte-identical mirror chain and RECORDS which
+    # source actually served the bytes (provenance, not vibes).
+    urls = [
+        next(p["url"] for p in PLAN if p["fetch"] == "cifar10"),
+        "https://data.brainchip.com/dataset-mirror/cifar10/"
+        "cifar-10-python.tar.gz",
+        "https://huggingface.co/datasets/fffan/Temp/resolve/main/"
+        "cifar-10-python.tar.gz",
+    ]
     out = os.path.join(DATA_ROOT, "vision.scene")
-    if os.path.isdir(out) and os.listdir(out):
+    # Completion sentinel — the OLD guard (`dir exists and non-empty`) treated
+    # a stale LICENCE+labels stub as "installed", which silently blocked every
+    # retry (the 2026-10-16 data-block). Only a completed run writes this.
+    sentinel = os.path.join(out, ".cifar10.complete")
+    if os.path.exists(sentinel):
         print("  already installed at %s" % out)
         return True
     tmp = tempfile.mkdtemp(prefix="omniseed_cifar_")
     tpath = os.path.join(tmp, "cifar.tar.gz")
-    print("  CIFAR-10: fetching %s" % url)
-    if not _download(url, tpath, max_mb):
+    used_url = None
+    for u in urls:
+        print("  CIFAR-10: fetching %s" % u)
+        try:
+            if _download(u, tpath, max_mb):
+                used_url = u
+                break
+        except Exception as e:  # network/host failure -> next mirror
+            print("  unreachable (%s: %s)" % (type(e).__name__, e))
+    if used_url is None:
+        print("  ALL SOURCES FAILED — no install claimed")
         shutil.rmtree(tmp, ignore_errors=True)
         return False
+    if os.path.isdir(out):
+        shutil.rmtree(out)  # stale partial stub (see sentinel note above)
     os.makedirs(out, exist_ok=True)
     # CIFAR coarse classes: 0 airplane,1 automobile,2 bird,3 cat,4 deer,5 dog,
     # 6 frog,7 horse,8 ship,9 truck.
@@ -355,7 +380,13 @@ def fetch_cifar10(max_mb):
                 mapped = MAP.get(lab)
                 if mapped is None:
                     continue
-                rows.append((i, mapped, lab))
+                # The pixels ARE the dataset: raw 32x32x3 RGB (no deps, no
+                # decoder). The old version kept only the label and deleted
+                # the tar — there was nothing to fit vision.scene ON.
+                fname = "img_%05d.bin" % i
+                with open(os.path.join(out, fname), "wb") as g:
+                    g.write(blob[off:off + 3072])
+                rows.append((fname, mapped, lab))
                 n_total += 1
     shutil.rmtree(tmp, ignore_errors=True)
     with open(os.path.join(out, "labels.tsv"), "w", encoding="utf-8", newline="\n") as f:
@@ -363,18 +394,24 @@ def fetch_cifar10(max_mb):
         f.write("# ⚠️ LOSSY: only 'nature' and 'outdoor' are supported. CIFAR has\n"
                 "# NO indoor class and NO urban class; those labels are recorded\n"
                 "# as UNSUPPORTED rather than invented.\n")
-        f.write("index\tvision.scene\tcifar_class\n")
+        f.write("# pixels: raw 32x32x3 RGB uint8, row-major (img_*.bin)\n")
+        f.write("file\tvision.scene\tcifar_class\n")
         for r in rows:
-            f.write("%d\t%s\t%d\n" % r)
+            f.write("%s\t%s\t%d\n" % r)
     with open(os.path.join(out, "LICENCE.txt"), "w", encoding="utf-8") as f:
         f.write("CIFAR-10 — MIT licence. Source: %s\n"
+                "(canonical host: %s)\n"
                 "Krizhevsky (2009), 'Learning Multiple Layers of Features from "
                 "Tiny Images'.\n"
                 "MAPPING IS LOSSY: nature<-{bird,deer,frog,horse}, "
                 "outdoor<-{airplane,automobile,ship,truck}.\n"
                 "indoor and urban have NO CIFAR source and are NOT provided.\n"
-                % url)
-    print("  mapped %d image(s) into nature/outdoor" % n_total)
+                % (used_url, urls[0]))
+    # Success marker LAST: an interrupted run never claims "installed".
+    with open(sentinel, "w", encoding="utf-8") as f:
+        f.write("cifar10 data_batch_1 -> %d images; fetched from %s\n"
+                % (n_total, used_url))
+    print("  mapped %d image(s) into nature/outdoor (pixels kept as .bin)" % n_total)
     print("  indoor + urban: NO SOURCE — recorded unsupported, not invented")
     return True
 

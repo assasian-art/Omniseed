@@ -221,6 +221,26 @@ def run_nightly(journal_path, out_path, corpus_paths=(), min_n=30):
     """
     rows = read_journal(journal_path)
     pairs = committed_pairs(rows)
+
+    # T110 / I7 — drift guard: a calibration fitted ACROSS a confidence
+    # regime change averages two worlds that no longer share a calibration.
+    # The chronological confidence stream goes through the two-window
+    # detector (tools/monster/drift.py); on drift we KEEP THE OLD MAP.
+    # A maintenance gate only — drift is information, never a trade.
+    from monster.drift import journal_confidence_drift
+    mon = journal_confidence_drift([p[0] for p in pairs])
+    if mon.hot:
+        return {
+            "accepted": False,
+            "drift": True,
+            "drift_at_n": mon.drift_at_n,
+            "reason": ("drift: the chronological confidence stream changed "
+                       "mean at row %s — keep-old map; refit once the stream "
+                       "stabilises (tools/monster/drift.py)" % mon.drift_at_n),
+            "timestamp": int(time.time()),
+            "journal": os.path.basename(journal_path),
+        }
+
     v = recalibrate(pairs, min_n=min_n)
     v["timestamp"] = int(time.time())
     v["journal"] = os.path.basename(journal_path)

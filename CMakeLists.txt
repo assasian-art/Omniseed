@@ -530,6 +530,17 @@ if(OMNISEED_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_monster_features PROPERTIES TIMEOUT 300)
 
+        # T110 / I7 — two-window drift detector for the continual-learning
+        # loop: calibrated false-alarm budget (0/5 seeds x 2500 stationary),
+        # +/-0.8-sigma shift detection, fail-closed warm-up, zero-var step.
+        add_test(NAME omniseed_monster_drift
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_drift.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_monster_drift PROPERTIES TIMEOUT 120)
+
         # Monster sniper engine: layer arithmetic, hard vetoes, the reachable
         # 0.85 bar, the [1%,2%] adaptive sizing band, cross-asset invalidation.
         add_test(NAME omniseed_monster_sniper
