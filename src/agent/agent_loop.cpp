@@ -59,6 +59,22 @@ bool AgentLoop::ensure_decision_head() {
                            "are well-formed but MEANINGLESS");
     }
     decision_head_.set_threshold(cfg_.decision_threshold);
+    // T111/I8 — nightly calibration gate. Active only when a path was given;
+    // an unloadable/unaccepted map leaves the gate SHUT (trustworthy()==false),
+    // which demotes every System-1 route to System-2 text — fail-closed,
+    // never silent-identity.
+    if (!cfg_.calibration_path.empty()) {
+        calibration_active_ = true;
+        if (calibration_.load(cfg_.calibration_path)) {
+            platform::log_info("calibration gate: %d bins from %s",
+                               static_cast<int>(calibration_.bin_count()),
+                               cfg_.calibration_path.c_str());
+        } else {
+            platform::log_warn("calibration gate: map '%s' missing/malformed/"
+                               "unaccepted — System-1 routes will be DEMOTED "
+                               "(fail-closed)", cfg_.calibration_path.c_str());
+        }
+    }
     return decision_head_.ready();
 }
 
@@ -424,12 +440,27 @@ AgentLoop::Result AgentLoop::run(const std::string& user_input) {
             res.first_token_uncertainty = Uncertainty::analyze(logits);
 
             if (d.fast_path) {
-                // Self-routed: System-1 answers, the token loop never runs.
-                res.decision_fast_path = true;
-                res.reply = d.to_json();
-                if (!cfg_.prefix_key.empty())
-                    prefix_cache_.store(cfg_.prefix_key, model_, st);
-                return finish_turn();
+                // T111/I8 calibration gate: the self-route is only allowed
+                // when the nightly map's MEASURED accuracy at this confidence
+                // clears the bar. Active gate + untrusted confidence demotes
+                // to the System-2 text path below — same fall-through as
+                // low confidence, never a fabricated permission.
+                if (calibration_active_ &&
+                    !calibration_.trustworthy(d.confidence_score,
+                                              cfg_.calibration_min_acc)) {
+                    platform::log_warn(
+                        "calibration gate: conf %.3f has no measured accuracy "
+                        ">=%.2f (or no accepted map) — demoting System-1 "
+                        "route to System-2", d.confidence_score,
+                        cfg_.calibration_min_acc);
+                } else {
+                    // Self-routed: System-1 answers, the token loop never runs.
+                    res.decision_fast_path = true;
+                    res.reply = d.to_json();
+                    if (!cfg_.prefix_key.empty())
+                        prefix_cache_.store(cfg_.prefix_key, model_, st);
+                    return finish_turn();
+                }
             }
             if (cfg_.decision_mode == DecisionMode::DecisionOnly) {
                 // DecisionOnly refuses to fall through. Emit the head's own

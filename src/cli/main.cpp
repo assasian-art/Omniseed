@@ -1376,6 +1376,8 @@ struct Session {
     DecisionMode decision_mode      = DecisionMode::Off;
     float        decision_threshold = 0.85f;
     std::string  decision_head_path;   // fitted projection blob (optional)
+    std::string  calibration_path;     // T111/I8 nightly calibration map
+    float        calibration_min_acc = 0.0f;  // gate bar; 0 = disabled
 
     // §47 — `dream --nightly`: the SCHEDULED consolidation pass. Kept separate
     // from `omniseed dream`, which is a demo that fabricates history when the
@@ -1561,6 +1563,8 @@ int cmd_ask(Session& s) {
     cfg.decision_mode      = s.decision_mode;
     cfg.decision_threshold = s.decision_threshold;
     cfg.decision_head_path = s.decision_head_path;
+    cfg.calibration_path     = s.calibration_path;
+    cfg.calibration_min_acc  = s.calibration_min_acc;
 
     AgentLoop loop(*s.model, s.tok, tools, mem, thr, imp, cfg);
     announce_decision_mode(loop, cfg);
@@ -1687,6 +1691,8 @@ int cmd_chat(Session& s) {
     cfg.decision_mode      = s.decision_mode;
     cfg.decision_threshold = s.decision_threshold;
     cfg.decision_head_path = s.decision_head_path;
+    cfg.calibration_path     = s.calibration_path;
+    cfg.calibration_min_acc  = s.calibration_min_acc;
     // Streaming: print each piece as it is decoded, then finish the line
     // after generation completes (Result.reply holds the same text).
     cfg.on_token = [](const std::string& piece) {
@@ -1783,6 +1789,10 @@ int main(int argc, char** argv) {
             s.decision_threshold = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--decision-head" && i + 1 < argc)
             s.decision_head_path = argv[++i];
+        else if (a == "--calibration" && i + 1 < argc)
+            s.calibration_path = argv[++i];
+        else if (a == "--calibration-min-acc" && i + 1 < argc)
+            s.calibration_min_acc = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];
         else if (a == "--eval-tokens" && i + 1 < argc)
             s.eval_tokens = std::atoi(argv[++i]);

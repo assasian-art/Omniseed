@@ -19,6 +19,7 @@
 #include "omniseed/core/tokenizer.h"
 #include "omniseed/core/uncertainty.h"
 #include "omniseed/decision_head.h"
+#include "omniseed/runtime/calibration.h"
 #include "omniseed/memory/memory.h"
 #include "omniseed/memory/prefix_cache.h"
 
@@ -302,6 +303,14 @@ public:
         // use the deterministic seeded placeholder, which is UNTRAINED and
         // therefore meaningless — see the honesty note in decision_head.h.
         std::string decision_head_path;
+        // T111/I8 — nightly calibration gate (state/calibration_map.json).
+        // Empty path = disabled (zero behaviour change). When set, a System-1
+        // self-route is only allowed if the map's MEASURED accuracy at that
+        // confidence clears `calibration_min_acc`; otherwise the turn is
+        // demoted to the System-2 text path. An unloadable map keeps the gate
+        // SHUT (fail-closed, never silent-identity).
+        std::string calibration_path;
+        float       calibration_min_acc = 0.0f;
     };
 
     AgentLoop(const RwkvModel& model, const Tokenizer& tok,
@@ -405,6 +414,8 @@ private:
     // System-1 decision head. Empty (E_ == 0, no buffers) until
     // ensure_decision_head() sizes it, so DecisionMode::Off costs nothing.
     DecisionHead        decision_head_;
+    CalibrationMap      calibration_;       // T111/I8 gate (active iff path set)
+    bool                calibration_active_ = false;
 };
 
 } // namespace omniseed

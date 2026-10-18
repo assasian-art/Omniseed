@@ -50,6 +50,9 @@ set(OMNISEED_CORE_SOURCES
     # distribution in one matvec. Sits above core/ because it is a decision
     # layer that both the agent loop and the trading runtime consume.
     src/decision_head.cpp
+    # T111/I8 — runtime consumer for the nightly calibration map (the
+    # fail-closed trustworthy() gate the agent loop consults).
+    src/runtime/calibration.cpp
     # "One backbone, multiple heads": the shared heads vocabulary, the router
     # that decides which heads run, and the per-head readouts of h[E].
     src/heads.cpp
