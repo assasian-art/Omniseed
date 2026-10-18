@@ -35,6 +35,7 @@
 #    python tools/get_modality_data.py --list              # what IS installed
 # =============================================================================
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +45,13 @@ import tarfile
 import tempfile
 import urllib.request
 import zipfile
+
+# Canonical md5 of the UofT cifar-10-python.tar.gz (publicly documented).
+# PINNED because data_batch_1 is unpickled below: pickle from an unverified
+# mirror would be arbitrary code execution, so the archive bytes must be the
+# authentic dataset BEFORE anything is deserialised. Mirrors are byte-for-byte
+# copies or they are refused.
+CIFAR10_TAR_MD5 = "c32a1d4ab5d03f1284b67883e8d87530"
 
 # ---------------------------------------------------------------------------
 # Where modality data lives. GITIGNORED — see docs/VISION_AUDIO_DATA.md.
@@ -353,6 +361,20 @@ def fetch_cifar10(max_mb):
         print("  ALL SOURCES FAILED — no install claimed")
         shutil.rmtree(tmp, ignore_errors=True)
         return False
+    # Authenticity gate BEFORE any deserialisation (see CIFAR10_TAR_MD5).
+    md5 = hashlib.md5()
+    with open(tpath, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            md5.update(blk)
+    if md5.hexdigest() != CIFAR10_TAR_MD5:
+        print("  BAD MIRROR: archive md5 %s != canonical %s — refusing to "
+              "unpickle bytes from an unverified source"
+              % (md5.hexdigest(), CIFAR10_TAR_MD5))
+        shutil.rmtree(tmp, ignore_errors=True)
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+        return False
+    print("  archive md5 verified against the canonical CIFAR-10 hash")
     if os.path.isdir(out):
         shutil.rmtree(out)  # stale partial stub (see sentinel note above)
     os.makedirs(out, exist_ok=True)
@@ -369,54 +391,93 @@ def fetch_cifar10(max_mb):
     #   urban   <- (NO SOURCE — must come from an urban dataset)
     MAP = {0: "outdoor", 1: "outdoor", 2: "nature", 3: None, 4: "nature",
            5: None, 6: "nature", 7: "nature", 8: "outdoor", 9: "outdoor"}
+    # data_batch_1 is a PICKLE ({b'data': uint8[10000,3072], b'labels': [...]}),
+    # NOT raw interleaved records — the old parser read pickle bytes as
+    # records and "extracted" 12 garbage rows (the 2026-10-18 incident; the
+    # real blob is 31,035,704 bytes with pickle overhead). Unpickling numpy
+    # needs the venv python (numpy is a tool-side dep everywhere else here,
+    # e.g. train_heads.py).
+    try:
+        import numpy as np
+        import pickle
+    except ImportError:
+        print("  REFUSED: numpy is required to unpack the CIFAR pickle — "
+              "run with the venv python (.venv/Scripts/python.exe)")
+        shutil.rmtree(tmp, ignore_errors=True)
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+        return False
     rows = []
     n_total = 0
     with tarfile.open(tpath, "r:gz") as t:
-        for member in t.getmembers():
-            if not member.name.endswith("data_batch_1"):
+        member = next((m for m in t.getmembers()
+                       if m.name.endswith("data_batch_1")), None)
+        if member is None:
+            print("  BAD MIRROR: data_batch_1 missing from tar")
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(out):
+                shutil.rmtree(out)
+            return False
+        f = t.extractfile(member)
+        blob = f.read() if f is not None else b""
+        try:
+            rec = pickle.loads(blob, encoding="latin1")
+        except Exception as e:  # truncated/corrupt mirror
+            print("  BAD MIRROR: cannot unpickle data_batch_1 (%s: %s)"
+                  % (type(e).__name__, e))
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(out):
+                shutil.rmtree(out)
+            return False
+        data = rec.get(b"data", rec.get("data"))
+        labs = rec.get(b"labels", rec.get("labels"))
+        if data is None or labs is None:
+            print("  BAD MIRROR: pickle lacks data/labels keys")
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(out):
+                shutil.rmtree(out)
+            return False
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3072)
+        labs = [int(x) for x in labs]
+        if arr.shape[0] != 10000 or len(labs) != 10000:
+            print("  BAD MIRROR: %d rows / %d labels (expected 10000)"
+                  % (arr.shape[0], len(labs)))
+            shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(out):
+                shutil.rmtree(out)
+            return False
+        for i in range(10000):
+            mapped = MAP.get(labs[i])
+            if mapped is None:
                 continue
-            f = t.extractfile(member)
-            if f is None:
-                continue
-            blob = f.read()
-            # A CIFAR batch holds 10000 records of (1 label byte + 3072
-            # pixels). Anything shorter is a truncated download masquerading
-            # as a valid member (the 12-image incident) — fail the mirror,
-            # never install a partial dataset silently.
-            expect = 10000 * 3073
-            if len(blob) != expect:
-                print("  BAD MIRROR: data_batch_1 is %d bytes, expected %d"
-                      % (len(blob), expect))
-                shutil.rmtree(tmp, ignore_errors=True)
-                if os.path.isdir(out):
-                    shutil.rmtree(out)
-                return False
-            for i in range(10000):
-                off = 1 + i * 3073
-                if off + 3073 > len(blob):
-                    break
-                lab = blob[off - 1]
-                mapped = MAP.get(lab)
-                if mapped is None:
-                    continue
-                # The pixels ARE the dataset: raw 32x32x3 RGB (no deps, no
-                # decoder). The old version kept only the label and deleted
-                # the tar — there was nothing to fit vision.scene ON.
-                fname = "img_%05d.bin" % i
-                with open(os.path.join(out, fname), "wb") as g:
-                    g.write(blob[off:off + 3072])
-                rows.append((fname, mapped, lab))
-                n_total += 1
+            # The pixels ARE the dataset, in the format the vision dump
+            # pipeline loads (tools/dump_hidden.cpp: BMP/PPM only): raw
+            # 32x32x3 RGB wrapped in a binary P6 PPM header — no deps,
+            # no decoder.
+            fname = "img_%05d.ppm" % i
+            with open(os.path.join(out, fname), "wb") as g:
+                g.write(b"P6\n32 32\n255\n")
+                g.write(arr[i].tobytes())
+            rows.append((fname, mapped, labs[i]))
+            n_total += 1
     shutil.rmtree(tmp, ignore_errors=True)
     with open(os.path.join(out, "labels.tsv"), "w", encoding="utf-8", newline="\n") as f:
         f.write("# CIFAR-10 data_batch_1, mapped to vision.scene\n")
         f.write("# ⚠️ LOSSY: only 'nature' and 'outdoor' are supported. CIFAR has\n"
                 "# NO indoor class and NO urban class; those labels are recorded\n"
                 "# as UNSUPPORTED rather than invented.\n")
-        f.write("# pixels: raw 32x32x3 RGB uint8, row-major (img_*.bin)\n")
+        f.write("# pixels: binary P6 PPM 32x32 RGB (img_*.ppm; dump_hidden-ready)\n")
         f.write("file\tvision.scene\tcifar_class\n")
         for r in rows:
             f.write("%s\t%s\t%d\n" % r)
+    # dump_hidden-ready manifest: `path<TAB>set.name` header + `path<TAB>label`
+    # rows (tools/dump_hidden.cpp read_modality_manifest). BARE filenames —
+    # the loader resolves them against the manifest's own directory.
+    with open(os.path.join(out, "images.tsv"), "w", encoding="utf-8",
+              newline="\n") as f:
+        f.write("path\tvision.scene\n")
+        for fname, mapped, _lab in rows:
+            f.write("%s\t%s\n" % (fname, mapped))
     with open(os.path.join(out, "LICENCE.txt"), "w", encoding="utf-8") as f:
         f.write("CIFAR-10 — MIT licence. Source: %s\n"
                 "(canonical host: %s)\n"

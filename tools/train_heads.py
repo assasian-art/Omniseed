@@ -864,6 +864,8 @@ def main():
     ap.add_argument("--trading", default="build/head_data/trading")
     ap.add_argument("--audio", default="build/head_data/audio_emotion",
                     help="audio h[E] dump (focal-codec route); fits audio.emotion")
+    ap.add_argument("--vision", default="build/head_data/vision_scene",
+                    help="vision h[E] dump (vision-proj route); fits vision.scene")
     ap.add_argument("--bars", default="models/market/AAPL_1d.csv")
     ap.add_argument("--out-dir", default="models/heads")
     ap.add_argument("--report", default="build/head_data/report.json")
@@ -1194,6 +1196,98 @@ def main():
         print("!! audio dump missing at %s — NOT FITTED" % args.audio)
         report["heads"]["audio"] = {"status": "NOT FITTED",
                                     "why": "no dump at " + args.audio}
+
+    # ======================= VISION =========================================
+    # T050's route, mirroring the audio block. The dump comes from
+    # `omniseed_dump_hidden.exe vision <model> <images.tsv> <out> --projector
+    # models/vision-proj.gguf`: PPM/BMP -> VisionEncoder [M,768] ->
+    # MultimodalBridge (stride 1, model's own embedding codebook) -> the SAME
+    # backbone forward the runtime performs. CIFAR-10 supplies ONLY the
+    # 'nature' and 'outdoor' labels (indoor/urban have no CIFAR source —
+    # recorded unsupported, not invented), so the honest framing is a 2-class
+    # problem against a MAJORITY baseline, not a 4-class scene understanding
+    # claim. Reported as such below.
+    if os.path.isdir(args.vision):
+        meta, H, ids, set_names, labels = load_dump(args.vision)
+        print("\n=== vision: N=%d E=%d sets=%s" % (H.shape[0], H.shape[1], set_names))
+        cols = {name: np.array([r[i] for r in labels]) for i, name in enumerate(set_names)}
+
+        sets_out, proj_rows, bias_rows, fitted_rows = [], [], [], []
+        per_set = {}
+        temps, cals, eces = [], [], []
+        for name in set_names:
+            vocab = label_sets.get(name)
+            if vocab is None:
+                raise SystemExit("label set %r is not in the C++ canonical list" % name)
+            inv = {l: i for i, l in enumerate(vocab)}
+            unknown = sorted(set(cols[name]) - set(inv))
+            if unknown:
+                raise SystemExit("labels %r in %s are not canonical for %r"
+                                 % (unknown, name, vocab))
+            y = np.array([inv[v] for v in cols[name]], dtype=int)
+            K = len(vocab)
+            present = sorted(set(cols[name]))
+            # Images have no meaningful time order -> STRATIFIED, like audio.
+            tr, hold = stratified_split(y, seed=args.seed)
+            r = fit_one(H, y, K, tr, hold, shuffle=True, seed=args.seed)
+            counts = {vocab[i]: int((y == i).sum()) for i in range(K)}
+            majority = max(counts.values()) / float(len(y))
+            print("  %-20s K=%d (present: %s) train=%d holdout=%d | acc=%.3f "
+                  "(macroF1=%.3f) | majority-baseline=%.3f | ECE %.3f -> %.3f | T=%.3f"
+                  % (name, K, ",".join(present), len(tr), len(hold),
+                     r["holdout_acc"], r["holdout_macro_f1"], majority,
+                     r["ece_raw"], r["ece_calibrated"], r["temperature"]))
+            if len(present) < K:
+                print("      NOTE: %d of %d labels have data (CIFAR provides no "
+                      "'indoor'/'urban'); accuracy is a 2-class result, NOT scene "
+                      "understanding" % (len(present), K))
+            per_set[name] = public_metrics(r)
+            per_set[name]["labels"] = vocab
+            per_set[name]["label_counts"] = counts
+            per_set[name]["majority_baseline"] = round(majority, 6)
+            per_set[name]["labels_present"] = present
+            sets_out.append({"name": name, "labels": vocab})
+            proj_rows.append(r["proj"])
+            bias_rows.append(r["bias"])
+            fitted_rows.extend([1] * K)
+            temps.append(r["temperature"])
+            cals.append(len(hold) if len(hold) else len(tr))
+            eces.append(r["ece_calibrated"])
+            if not args.no_fixture:
+                emit_fixture(args.fixture_dir, name.replace(".", "_"), H,
+                             r["_test_idx"], [(name, cols[name])],
+                             {"bin": "models/heads/vision_head.bin",
+                              "set_name": name,
+                              "split": "stratified 70/30 + 5-fold CV for T",
+                              "render": "PPM 32x32 -> VisionEncoder (vision-proj"
+                                        ".gguf) -> MultimodalBridge -> backbone",
+                              "ece_bins_calibrated": r["ece_bins_calibrated"]},
+                             {name: {"temperature": r["temperature"],
+                                     "ece_calibrated": r["ece_calibrated"],
+                                     "holdout_acc": r["holdout_acc"]}},
+                             {name: vocab})
+
+        proj = np.vstack(proj_rows)
+        bias = np.concatenate(bias_rows)
+        vpath = os.path.join(args.out_dir, "vision_head.bin")
+        vsize = write_classification_head(
+            vpath, H.shape[1], sets_out, proj, bias,
+            sum(len(s["labels"]) for s in sets_out), fitted_rows,
+            default_temperature=1.0, temperatures=temps,
+            calib_samples_list=cals, calib_errors=eces)
+        print("  wrote %s (%d bytes, %d labels)" % (vpath, vsize, len(bias)))
+        report["heads"]["vision"] = {
+            "kind": "ClassificationHead", "path": vpath, "bytes": vsize,
+            "E": H.shape[1], "n_examples": int(H.shape[0]),
+            "temperatures": {n: round(t, 6) for n, t in zip(set_names, temps)},
+            "calibration_samples": {n: c for n, c in zip(set_names, cals)},
+            "ece_calibrated": {n: round(e, 6) for n, e in zip(set_names, eces)},
+            "sets": per_set, "source": meta,
+        }
+    else:
+        print("!! vision dump missing at %s — NOT FITTED" % args.vision)
+        report["heads"]["vision"] = {"status": "NOT FITTED",
+                                     "why": "no dump at " + args.vision}
 
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:
