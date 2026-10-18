@@ -1174,6 +1174,20 @@ if(OMNISEED_BUILD_TESTS)
         set_tests_properties(omniseed_audio_resample PROPERTIES TIMEOUT 300)
     endif()
 
+    # T113b — synthetic candlestick chart generator (P12): byte-identical
+    # re-render, independent next-bar label recompute, fail-closed refusals
+    # (missing CSV / bad header / sentinel / stale param hash -> exit 2).
+    # Stdlib-only, writes only into temp dirs.
+    if(OMNISEED_TEST_PY)
+        add_test(NAME omniseed_make_vision_candles
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_TEST_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_make_vision_candles.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_make_vision_candles PROPERTIES TIMEOUT 300)
+    endif()
+
     # §43 — the modality dump contract. tools/dump_hidden.cpp grew `vision` and
     # `audio` modes so the modality heads can be fitted on h[E] the runtime also
     # produces. This pins the parts checkable WITHOUT the 243 MB backbone, and
