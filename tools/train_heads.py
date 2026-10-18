@@ -1269,14 +1269,22 @@ def main():
 
         proj = np.vstack(proj_rows)
         bias = np.concatenate(bias_rows)
-        vpath = os.path.join(args.out_dir, "vision_head.bin")
+        # One dump = one modality; the bin carries the SET in its name so a
+        # vision.anomaly fit never clobbers the vision.scene head.
+        only = set_names[0] if len(set_names) == 1 else ""
+        vbin = ("vision_head.bin" if only == "vision.scene" else
+                (only.replace(".", "_") + "_head.bin" if only
+                 else "vision_head.bin"))
+        vpath = os.path.join(args.out_dir, vbin)
         vsize = write_classification_head(
             vpath, H.shape[1], sets_out, proj, bias,
             sum(len(s["labels"]) for s in sets_out), fitted_rows,
             default_temperature=1.0, temperatures=temps,
             calib_samples_list=cals, calib_errors=eces)
         print("  wrote %s (%d bytes, %d labels)" % (vpath, vsize, len(bias)))
-        report["heads"]["vision"] = {
+        report_key = "vision" if only == "vision.scene" else (
+            "vision_anomaly" if only == "vision.anomaly" else "vision")
+        report["heads"][report_key] = {
             "kind": "ClassificationHead", "path": vpath, "bytes": vsize,
             "E": H.shape[1], "n_examples": int(H.shape[0]),
             "temperatures": {n: round(t, 6) for n, t in zip(set_names, temps)},
