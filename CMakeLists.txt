@@ -1277,6 +1277,21 @@ else()
 endif()
 add_test(NAME omniseed_ws COMMAND omniseed_ws_test)
 
+# T111 / I8 — runtime calibration-map consumer (fail-closed gate on the
+# nightly confidence->accuracy map). Standalone target, fixture-driven.
+add_executable(omniseed_calibration_test
+    tests/test_calibration_map.cpp
+    src/runtime/calibration.cpp)
+target_include_directories(omniseed_calibration_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(omniseed_calibration_test PRIVATE
+        /W4 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(omniseed_calibration_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME omniseed_calibration_map COMMAND omniseed_calibration_test)
+
 # -------------------------- Introspection + trading CLI ----------------------
 # Separate binary so the core CLI stays lean; shares omniseed_core.
 if(OMNISEED_BUILD_AGENT2)

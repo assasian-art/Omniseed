@@ -15,6 +15,7 @@ the rejections are the valuable part. Last updated: §54 (2026-10-16)._
 | I5 | **Nightly recalibration with a keep-old gate** (§54) | `tools/nightly_refit.py` | The journal cannot re-fit softmax weights (no h[E] inputs), so it re-fits what it CAN support — a monotone confidence→accuracy map — accepted only on chronological-holdout Brier improvement, corpus-fingerprinted so a stale map is visible. Silence (held rows) is never scored. |
 | I6 | **RUN_SERIAL as a correctness fix** (§52) | CMakeLists (`edge_tracks_gate`) | The gate's 1800 s subprocess timeout exceeded its 1200 s ctest budget: a starved run could never fail fast. Serializing the CPU-bound numpy regen turned a flaky 47th test into a deterministic pass. |
 | I7 | **Drift-gated nightly recalibration** (T110) | `tools/monster/drift.py` + `nightly_refit.run_nightly` | A calibration fitted ACROSS a confidence-regime change averages two worlds. The two-window (ADWIN-cut) test on the CHRONOLOGICAL confidence stream keeps the old map on drift — measured: 0/5 false alarms on 2500-sample stationary streams, ±0.8σ shifts caught at the first post-shift boundary (t≈1151), live nightly guard verified both ways. Page-Hinkley was implemented first and CALIBRATED OUT (+delta accumulator false-alarms on noise; shifted runs alarmed at the same index as controls) — the rejection is written into the module header so nobody re-derives the trap. |
+| I8 | **Fail-closed calibration gate in C++** (T111) | `runtime/calibration.{h,cpp}` | The nightly map finally has a consumer, and its contract is the invention: an unloaded/unaccepted/malformed map degrades to an identity REPORT (honest raw confidence) while `trustworthy()` stays FALSE — absence of evidence can never pass a gate that demands measured accuracy. |
 
 ## Prototyped and REJECTED (kept on purpose)
 
@@ -31,6 +32,10 @@ the rejections are the valuable part. Last updated: §54 (2026-10-16)._
   adoption bar every layer has faced (measured value first, wiring second).
 - **Lyapunov/FNN as a regime axis** — the exotics layer (§55) computes them;
   whether they earn a place in the regime ensemble is a measurement question.
-- **Calibration maps consumed by the runtime** — nightly_refit writes
-  `state/calibration_map.json`; no C++ consumer reads it yet (same honest gap
-  shape as FEEDBACK.md's original §9).
+- ~~Calibration maps consumed by the runtime~~ — **CLOSED 2026-10-18 (I8)**:
+  `include/omniseed/runtime/calibration.h` + `src/runtime/calibration.cpp` read the
+  nightly map with a fail-closed contract: missing/malformed/accepted:false/1-bin
+  => identity REPORT but the `trustworthy()` gate stays SHUT — a stale or absent
+  calibration can never silently wave through a decision that needed measured
+  accuracy (`omniseed_calibration_map`, 26 checks). Remaining step: wire the gate
+  into AgentLoop/agent2 decision paths (consumer now exists).
