@@ -113,7 +113,9 @@ def main():
             if not line:
                 continue
             path, _setname = line.split("\t")
-            rows.append(path)
+            # Manifest rows are BARE filenames resolved against the scene dir
+            # (dump_hidden does the same via its manifest-dir join).
+            rows.append(path if os.path.isabs(path) else os.path.join(SCENE, path))
 
     os.makedirs(ANOM, exist_ok=True)
     out_rows = []
