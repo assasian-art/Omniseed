@@ -209,6 +209,14 @@ def _download(url, dest, max_mb):
                           % max_mb)
                     return False
                 f.write(chunk)
+        if total and got != total:
+            # Premature close: urllib reports success on a short body when the
+            # server omits/chops Content-Length handling — a truncated tar
+            # then "extracts" a handful of records and CLAIMS success (the
+            # 2026-10-18 12-image incident). A short body is a FAILED mirror.
+            print("  TRUNCATED: got %d of %d advertised bytes" % (got, total))
+            os.remove(dest)
+            return False
     print("  downloaded %s" % human(got / 1048576.0))
     return True
 
@@ -371,8 +379,19 @@ def fetch_cifar10(max_mb):
             if f is None:
                 continue
             blob = f.read()
-            # <1s byte label><3072 bytes> x 10000, 1000 per batch
-            for i in range(1000):
+            # A CIFAR batch holds 10000 records of (1 label byte + 3072
+            # pixels). Anything shorter is a truncated download masquerading
+            # as a valid member (the 12-image incident) — fail the mirror,
+            # never install a partial dataset silently.
+            expect = 10000 * 3073
+            if len(blob) != expect:
+                print("  BAD MIRROR: data_batch_1 is %d bytes, expected %d"
+                      % (len(blob), expect))
+                shutil.rmtree(tmp, ignore_errors=True)
+                if os.path.isdir(out):
+                    shutil.rmtree(out)
+                return False
+            for i in range(10000):
                 off = 1 + i * 3073
                 if off + 3073 > len(blob):
                     break
