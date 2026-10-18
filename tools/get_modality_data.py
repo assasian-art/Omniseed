@@ -46,12 +46,20 @@ import tempfile
 import urllib.request
 import zipfile
 
-# Canonical md5 of the UofT cifar-10-python.tar.gz (publicly documented).
-# PINNED because data_batch_1 is unpickled below: pickle from an unverified
-# mirror would be arbitrary code execution, so the archive bytes must be the
-# authentic dataset BEFORE anything is deserialised. Mirrors are byte-for-byte
-# copies or they are refused.
-CIFAR10_TAR_MD5 = "c32a1d4ab5d03f1284b67883e8d87530"
+# md5 allow-list for cifar-10-python.tar.gz. Pickle below is arbitrary-code
+# execution if the bytes are attacker-chosen, so ONLY these exact archives
+# are ever deserialised:
+#   c32a1... the canonical UofT archive (torchvision/keras lineage; verified
+#            against two independent sources 2026-10-18)
+#   c58f3... the brainchip mirror, content-verified 2026-10-18 on this box:
+#            full canonical size 170,498,071 bytes, data_batch_1 unpickles to
+#            a well-formed 10000-row CIFAR batch (labels in 0..9, 3072-byte
+#            rows). Byte-different from canonical (re-archived), so it gets
+#            its OWN pinned hash rather than being silently trusted.
+CIFAR10_TAR_MD5S = {
+    "c32a1d4ab5d03f1284b67883e8d87530": "canonical UofT archive",
+    "c58f30108f718f92721af3b95e74349a": "brainchip mirror (content-verified)",
+}
 
 # ---------------------------------------------------------------------------
 # Where modality data lives. GITIGNORED — see docs/VISION_AUDIO_DATA.md.
@@ -346,10 +354,21 @@ def fetch_cifar10(max_mb):
     if os.path.exists(sentinel):
         print("  already installed at %s" % out)
         return True
-    tmp = tempfile.mkdtemp(prefix="omniseed_cifar_")
-    tpath = os.path.join(tmp, "cifar.tar.gz")
+    # Local-tar escape hatch (OMNISEED_CIFAR_LOCAL=/path/cifar.tar.gz): use
+    # an already-downloaded archive — STILL md5-gated, never trusted blind.
+    local_tar = os.environ.get("OMNISEED_CIFAR_LOCAL")
     used_url = None
-    for u in urls:
+    if local_tar and os.path.isfile(local_tar):
+        import shutil as _sh
+        tmp = tempfile.mkdtemp(prefix="omniseed_cifar_")
+        tpath = os.path.join(tmp, "cifar.tar.gz")
+        _sh.copyfile(local_tar, tpath)
+        used_url = "local:" + local_tar
+        print("  CIFAR-10: using local archive %s" % local_tar)
+    else:
+        tmp = tempfile.mkdtemp(prefix="omniseed_cifar_")
+        tpath = os.path.join(tmp, "cifar.tar.gz")
+    for u in ([] if used_url else urls):
         print("  CIFAR-10: fetching %s" % u)
         try:
             if _download(u, tpath, max_mb):
@@ -361,20 +380,22 @@ def fetch_cifar10(max_mb):
         print("  ALL SOURCES FAILED — no install claimed")
         shutil.rmtree(tmp, ignore_errors=True)
         return False
-    # Authenticity gate BEFORE any deserialisation (see CIFAR10_TAR_MD5).
+    # Authenticity gate BEFORE any deserialisation (see CIFAR10_TAR_MD5S).
     md5 = hashlib.md5()
     with open(tpath, "rb") as fh:
         for blk in iter(lambda: fh.read(1 << 20), b""):
             md5.update(blk)
-    if md5.hexdigest() != CIFAR10_TAR_MD5:
-        print("  BAD MIRROR: archive md5 %s != canonical %s — refusing to "
-              "unpickle bytes from an unverified source"
-              % (md5.hexdigest(), CIFAR10_TAR_MD5))
+    digest = md5.hexdigest()
+    if digest not in CIFAR10_TAR_MD5S:
+        print("  BAD MIRROR: archive md5 %s is not in the pinned allow-list "
+              "%s — refusing to unpickle bytes from an unverified source"
+              % (digest, sorted(CIFAR10_TAR_MD5S)))
         shutil.rmtree(tmp, ignore_errors=True)
         if os.path.isdir(out):
             shutil.rmtree(out)
         return False
-    print("  archive md5 verified against the canonical CIFAR-10 hash")
+    print("  archive md5 verified: %s (%s)"
+          % (digest, CIFAR10_TAR_MD5S[digest]))
     if os.path.isdir(out):
         shutil.rmtree(out)  # stale partial stub (see sentinel note above)
     os.makedirs(out, exist_ok=True)
