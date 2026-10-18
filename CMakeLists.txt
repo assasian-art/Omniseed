@@ -53,6 +53,10 @@ set(OMNISEED_CORE_SOURCES
     # T111/I8 — runtime consumer for the nightly calibration map (the
     # fail-closed trustworthy() gate the agent loop consults).
     src/runtime/calibration.cpp
+    # Runtime consumer for fitted ClassificationHead blobs (language/vision/
+    # audio/trading .bins from tools/train_heads.py): lazy load, fail-closed
+    # refusal — nothing loads those files without this.
+    src/runtime/fitted_heads.cpp
     # "One backbone, multiple heads": the shared heads vocabulary, the router
     # that decides which heads run, and the per-head readouts of h[E].
     src/heads.cpp
@@ -867,6 +871,27 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_unified_output COMMAND omniseed_unified_output
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_unified_output PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # T112 — the runtime consumer for fitted ClassificationHead blobs
+    # (FittedHeads): discovery of the train_heads.py bins by filename, the
+    # crafted-hidden argmax happy path, and the fail-closed contract —
+    # nonexistent/empty/truncated dir, unmapped set, E mismatch all REFUSE
+    # (empty top_k, "<error:...>" domain, no throw). Synthetic blobs are
+    # written through ClassificationHead::save() in the fixture itself; the
+    # real models/heads blob leg is gated (skips on a clean checkout).
+    add_executable(omniseed_fitted_heads tests/test_fitted_heads.cpp)
+    target_include_directories(omniseed_fitted_heads PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_fitted_heads PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_fitted_heads PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_fitted_heads PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_fitted_heads COMMAND omniseed_fitted_heads
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_fitted_heads PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # The language domain, in C++ with no model and no Python: UTF-8 script
     # detection (Bengali from its own Unicode block), the tokenizer, intent

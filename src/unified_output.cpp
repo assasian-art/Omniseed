@@ -222,8 +222,21 @@ UnifiedOutput UnifiedPipeline::run(
 
     // --- 5. the cheap heads, if the plan names them --------------------------
     if (out.router.has(HeadKind::Classify) && !cfg_.classification_set.empty()) {
-        out.classification = classifier_.classify(hidden, cfg_.classification_set,
-                                                  cfg_.classification_top_k);
+        if (!cfg_.fitted_heads_dir.empty()) {
+            // Fitted path: answer from the trained .bin for this set's family,
+            // or REFUSE (empty top_k -> has_classification false below). No
+            // fallback to the seeded classifier_ — random weights answering
+            // with confident-looking probabilities is the failure mode this
+            // branch exists to prevent.
+            if (fitted_heads_.heads_dir() != cfg_.fitted_heads_dir)
+                fitted_heads_.set_heads_dir(cfg_.fitted_heads_dir);
+            out.classification = fitted_heads_.classify(
+                hidden, cfg_.classification_set, cfg_.classification_top_k,
+                classifier_.hidden_size());
+        } else {
+            out.classification = classifier_.classify(hidden, cfg_.classification_set,
+                                                      cfg_.classification_top_k);
+        }
         // An empty top_k means the head refused (unknown set, width mismatch).
         // Reporting a head that produced nothing would violate the
         // "present iff it ran" rule, so the field is not claimed.

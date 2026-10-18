@@ -50,6 +50,7 @@
 #include "omniseed/domain_decision.h"
 #include "omniseed/heads.h"
 #include "omniseed/router.h"
+#include "omniseed/runtime/fitted_heads.h"
 #include "omniseed/scoring_head.h"
 #include "omniseed/soul.h"
 
@@ -110,6 +111,15 @@ public:
         // Empty disables it (the head simply never reports).
         std::string classification_set = "general.routing";
         int32_t     classification_top_k = 3;
+        // Directory of fitted head blobs (tools/train_heads.py output).
+        // NON-EMPTY = classify answers come from the fitted .bin for the set's
+        // family (lazy-loaded, cached); a missing/corrupt blob or an unmapped
+        // set refuses (empty top_k -> has_classification false) instead of
+        // falling back to the seeded, untrained classifier_ — silently
+        // meaningful-looking output from random weights is exactly what this
+        // flag exists to prevent. EMPTY = legacy path, seeded classifier_
+        // (default; zero behaviour change for existing callers).
+        std::string fitted_heads_dir;
         // Force a mode, bypassing the router's gates (the CLI's --mode).
         // std::nullopt-equivalent: `force_mode` false means "let the router decide".
         bool        force_mode = false;
@@ -192,6 +202,10 @@ private:
     ClassificationHead  classifier_;
     ScoringHead         scorer_;
     Soul                soul_;
+    // Fitted-blob consumer for cfg.fitted_heads_dir (empty dir = legacy seeded
+    // classifier_ path). Mutable: run() is const, but the lazy disk load and
+    // its caches are an internal detail, not an observable mutation.
+    mutable FittedHeads fitted_heads_;
 };
 
 } // namespace omniseed

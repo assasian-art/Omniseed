@@ -21,6 +21,13 @@
 //    POST /control        -> {"action":"pause"|"resume"|"status"}; while
 //                           paused, /gen and /ask refuse with
 //                           {"error":"paused"}. In-flight generations finish.
+//    POST /classify       -> run a FITTED classification head (T112):
+//                           {"set":"vision.scene","hidden":[...E floats...],
+//                            "top_k":3,"heads_dir":"models/heads"}. Returns the
+//                           head's own JSON (domain/top_k/margin) or
+//                           {"error":"not-available","reason":...} — a missing
+//                           blob, an unknown set or an E mismatch REFUSES; it
+//                           never fabricates a distribution. Needs no model.
 //    AUTH: when OMNISEED_API_TOKEN is set in the environment, every endpoint
 //    except / and /health requires `Authorization: Bearer <token>` (401
 //    otherwise; timing-safe compare). Unset = open (edge default).
@@ -42,6 +49,7 @@
 
 #include "omniseed/memory/memory.h"
 #include "omniseed/core/tensor.h"
+#include "omniseed/runtime/fitted_heads.h"
 #include "omniseed/server/ws.h"
 
 #ifndef _WIN32
@@ -209,6 +217,37 @@ std::vector<std::string> json_stop_array(const std::string& body) {
         p = q2 + 1;
     }
     return stops;
+}
+
+// Float-array JSON field: "hidden": [0.1, -2.0, ...] (unquoted numbers, no
+// nested structures). Returns false when the key is absent or the array is
+// malformed — same no-JSON-decoder stance as json_stop_array; a caller that
+// needs the refusal uses the bool, never a partially filled vector (the
+// vector is cleared first).
+bool json_float_array(const std::string& body, const std::string& key,
+                      std::vector<float>& out) {
+    out.clear();
+    const auto kpos = body.find("\"" + key + "\"");
+    if (kpos == std::string::npos) return false;
+    const auto cpos = body.find(':', kpos);
+    if (cpos == std::string::npos) return false;
+    const auto lb = body.find('[', cpos);
+    const auto end = body.find(']', cpos);
+    if (lb == std::string::npos || end == std::string::npos || lb > end)
+        return false;
+    const char* p = body.c_str() + lb + 1;
+    const char* stop = body.c_str() + end;
+    while (p < stop) {
+        while (p < stop && (*p == ' ' || *p == ',' || *p == '\n' ||
+                            *p == '\r' || *p == '\t')) ++p;
+        if (p >= stop) break;
+        char* e = nullptr;
+        const float v = std::strtof(p, &e);
+        if (e == p) { out.clear(); return false; }  // not a number -> refuse
+        out.push_back(v);
+        p = e;
+    }
+    return true;
 }
 
 // "stop_defaults": true -> the assistant stop set (mirrors CLI
@@ -1035,6 +1074,50 @@ int main(int argc, char** argv) {
             }
             respond(client, std::string("{\"paused\":") +
                             (g_server_paused ? "true" : "false") + "}");
+        } else if (path == "/classify" && method == "POST") {
+            // T112 — the runtime consumer for fitted ClassificationHead blobs
+            // (tools/train_heads.py output). Chosen as the ONE call site over a
+            // CLI subcommand because it needs NO model (the client supplies
+            // h[E] directly), rides the existing JSON-body + bearer-auth
+            // machinery, and FittedHeads' lazy per-bin cache makes it ~free
+            // after the first request. Pause does NOT gate it: it classifies,
+            // never generates. The HTTP loop is serial, so a function-local
+            // static FittedHeads is race-free by construction.
+            static FittedHeads fitted;
+            const std::string set = json_field(body, "set");
+            std::vector<float> hidden;
+            const bool got_hidden = json_float_array(body, "hidden", hidden);
+            // Optional override (ops/tests); empty keeps the default dir.
+            const std::string want_dir = json_field(body, "heads_dir");
+            if (!want_dir.empty() && fitted.heads_dir() != want_dir)
+                fitted.set_heads_dir(want_dir);  // drops caches; re-reads
+            if (set.empty() || !got_hidden || hidden.empty()) {
+                respond(client,
+                        "{\"error\":\"bad-request\",\"hint\":\"POST "
+                        "{\\\"set\\\":\\\"vision.scene\\\",\\\"hidden\\\":[...E "
+                        "floats...]}; optional: top_k, heads_dir\"}");
+                close_socket(client);
+                continue;
+            }
+            int32_t top_k = static_cast<int32_t>(json_num_field(body, "top_k", 3.0f));
+            if (top_k <= 0) top_k = 3;
+            // caller_E = hidden.size(): the width guard — a blob fitted at
+            // E=768 fed a 512-wide vector is a REFUSAL, never a silently
+            // wrong distribution.
+            const ClassificationResult r =
+                fitted.classify(hidden.data(), set, top_k,
+                                static_cast<int32_t>(hidden.size()));
+            if (r.top_k.empty()) {
+                // Head refused (missing/corrupt blob, unmapped set, E
+                // mismatch). domain carries the reason in the repo's
+                // "<error: ...>" form; top_k stays empty by contract.
+                respond(client, std::string("{\"error\":\"not-available\","
+                                            "\"reason\":\"") +
+                                json_escape(r.domain) + "\"}");
+                close_socket(client);
+                continue;
+            }
+            respond(client, r.to_json());
         } else if (path == "/ask" && method == "POST") {
             // Pause gate BEFORE the model check: a paused server answers
             // {"error":"paused"} even when no GGUF is loaded (the
