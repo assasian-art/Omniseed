@@ -42,6 +42,13 @@
 
 #include "omniseed/memory/memory.h"
 #include "omniseed/core/tensor.h"
+#include "omniseed/server/ws.h"
+
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +60,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
+#include <mutex>
 
 using namespace omniseed;
 
@@ -306,6 +315,39 @@ async function checkHealth() {
 }
 checkHealth(); setInterval(checkHealth, 30000);
 
+// ---- T103 live updates: WebSocket with reconnect backoff --------------------
+// Render free tier sleeps after ~15 min idle (wake ~1 min) -> exponential
+// backoff capped at 30 s; REST polling above stays as the fallback.
+let ws = null, wsTries = 0;
+function connectWS() {
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') +
+              location.host + '/ws' +
+              (tok.value ? '?token=' + encodeURIComponent(tok.value) : '');
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch {}
+  ws = new WebSocket(url);
+  ws.onopen = () => { wsTries = 0; };
+  ws.onmessage = ev => {
+    try {
+      const j = JSON.parse(ev.data);
+      if (j.type !== 'health') return;
+      serverPaused = !!j.paused;
+      pauseBtn.textContent = serverPaused ? '\u25B6' : '\u23F8';
+      health.textContent = 'live | model: ' + (j.model ? 'loaded' : 'missing') +
+                           (j.auth ? ' | auth: on' : '') +
+                           (serverPaused ? ' | PAUSED' : '') +
+                           ' | RSS: ' + j.rss + ' MB';
+    } catch {}
+  };
+  ws.onclose = () => {
+    wsTries = Math.min(wsTries + 1, 6);
+    const delay = Math.min(1000 * Math.pow(2, wsTries - 1), 30000);
+    health.textContent = 'reconnecting in ' + Math.round(delay / 1000) + 's\u2026';
+    setTimeout(connectWS, delay);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+connectWS();
+
 pauseBtn.addEventListener('click', async () => {
   pauseBtn.disabled = true;
   try {
@@ -496,6 +538,159 @@ bool base64_decode(const std::string& in, std::string& out) {
 // (readiness probes must not need secrets).
 // ---------------------------------------------------------------------------
 std::atomic<bool> g_server_paused{false};
+
+// ---------------------------------------------------------------------------
+// T103 — WebSocket live updates (GET /ws).
+//
+// The HTTP loop is serial and /gen can block for seconds, so upgraded
+// sockets live on a DEDICATED thread: main() hands them over, the thread
+// answers pings, honors the close handshake and broadcasts a health snapshot
+// every 2 s (which also surfaces pause transitions within one tick). Only the
+// WS thread writes to adopted sockets afterwards => no send mutex needed.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct WsConn {
+    Socket_t sock;
+    omniseed::server::ws::FrameParser parser;
+};
+
+struct WsRegistry {
+    std::mutex m;
+    std::vector<WsConn> conns;
+};
+
+WsRegistry g_ws;
+std::atomic<bool> g_ws_stop{false};
+
+void ws_set_nonblocking(Socket_t s) {
+#ifdef _WIN32
+    u_long nb = 1;
+    ::ioctlsocket(s, FIONBIO, &nb);
+#else
+    const int fl = ::fcntl(s, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+void ws_close_conn(WsRegistry* reg, Socket_t s) {
+    {
+        std::lock_guard<std::mutex> lk(reg->m);
+        for (size_t i = 0; i < reg->conns.size(); ++i) {
+            if (reg->conns[i].sock == s) {
+                reg->conns.erase(reg->conns.begin() +
+                                 static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
+    close_socket(s);
+}
+
+std::string ws_snapshot(bool auth_on, bool have_model) {
+    return std::string("{\"type\":\"health\",\"ok\":true,\"paused\":") +
+           (g_server_paused.load() ? "true" : "false") +
+           ",\"auth\":" + (auth_on ? "true" : "false") +
+           ",\"model\":" + (have_model ? "true" : "false") +
+           ",\"rss\":" +
+           std::to_string(platform::peak_rss_bytes() / 1048576) + "}";
+}
+
+void ws_thread_main(WsRegistry* reg, bool auth_on, bool have_model) {
+    namespace wsp = omniseed::server::ws;
+    using Clock = std::chrono::steady_clock;
+    auto last_tick = Clock::now() - std::chrono::seconds(3);
+    while (!g_ws_stop.load(std::memory_order_relaxed)) {
+        std::vector<WsConn> conns;
+        {
+            std::lock_guard<std::mutex> lk(reg->m);
+            conns = reg->conns;
+        }
+        // ---- drain client frames: ping -> pong, close -> ack + drop --------
+        for (WsConn& c : conns) {
+            bool dropped = false;
+            char buf[2048];
+            while (!dropped) {
+                const int n = ::recv(c.sock, buf, sizeof(buf), 0);
+                if (n <= 0) {
+#ifdef _WIN32
+                    const bool dead =
+                        (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK);
+#else
+                    const bool dead = (n == 0 || errno != EWOULDBLOCK);
+#endif
+                    if (dead) ws_close_conn(reg, c.sock);
+                    break;  // would-block (keep) or dead (dropped)
+                }
+                wsp::Frame f;
+                const wsp::ParseResult r =
+                    c.parser.feed(buf, static_cast<size_t>(n));
+                if (r == wsp::ParseResult::kNeedMore) break;
+                if (r == wsp::ParseResult::kProtocolError) {
+                    const std::string bye = wsp::encode_frame(
+                        wsp::kClose, std::string("\x03\xea", 2));  // 1002
+                    send_all(c.sock, bye.data(), bye.size());
+                    ws_close_conn(reg, c.sock);
+                    dropped = true;
+                    break;
+                }
+                while (c.parser.take(f)) {
+                    if (f.opcode == wsp::kPing) {
+                        const std::string pong =
+                            wsp::encode_frame(wsp::kPong, "");
+                        if (!send_all(c.sock, pong.data(), pong.size())) {
+                            ws_close_conn(reg, c.sock);
+                            dropped = true;
+                            break;
+                        }
+                    } else if (f.opcode == wsp::kClose) {
+                        const std::string bye =
+                            wsp::encode_frame(wsp::kClose, "");
+                        send_all(c.sock, bye.data(), bye.size());
+                        ws_close_conn(reg, c.sock);
+                        dropped = true;
+                        break;
+                    }
+                    // Console sends no data frames; anything else is consumed
+                    // and ignored (RFC 6455 endpoints must still read them).
+                }
+            }
+        }
+        // ---- periodic broadcast (also carries pause transitions) -----------
+        const auto now = Clock::now();
+        if (now - last_tick >= std::chrono::seconds(2)) {
+            last_tick = now;
+            std::vector<WsConn> cur;
+            {
+                std::lock_guard<std::mutex> lk(reg->m);
+                cur = reg->conns;
+            }
+            if (!cur.empty()) {
+                const std::string frame = wsp::encode_frame(
+                    wsp::kText, ws_snapshot(auth_on, have_model));
+                for (const WsConn& c : cur) {
+                    if (!send_all(c.sock, frame.data(), frame.size())) {
+                        ws_close_conn(reg, c.sock);
+                    }
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+}
+
+}  // namespace
+
+// Hand a freshly upgraded socket to the WS thread (never touched again here).
+void ws_adopt(Socket_t s) {
+    ws_set_nonblocking(s);
+    std::lock_guard<std::mutex> lk(g_ws.m);
+    if (g_ws.conns.size() < 64) {
+        g_ws.conns.push_back(WsConn{s, {}});
+    } else {
+        close_socket(s);
+    }
+}
 
 // Case-insensitive header value for `name`, or "" — same portable walk as
 // the Content-Length scan (no locale-dependent string ops).
@@ -734,6 +929,11 @@ int main(int argc, char** argv) {
         platform::log_info("api token: unset — endpoints open (set "
                            "OMNISEED_API_TOKEN to require auth)");
 
+    // T103: dedicated WS thread — keeps answering pings and broadcasting
+    // health snapshots even while the serial HTTP thread is mid-generation.
+    std::thread(ws_thread_main, &g_ws, !api_token.empty(), have_model)
+        .detach();
+
     while (true) {
         Socket_t client = ::accept(listener, nullptr, nullptr);
         if (client == kInvalidSocket) continue;
@@ -764,13 +964,28 @@ int main(int argc, char** argv) {
         const bool is_open = (path == "/" || path == "/index.html" ||
                               path == "/health");
         if (!is_open && !bearer_authorized(req, api_token)) {
-            respond(client,
-                    "{\"error\":\"unauthorized\",\"hint\":\"Authorization: "
-                    "Bearer <OMNISEED_API_TOKEN>\"}",
-                    "application/json", "401 Unauthorized",
-                    "WWW-Authenticate: Bearer\r\n");
-            close_socket(client);
-            continue;
+            // Browsers cannot attach headers to a WebSocket handshake, so
+            // /ws also accepts ?token=<OMNISEED_API_TOKEN> (constant-time).
+            bool ws_ok = false;
+            if (!api_token.empty() && path.compare(0, 3, "/ws") == 0 &&
+                (path.size() == 3 || path[3] == '?')) {
+                const size_t q = path.find("token=");
+                if (q != std::string::npos) {
+                    std::string v = path.substr(q + 6);
+                    const size_t amp = v.find('&');
+                    if (amp != std::string::npos) v.erase(amp);
+                    ws_ok = token_equal(v, api_token);
+                }
+            }
+            if (!ws_ok) {
+                respond(client,
+                        "{\"error\":\"unauthorized\",\"hint\":\"Authorization: "
+                        "Bearer <OMNISEED_API_TOKEN>\"}",
+                        "application/json", "401 Unauthorized",
+                        "WWW-Authenticate: Bearer\r\n");
+                close_socket(client);
+                continue;
+            }
         }
 
         if (path == "/" || path == "/index.html") {
@@ -946,6 +1161,36 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        } else if (path.compare(0, 3, "/ws") == 0 &&
+                   (path.size() == 3 || path[3] == '?')) {
+            // T103 live updates. Auth was enforced by the gate above
+            // (Bearer header or ?token=). Upgrade + hand the socket to the
+            // WS thread; the HTTP loop moves on immediately.
+            const std::string key = header_value(req, "sec-websocket-key");
+            std::string up = header_value(req, "upgrade");
+            std::transform(up.begin(), up.end(), up.begin(),
+                           [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+            if (key.empty() || up != "websocket") {
+                respond(client,
+                        "{\"error\":\"not-a-websocket-upgrade\","
+                        "\"hint\":\"GET /ws with Upgrade: websocket\"}");
+                close_socket(client);
+                continue;
+            }
+            const std::string hdr101 =
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: " +
+                omniseed::server::ws::accept_key(key) + "\r\n\r\n";
+            if (!send_all(client, hdr101.data(), hdr101.size())) {
+                close_socket(client);
+                continue;
+            }
+            ws_adopt(client);  // owned by the WS thread from here on
+            continue;
         } else {
             respond(client, "{\"error\":\"not found\"}");
         }

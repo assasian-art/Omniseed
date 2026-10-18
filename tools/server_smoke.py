@@ -19,8 +19,12 @@ real HTTP, stdlib only, no network beyond loopback:
 
 Registered in CMake as `omniseed_server_smoke`.
 """
+import base64
+import hashlib
 import json
 import os
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -160,6 +164,135 @@ def scenario_auth_mode():
         kill(p)
 
 
+# ---- T103 WebSocket scenarios (raw-socket RFC 6455 client) ------------------
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_connect(port, token=None):
+    """Raw handshake. Returns (socket, response_head, client_key)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    key = base64.b64encode(b"omniseed-smoke-key-123456").decode()
+    path = "/ws" + (("?token=" + token) if token else "")
+    req = (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    s.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    head = resp.split(b"\r\n\r\n")[0].decode("latin1", "replace")
+    return s, head, key
+
+
+def ws_recv_frame(s, timeout=8):
+    """Read one server->client frame (unmasked). Returns (opcode, payload)."""
+    s.settimeout(timeout)
+    hdr = b""
+    while len(hdr) < 2:
+        hdr += s.recv(2 - len(hdr))
+    b0, b1 = hdr[0], hdr[1]
+    ln = b1 & 0x7F
+    if ln == 126:
+        ln = struct.unpack("!H", s.recv(2))[0]
+    elif ln == 127:
+        ln = struct.unpack("!Q", s.recv(8))[0]
+    payload = b""
+    while len(payload) < ln:
+        payload += s.recv(ln - len(payload))
+    return b0 & 0x0F, payload
+
+
+def ws_send_masked(s, opcode, payload=b""):
+    """Client frame (masked, RFC 6455 requires masking)."""
+    mask = b"\x01\x02\x03\x04"
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x80 | opcode, 0x80 | n])
+    else:
+        hdr = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", n)
+    masked = bytes(payload[i] ^ mask[i % 4] for i in range(n))
+    s.sendall(hdr + mask + masked)
+
+
+def expected_accept(key):
+    return base64.b64encode(
+        hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+
+
+def scenario_ws_dev_mode():
+    port = 24000 + (os.getpid() % 3000)
+    p = boot(port)
+    try:
+        s, head, key = ws_connect(port)
+        try:
+            check("ws: handshake 101", "101" in head.split("\r\n")[0])
+            check("ws: Sec-WebSocket-Accept matches RFC vector logic",
+                  ("Sec-WebSocket-Accept: " + expected_accept(key)) in head)
+
+            op, payload = ws_recv_frame(s)
+            check("ws: first health event is a text frame", op == 0x1)
+            ev = json.loads(payload)
+            check("ws: event type=health with paused/rss",
+                  ev.get("type") == "health" and "rss" in ev and
+                  "paused" in ev)
+
+            # ping -> pong (RFC 6455 keepalive)
+            ws_send_masked(s, 0x9, b"hi")
+            op, _ = ws_recv_frame(s)
+            check("ws: masked ping answered with pong", op == 0xA)
+
+            # live propagation: REST pause -> next WS event paused:true
+            req(port, "/control", {"action": "pause"})
+            op, payload = ws_recv_frame(s)
+            ev = json.loads(payload)
+            check("ws: pause via /control propagates live (paused=true)",
+                  op == 0x1 and ev.get("paused") is True)
+            req(port, "/control", {"action": "resume"})
+
+            # clean close handshake: client close -> server echoes close
+            ws_send_masked(s, 0x8, b"\x03\xe8")
+            op, _ = ws_recv_frame(s)
+            check("ws: close frame acknowledged", op == 0x8)
+        finally:
+            s.close()
+    except Exception as e:  # noqa: BLE001 - smoke reports, doesn't crash
+        check(f"ws dev scenario completed ({type(e).__name__}: {e})", False)
+    finally:
+        kill(p)
+
+
+def scenario_ws_auth_mode():
+    port = 27000 + (os.getpid() % 3000)
+    p = boot(port, token=TOKEN)
+    try:
+        s, head, _ = ws_connect(port)
+        s.close()
+        check("ws auth: handshake without token -> 401",
+              "401" in head.split("\r\n")[0])
+        s, head, _ = ws_connect(port, token="wrong-token-xxxxx")
+        s.close()
+        check("ws auth: handshake with wrong token -> 401",
+              "401" in head.split("\r\n")[0])
+        s, head, key = ws_connect(port, token=TOKEN)
+        try:
+            check("ws auth: handshake with ?token= -> 101",
+                  "101" in head.split("\r\n")[0])
+            op, payload = ws_recv_frame(s)
+            ev = json.loads(payload)
+            check("ws auth: health event flows with auth:true",
+                  op == 0x1 and ev.get("auth") is True)
+        finally:
+            s.close()
+    except Exception as e:  # noqa: BLE001
+        check(f"ws auth scenario completed ({type(e).__name__}: {e})", False)
+    finally:
+        kill(p)
+
+
 def main():
     if server_exe() is None:
         print("FAIL omniseed_server binary not built "
@@ -167,6 +300,8 @@ def main():
         return 2
     scenario_dev_mode()
     scenario_auth_mode()
+    scenario_ws_dev_mode()
+    scenario_ws_auth_mode()
     if fails:
         print(f"server_smoke: {len(fails)} FAILED")
         return 1

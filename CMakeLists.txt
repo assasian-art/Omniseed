@@ -1208,7 +1208,7 @@ endif()
 # ------------------------- Optional HTTP server binary -----------------------
 # Built only with -DOMNISEED_BUILD_SERVER=ON; guarded in source by OMNISEED_HTTP.
 if(OMNISEED_BUILD_SERVER)
-    add_executable(omniseed_server src/server/main.cpp)
+    add_executable(omniseed_server src/server/main.cpp src/server/ws.cpp)
     target_include_directories(omniseed_server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
