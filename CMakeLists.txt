@@ -593,6 +593,22 @@ if(OMNISEED_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(omniseed_monster_signals PROPERTIES TIMEOUT 300)
 
+        # Monster exotics (T090-T093): DFA fractal Hurst, OU half-life +
+        # Rosenstein divergence (calibrated on logistic maps, stochastic
+        # noise-floor documented), false-nearest-neighbors, Granger
+        # causality with honest "not interventional" wording, strict-horizon
+        # what-if replay (prefix-invariant, refuses unreachable horizons),
+        # 2x2 zero-sum/bimatrix games with explicit representation flag,
+        # seeded genetic search (tournament max + elitism), tabular
+        # Q-learning vs the same-series baselines.
+        add_test(NAME omniseed_exotics
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_monster_exotics.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_exotics PROPERTIES TIMEOUT 300)
+
         # Self-modify harness (T075): sandboxed git repo per run — apply
         # keeps, gate failure rolls back byte-exact, allowlist + dirty-tree
         # refusals, --check parses ctest's own fail log.
