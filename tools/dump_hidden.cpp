@@ -338,8 +338,17 @@ std::string join_path(const std::string& dir, const std::string& rel) {
 bool read_modality_manifest(const std::string& manifest,
                             std::string& set_name,
                             std::vector<ModalityRow>& rows) {
+    std::vector<std::vector<std::string>> raw_all;
+    if (!read_tsv(manifest, raw_all)) return false;
+    // Comment lines ("# ...") are documentation the generators write above the
+    // header; they carry no tab, so they must be dropped BEFORE the header row
+    // is taken or every commented manifest reads as malformed (T051 anomaly).
     std::vector<std::vector<std::string>> raw;
-    if (!read_tsv(manifest, raw)) return false;
+    raw.reserve(raw_all.size());
+    for (const auto& line : raw_all) {
+        if (!line.empty() && !line[0].empty() && line[0][0] == '#') continue;
+        raw.push_back(line);
+    }
     if (raw.size() < 2) return false;
     if (raw[0].size() < 2) return false;
     set_name = raw[0][1];
