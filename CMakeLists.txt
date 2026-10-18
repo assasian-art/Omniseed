@@ -1225,6 +1225,31 @@ if(OMNISEED_BUILD_SERVER)
     if(WIN32)
         target_link_libraries(omniseed_server PRIVATE ws2_32)
     endif()
+
+    # Server integration smoke (T100/T101/T102): boots the real binary
+    # model-less on an ephemeral port and asserts health/pause/bearer-auth
+    # over real loopback HTTP. Stdlib-only python.
+    if(EXISTS "${OMNISEED_VENV_PY}")
+        add_test(NAME omniseed_server_smoke
+                 COMMAND ${CMAKE_COMMAND} -E env
+                     PYTHONIOENCODING=utf-8
+                     "${OMNISEED_VENV_PY}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/server_smoke.py"
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(omniseed_server_smoke PROPERTIES TIMEOUT 120)
+    endif()
+endif()
+
+# Render deploy dry-run (T100): offline lint of render.yaml/Dockerfile/build
+# wiring + secret-literal scan. No network; fail-closed (exit 2).
+if(EXISTS "${OMNISEED_VENV_PY}")
+    add_test(NAME omniseed_render_check
+             COMMAND ${CMAKE_COMMAND} -E env
+                 PYTHONIOENCODING=utf-8
+                 "${OMNISEED_VENV_PY}"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/render_check.py"
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(omniseed_render_check PROPERTIES TIMEOUT 120)
 endif()
 
 # -------------------------- Introspection + trading CLI ----------------------

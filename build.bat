@@ -74,8 +74,9 @@ if defined VSDIR (
 )
 
 REM ------------------------------ Configure -----------------------------------
-set SERVERFLAG=
-if /I "%1"=="server" set SERVERFLAG=-DOMNISEED_BUILD_SERVER=ON
+REM T100: the HTTP server (and its omniseed_server_smoke test) is part of the
+REM default board — Render deploys the same binary we test.
+set SERVERFLAG=-DOMNISEED_BUILD_SERVER=ON
 
 echo [omniseed] Configuring (%BUILDTYPE%)...
 cmake -S . -B %BUILDDIR% -G "%GENERATOR%" %EXTRA% ^

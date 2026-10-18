@@ -114,10 +114,13 @@ void close_socket(Socket_t s) {
 }
 
 void respond(Socket_t client, const std::string& body,
-             const char* content_type = "application/json") {
+             const char* content_type = "application/json",
+             const std::string& status_line = "200 OK",
+             const std::string& extra_headers = "") {
     std::string hdr =
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 " + status_line + "\r\n"
         "Content-Type: " + std::string(content_type) + "\r\n" +
+        extra_headers +
         "Content-Length: " + std::to_string(body.size()) + "\r\n"
         "Connection: close\r\n\r\n";
     send_all(client, hdr.c_str(), hdr.size());
@@ -763,7 +766,9 @@ int main(int argc, char** argv) {
         if (!is_open && !bearer_authorized(req, api_token)) {
             respond(client,
                     "{\"error\":\"unauthorized\",\"hint\":\"Authorization: "
-                    "Bearer <OMNISEED_API_TOKEN>\"}");
+                    "Bearer <OMNISEED_API_TOKEN>\"}",
+                    "application/json", "401 Unauthorized",
+                    "WWW-Authenticate: Bearer\r\n");
             close_socket(client);
             continue;
         }
@@ -815,9 +820,19 @@ int main(int argc, char** argv) {
             }
             respond(client, std::string("{\"paused\":") +
                             (g_server_paused ? "true" : "false") + "}");
-        } else if (path == "/ask" && method == "POST" && have_model) {
+        } else if (path == "/ask" && method == "POST") {
+            // Pause gate BEFORE the model check: a paused server answers
+            // {"error":"paused"} even when no GGUF is loaded (the
+            // model-less omniseed_server_smoke asserts this contract).
             if (g_server_paused.load()) {
                 respond(client, "{\"error\":\"paused\",\"paused\":true}");
+                close_socket(client);
+                continue;
+            }
+            if (!have_model) {
+                respond(client,
+                        "{\"error\":\"no-model\",\"hint\":\"restart with "
+                        "--model <gguf>\"}");
                 close_socket(client);
                 continue;
             }
@@ -845,9 +860,17 @@ int main(int argc, char** argv) {
             }
             b += "}";
             respond(client, b);
-        } else if (path == "/gen" && method == "POST" && have_model) {
+        } else if (path == "/gen" && method == "POST") {
+            // Pause gate BEFORE the model check (see /ask above).
             if (g_server_paused.load()) {
                 respond(client, "{\"error\":\"paused\",\"paused\":true}");
+                close_socket(client);
+                continue;
+            }
+            if (!have_model) {
+                respond(client,
+                        "{\"error\":\"no-model\",\"hint\":\"restart with "
+                        "--model <gguf>\"}");
                 close_socket(client);
                 continue;
             }
