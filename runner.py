@@ -171,6 +171,8 @@ def build_prompt(task_id: str, desc: str, error_tail: str = "") -> str:
         f"TASK {task_id}: {desc}. "
         "You are working in the OmniSeed repo (pure C++17, CMake, MSVC). "
         "FIRST read PROJECT_STATE.md NEXT-STEPS section and state/blocked.md for this task's context; "
+        "if the task text references a design/brief file (state/*.md), read that file first — it is the authoritative design; "
+        "PROJECT_STATE.md is 300KB+ — grep it for the relevant section, never read it whole; "
         "check whether the capability already exists ([VERIFY] rule). "
         "Rules: one micro-task, <=40 lines of meaningful change; add or extend unit tests; "
         "build with `cmake --build build --config Release` and run `ctest --test-dir build -C Release` "

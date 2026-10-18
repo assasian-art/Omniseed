@@ -5482,3 +5482,17 @@ in the isotonic expansion.
 support, gates every write on beating the identity map on a chronological
 holdout, and stamps corpus provenance — while the softmax-weight half of
 "self-refit" stays openly open in FEEDBACK.md §9.
+
+
+---
+
+## § P9 DEPLOY — CLOSED 2026-10-18 (orchestrator session)
+
+Master Plan #7 done in-repo: T100 tools/render_check.py (19 offline checks, ctest omniseed_render_check) + build.bat builds server by default; T101 pause toggle verified live (omniseed_server_smoke); T102 bearer auth verified + FIXED to real HTTP 401 + WWW-Authenticate (was 200+error-body) + pause gate moved BEFORE model check; T103 /ws live updates (see ws.h/ws.cpp + omniseed_ws 70/70 + WS smoke scenarios incl live pause propagation + ?token= auth). NEW suites: omniseed_server_smoke, omniseed_render_check, omniseed_ws. NOT done (honest): live Render deploy needs owner login (RENDER_LIVE_CHECKLIST.md). dashboard.html is the trading-daemon view (api/state) — separate surface; server console (GET /) is WS-wired. Engine note: opencode CLI providers all dead today — runner.py parked, main session executed queue (state/blocked.md OPencode-ENGINE + lora_e2e board hang under 8GB RAM).
+
+## § T110-T111 + VISION UNBLOCK — 2026-10-18 (same session)
+
+T110/I7: tools/monster/dift.py two-window drift detector (PH implemented first, calibrated OUT with evidence) + drift gate in nightly_refit.run_nightly (hot -> keep-old, no map written; verified both ways). ctest omniseed_monster_drift.
+T111/I8: runtime calibration-map consumer (include/omniseed/runtime/calibration.h + src/runtime/calibration.cpp); trustworthy() gate FAIL-CLOSED (missing/malformed/unaccepted/1-bin => identity report, gate shut). ctest omniseed_calibration_map (name distinct from M4 omniseed_calibration). Next step: wire gate into AgentLoop/agent2 decision paths.
+VISION DATA: cifar-10-python.tar.gz fetched via mirror chain (cs.toronto.edu dead; brainchip byte-identical mirror + HF fallback), canonical md5 pinned BEFORE pickle unpickling (security), PPM + images.tsv manifest emitted; dump_hidden vision + train_heads --vision ready (2-class honest framing vs majority baseline). Old block root causes: stale stub dir false-'installed', labels-only extraction, RAW-RECORD parse of a PICKLE (12 garbage rows).
+ENGINE: runner.py parked (state/blocked.md OPencode-ENGINE has the unblock matrix). Main session executed the queue directly this session.
