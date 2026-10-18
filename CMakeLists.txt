@@ -1252,6 +1252,20 @@ if(EXISTS "${OMNISEED_VENV_PY}")
     set_tests_properties(omniseed_render_check PROPERTIES TIMEOUT 120)
 endif()
 
+# T103 WebSocket primitives (RFC 6455): SHA-1/base64/accept-key + strict
+# frame codec. Standalone target — no server, no sockets, no deps.
+add_executable(omniseed_ws_test
+    tests/test_server_ws.cpp
+    src/server/ws.cpp)
+target_include_directories(omniseed_ws_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(MSVC)
+    target_compile_options(omniseed_ws_test PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(omniseed_ws_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME omniseed_ws COMMAND omniseed_ws_test)
+
 # -------------------------- Introspection + trading CLI ----------------------
 # Separate binary so the core CLI stays lean; shares omniseed_core.
 if(OMNISEED_BUILD_AGENT2)
