@@ -19,7 +19,7 @@ namespace {
 constexpr int64_t kMaxStackRank = 256;
 } // namespace
 
-bool LoraAdapter::load(const std::string& path) {
+bool LoraAdapter::load(const std::string& path, bool build_hot) {
     valid_ = false;
     error_.clear();
     if (!store_.open(path)) {
@@ -43,8 +43,83 @@ bool LoraAdapter::load(const std::string& path) {
         return false;
     }
     valid_ = true;
-    build_hot_cache();
+    // T122b: LoraBank idle adapters skip the hot copies (mmap-only cost);
+    // hot_entry() then returns nullptr for every slot — set_lora() on such
+    // an adapter is a no-op, which is exactly right for an idle skill.
+    if (build_hot) build_hot_cache();
+    else           hot_.clear();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// T122b composite builder (LoraBank only)
+// ---------------------------------------------------------------------------
+void LoraAdapter::begin_composite(int32_t n_embd, int32_t layer_count) {
+    // A composite is a LoraAdapter whose "store_" is nobody's file: only the
+    // hot cache carries data, geometry mirrors the base model, and scaling_
+    // is 1.0 because fold() bakes each source's scaling into its b32 copy.
+    valid_ = true;
+    error_.clear();
+    rank_        = 0;              // composite rank = max across folded slots
+    layer_count_ = layer_count;
+    n_embd_      = n_embd;
+    scaling_     = 1.0f;
+    hot_.clear();
+    for (int32_t l = 0; l < layer_count; ++l) hot_.emplace_back();
+}
+
+int64_t LoraAdapter::fold(const LoraAdapter& src, bool overwrite) {
+    if (!valid_ || !src.valid_) return 0;
+    if (src.layer_count_ != layer_count_) return 0;   // geometry refuse
+    int64_t filled = 0;
+    for (int32_t l = 0; l < layer_count_; ++l) {
+        for (int t = 0; t < 6; ++t) {
+            const LoraTarget target = static_cast<LoraTarget>(t);
+            HotEntry& de = hot_[static_cast<size_t>(l)][static_cast<size_t>(t)];
+            if (de.rank > 0 && !overwrite) continue;    // earlier wins
+
+            // Source data: HOT path when the source built hot copies (direct
+            // adapter), ZERO-COPY fp16 views when it is a bank idle adapter
+            // (build_hot=false) — fold converts once, so idle mmap adapters
+            // still compose. Either way the copied arrays are owned here.
+            const LoraAdapter::HotEntry* se = src.hot_entry(l, target);
+            int64_t r = 0, nin = 0, nout = 0;
+            std::vector<float> a32, b32;
+            if (se != nullptr && se->rank > 0) {
+                r = se->rank; nin = n_embd_; nout = se->out;
+                a32.assign(se->a32.get(),
+                           se->a32.get() + r * nin);
+                b32.assign(se->b32.get(),
+                           se->b32.get() + nout * r);
+            } else {
+                const Factors f = src.factors(l, target);
+                if (f.a.numel() == 0 || f.b.numel() == 0) continue;
+                r = f.a.dim(0); nin = f.a.dim(1); nout = f.b.dim(0);
+                if (nin != n_embd_) return 0;          // in-dim refuse
+                a32.resize(static_cast<size_t>(r * nin));
+                b32.resize(static_cast<size_t>(nout * r));
+                for (int64_t i = 0; i < r * nin; ++i)
+                    a32[static_cast<size_t>(i)] = half_to_float(f.a.f16()[i]);
+                for (int64_t i = 0; i < nout * r; ++i)
+                    b32[static_cast<size_t>(i)] = half_to_float(f.b.f16()[i]);
+            }
+            de.rank = r;
+            de.out  = nout;
+            de.a32 = std::make_unique<float[]>(static_cast<size_t>(r * nin));
+            de.b32 = std::make_unique<float[]>(static_cast<size_t>(nout * r));
+            std::memcpy(de.a32.get(), a32.data(),
+                        static_cast<size_t>(r * nin) * sizeof(float));
+            // Bake source scaling into b32 (lora.h contract) — composite's
+            // scaling_ stays 1.0 so apply_targeted reproduces source math.
+            for (size_t i = 0; i < b32.size(); ++i)
+                b32[i] *= src.scaling_;
+            std::memcpy(de.b32.get(), b32.data(),
+                        static_cast<size_t>(nout * r) * sizeof(float));
+            if (r > rank_) rank_ = static_cast<int32_t>(r);
+            ++filled;
+        }
+    }
+    return filled;
 }
 
 LoraAdapter::Factors LoraAdapter::factors(int32_t layer,
@@ -107,6 +182,9 @@ void LoraAdapter::build_hot_cache() {
 const LoraAdapter::HotEntry* LoraAdapter::hot_entry(int32_t layer,
                                                     LoraTarget target) const {
     if (layer < 0 || layer >= layer_count_) return nullptr;
+    // T122b: idle bank adapters load with build_hot=false -> hot_ is EMPTY;
+    // indexing it would be OOB. Size guard makes them uniform no-ops.
+    if (hot_.empty()) return nullptr;
     const HotEntry& e =
         hot_[static_cast<size_t>(layer)][static_cast<size_t>(target)];
     return (e.rank > 0 && e.a32 && e.b32) ? &e : nullptr;

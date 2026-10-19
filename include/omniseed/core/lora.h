@@ -40,7 +40,11 @@ public:
     LoraAdapter() = default;
 
     // Loads the sidecar GGUF (stays mapped for zero-copy A/B views).
-    bool load(const std::string& path);
+    // build_hot=false skips the per-slot fp32 copies: the file stays mapped
+    // (zero-copy factors() views still work) but hot_entry() returns nullptr
+    // for every slot — LoraBank's loaded-but-idle adapters use this so ONLY
+    // the composite pays hot memory (state/task_T122_brief.md).
+    bool load(const std::string& path, bool build_hot = true);
     bool valid() const { return valid_; }
     const std::string& error() const { return error_; }
 
@@ -79,6 +83,35 @@ public:
     static void apply_lora(const Tensor& B, const Tensor& A, float scaling,
                            const float* x, float* y,
                            int64_t out_dim, int64_t in_dim);
+
+    // ---- T122b composite builder (LoraBank only) ---------------------------
+    // begin_composite(): reset to an empty-but-valid composite with the
+    // base model's geometry. fold(): deep-copy `src`'s HOT entries into this
+    // composite for every (layer,target) slot — later folds win an already
+    // filled slot when `overwrite` (bank's later-activation-wins rule; the
+    // winner count is what LoraBank::shadowed_slots reports).
+    // EXACTNESS: `src`'s scaling is BAKED into the copied b32 rows here, so
+    // the composite's own scaling_ stays 1.0 and apply_targeted()'s single
+    // `lora_->scaling()` multiply reproduces the source math bit-exactly
+    // (scaling*x == (x*scaling) per-element — same one rounding, same side).
+    // Deep copy (not aliasing) means an ACTIVE-source LRU eviction can never
+    // dangle the composite: active adapters are also never evicted, belt+braces.
+    void begin_composite(int32_t n_embd, int32_t layer_count);
+    int64_t fold(const LoraAdapter& src, bool overwrite);
+    // Detach semantics for LoraBank: reset to a default (invalid, no hot)
+    // adapter IN PLACE. GgufLoader's user-declared dtor suppresses implicit
+    // move for the whole aggregate, so `*this = LoraAdapter()` won't compile;
+    // field-wise clear works and never touches store_ (a composite never
+    // opens a file — fold() copies data, begin_composite() sets geometry).
+    void reset_composite() {
+        valid_       = false;
+        error_.clear();
+        rank_        = 0;
+        layer_count_ = 0;
+        n_embd_      = 0;
+        scaling_     = 1.0f;
+        hot_.clear();
+    }
 
 private:
     GgufLoader store_;

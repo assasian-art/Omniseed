@@ -83,6 +83,7 @@ set(OMNISEED_CORE_SOURCES
     src/core/gguf_loader.cpp
     src/core/tokenizer.cpp
     src/core/lora.cpp
+    src/core/lora_bank.cpp
     src/core/bitlinear_avx2.cpp
     src/vision/mobilenet_v4.cpp
     src/vision/unicompress.cpp
@@ -307,6 +308,23 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_lora COMMAND omniseed_lora
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_lora PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # T122b LoRA bank: mmap-only idle adapters, atomic activation, later-wins
+    # override + shadow accounting, geometry quarantine, LRU idle-only
+    # eviction. Hand-written synthetic sidecars — no Python, no model.
+    add_executable(omniseed_lora_bank tests/test_lora_bank.cpp)
+    target_include_directories(omniseed_lora_bank PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_lora_bank PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_lora_bank PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_lora_bank PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_lora_bank COMMAND omniseed_lora_bank
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_lora_bank PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # Assistant-LoRA E2E regression (degenerate-run guard): the driver
     # trains 12 steps on tests/fixtures/lora_chat_tiny.tsv with the venv
