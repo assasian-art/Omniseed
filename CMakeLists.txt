@@ -893,6 +893,24 @@ if(OMNISEED_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_fitted_heads PRIVATE _CRT_SECURE_NO_WARNINGS)
 
+    # T120b: grouped int4 FFN (g=64) — nibble pack/unpack round-trip, kernel
+    # vs fp32 reference bit-exactness (same accumulation order), and the
+    # i4g64_layout_ok load-time gate (bad gscale numel / in_dim%64 refused).
+    # No model, no Python, fully offline.
+    add_executable(omniseed_int4_ffn tests/test_int4_ffn.cpp)
+    target_include_directories(omniseed_int4_ffn PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_int4_ffn PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_int4_ffn PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_int4_ffn PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_int4_ffn COMMAND omniseed_int4_ffn
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_int4_ffn PRIVATE _CRT_SECURE_NO_WARNINGS)
+
     # The language domain, in C++ with no model and no Python: UTF-8 script
     # detection (Bengali from its own Unicode block), the tokenizer, intent
     # rules for EN and BN, and the sentiment negation SCOPING rule ("not bad,

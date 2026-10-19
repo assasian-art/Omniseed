@@ -30,6 +30,8 @@ enum class DType : int32_t {
     I8   = 2,     // signed byte (scales, KV, int8 kernels)
     I32  = 3,     // indices, token ids
     TERNARY = 4,  // BitNet 1.58-bit: 2 weights/byte, sign-magnitude packed
+    I4G64 = 5,    // T120b: grouped int4 (g=64), 2 nibbles/byte; per-group
+                  // fp32 scales ride a separate .gscale tensor, NOT here
 };
 
 size_t dtype_size(DType t);

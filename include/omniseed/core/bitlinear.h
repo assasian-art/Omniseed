@@ -75,6 +75,26 @@ void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
                           const float* x, float* y,
                           int64_t out_dim, int64_t in_dim);
 
+// T120b grouped int4 (g=64): W_i4 packs 2 signed nibbles/byte (low nibble =
+// even column, two's complement -8..7); gscale is [out_dim, in_dim/64]
+// row-major fp32 (per-group scale). in_dim MUST be divisible by 64 — the
+// loader refuses otherwise; this kernel documents, not re-checks (hot path).
+//   y[r] = sum_g gscale[r,g] * sum_{c in g} q4(r,c) * x[c]
+// Scalar reference implementation; A/B'd bit-exactly against the dequantized
+// fp32 dot in tests/test_int4_ffn.cpp (same accumulation order).
+void bitlinear_forward_i4g64(const uint8_t* W_i4, const float* gscale,
+                             const float* x, float* y,
+                             int64_t out_dim, int64_t in_dim);
+
+// Fail-closed load-time layout gate for the I4G64 pair: in_dim must divide
+// by the group size (64) and the .gscale tensor must carry exactly
+// out_dim * (in_dim / 64) values. Loader calls this BEFORE any kernel does.
+inline bool i4g64_layout_ok(int64_t out_dim, int64_t in_dim,
+                            int64_t gscale_numel) {
+    if (out_dim <= 0 || in_dim <= 0 || in_dim % 64 != 0) return false;
+    return gscale_numel == out_dim * (in_dim / 64);
+}
+
 // Per-row PACKED ternary (2 weights/byte, low nibble = even index, layout
 // identical to bitlinear_forward_rows): y[r] = scales[r] * (W . x).
 // Same SIMD/dispatch contract as bitlinear_forward_i8 (see bitlinear.cpp):

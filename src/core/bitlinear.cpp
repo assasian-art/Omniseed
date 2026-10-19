@@ -229,6 +229,31 @@ void bitlinear_forward_i8(const int8_t* W_i8, const float* scales,
     g_i8_fn(W_i8, scales, x, y, out_dim, in_dim);
 }
 
+// T120b: grouped int4 unpack-in-matvec (scalar; correctness first — the gate
+// is ppl + resident RAM, not tok/s; an AVX2 unpack lands only if latency
+// regresses the measured harness).
+void bitlinear_forward_i4g64(const uint8_t* W_i4, const float* gscale,
+                             const float* x, float* y,
+                             int64_t out_dim, int64_t in_dim) {
+    const int64_t groups = in_dim / 64;
+    for (int64_t r = 0; r < out_dim; ++r) {
+        const uint8_t* row = W_i4 + r * in_dim / 2;   // 2 nibbles/byte
+        float acc = 0.0f;
+        for (int64_t g = 0; g < groups; ++g) {
+            float inner = 0.0f;
+            for (int64_t c = g * 64; c < (g + 1) * 64; ++c) {
+                const uint8_t byte = row[c / 2];
+                int32_t q = (c & 1) ? static_cast<int32_t>(byte >> 4)
+                                    : static_cast<int32_t>(byte & 0x0F);
+                if (q > 7) q -= 16;                    // signed nibble
+                inner += static_cast<float>(q) * x[c];
+            }
+            acc += gscale[r * groups + g] * inner;
+        }
+        y[r] = acc;
+    }
+}
+
 void bitlinear_forward_rows_simd(const uint8_t* W_packed, const float* scales,
                                  const float* x, float* y,
                                  int64_t out_dim, int64_t in_dim) {

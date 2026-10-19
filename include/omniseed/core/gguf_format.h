@@ -45,6 +45,10 @@ enum class GgufDType : int32_t {
     I32     = 5,
     // 40+ are reserved for vendor formats; OmniSeed registers TERNARY at 40.
     TERNARY = 40,  // BitNet b1.58 packed, 2 weights/byte (OmniSeed-specific)
+    // T120b: grouped int4, group size 64 — 2 nibbles/byte + per-group fp32
+    // scales in a SEPARATE `<name>.gscale` tensor (keeps this tensor's byte
+    // math a flat numel/2, same trick as TERNARY's half-byte packing).
+    I4G64   = 41,
 };
 
 // ---------------------------------------------------------------------------

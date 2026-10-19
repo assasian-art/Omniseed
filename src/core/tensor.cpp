@@ -19,6 +19,7 @@ size_t dtype_size(DType t) {
         case DType::I8:      return 1;
         case DType::I32:     return 4;
         case DType::TERNARY: return 1;   // 2 weights per byte = 0.5 B/weight
+        case DType::I4G64:   return 1;   // 2 nibbles per byte = 0.5 B/weight
         default:             return 0;
     }
 }
@@ -30,6 +31,7 @@ const char* dtype_name(DType t) {
         case DType::I8:      return "i8";
         case DType::I32:     return "i32";
         case DType::TERNARY: return "ternary(1.58-bit)";
+        case DType::I4G64:   return "int4-grouped(g=64)";
         default:             return "?";
     }
 }
@@ -102,9 +104,10 @@ int64_t Tensor::numel() const {
 }
 
 size_t Tensor::nbytes() const {
-    // TERNARY packs two weights per byte: the stored region is (numel+1)/2
-    // bytes, not numel. This must match GgufLoader::read_tensor_dir.
-    if (dtype_ == DType::TERNARY)
+    // Half-byte packings (TERNARY 2/byte, I4G64 nibbles 2/byte): the stored
+    // region is (numel+1)/2 bytes, not numel. Must match GgufLoader's
+    // read_tensor_dir byte math for the same dtype.
+    if (dtype_ == DType::TERNARY || dtype_ == DType::I4G64)
         return static_cast<size_t>((numel() + 1) / 2);
     return static_cast<size_t>(numel()) * dtype_size(dtype_);
 }

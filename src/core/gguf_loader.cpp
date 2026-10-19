@@ -176,6 +176,7 @@ size_t gguf_dtype_size(gguf::GgufDType t) {
         case gguf::GgufDType::I8:      return 1;
         case gguf::GgufDType::I32:     return 4;
         case gguf::GgufDType::TERNARY: return 0;   // handled specially (2/byte)
+        case gguf::GgufDType::I4G64:   return 0;   // handled specially (2/byte)
         default:                       return 0;
     }
 }
@@ -187,6 +188,7 @@ DType to_tensor_dtype(gguf::GgufDType t) {
         case gguf::GgufDType::I8:      return DType::I8;
         case gguf::GgufDType::I32:     return DType::I32;
         case gguf::GgufDType::TERNARY: return DType::TERNARY;
+        case gguf::GgufDType::I4G64:   return DType::I4G64;
         default:                       return DType::F32;
     }
 }
@@ -261,15 +263,16 @@ bool GgufLoader::read_tensor_dir() {
         // Compute byte size; GGUF dims are reversed vs row-major.
         int64_t numel = 1;
         for (const int64_t d : info.dims) numel *= d;
-        const bool is_ternary = (ggtype == GgufDType::TERNARY);
+        const bool is_half_byte = (ggtype == GgufDType::TERNARY ||
+                                   ggtype == GgufDType::I4G64);  // 2 weights/byte
         const size_t esz = gguf_dtype_size(ggtype);
-        if (esz == 0 && !is_ternary) {
+        if (esz == 0 && !is_half_byte) {
             error_ = "tensor '" + info.name + "': unsupported dtype " +
                      std::to_string(static_cast<int>(ggtype));
             return false;
         }
         info.type   = ggtype;   // store raw GGUF dtype
-        info.nbytes = is_ternary
+        info.nbytes = is_half_byte
                           ? static_cast<uint64_t>((numel + 1) / 2)  // 2 weights/byte
                           : static_cast<uint64_t>(numel) * esz;
 

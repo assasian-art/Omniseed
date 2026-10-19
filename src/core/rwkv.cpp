@@ -175,8 +175,9 @@ Tensor load_ternary_view(const GgufLoader& gg, const std::string& name,
         return Tensor();
     }
     Tensor t = gg.tensor(name);
-    if (t.dtype() != DType::TERNARY && t.dtype() != DType::I8) {
-        err = "tensor " + name + ": expected ternary/int8, got " +
+    if (t.dtype() != DType::TERNARY && t.dtype() != DType::I8 &&
+        t.dtype() != DType::I4G64) {
+        err = "tensor " + name + ": expected ternary/int8/int4g64, got " +
               dtype_name(t.dtype());
         return Tensor();
     }
@@ -371,11 +372,36 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
         w.F_key   = load_ternary_view(gg, p + "ffn.key.weight", fe, error_);
         w.F_value = load_ternary_view(gg, p + "ffn.value.weight", ef, error_);
         if (!error_.empty()) return false;
-        w.sc_fk = load_f32(gg, p + "ffn.key.scale", error_, false);
-        w.sc_fv = load_f32(gg, p + "ffn.value.scale", error_, false);
+        if (w.F_key.dtype() == DType::I4G64 ||
+            w.F_value.dtype() == DType::I4G64) {
+            // T120b fail-closed: BOTH must be int4 (a half-converted pair has
+            // no defined runtime semantics), in_dim % 64 == 0, and the
+            // per-group scale tensor must carry exactly out*(in/64) values.
+            if (w.F_key.dtype() != w.F_value.dtype()) {
+                error_ = p + "ffn: mixed dtypes (key/value must both be "
+                         "int4g64 or neither)";
+                return false;
+            }
+            w.sc_fk = load_f32(gg, p + "ffn.key.gscale", error_);
+            if (!error_.empty()) return false;
+            w.sc_fv = load_f32(gg, p + "ffn.value.gscale", error_);
+            if (!error_.empty()) return false;
+            if (!bitnet::i4g64_layout_ok(cfg_.ffn_inter, E, w.sc_fk.numel()) ||
+                !bitnet::i4g64_layout_ok(E, cfg_.ffn_inter, w.sc_fv.numel())) {
+                error_ = p + "ffn: int4g64 layout refused (in_dim % 64 != 0 "
+                         "or .gscale numel != out*(in/64))";
+                return false;
+            }
+            w.fk_scale = 1.0f;   // group scales carry all quantisation info
+            w.fv_scale = 1.0f;
+        } else {
+            w.sc_fk = load_f32(gg, p + "ffn.key.scale", error_, false);
+            w.sc_fv = load_f32(gg, p + "ffn.value.scale", error_, false);
+            if (!error_.empty()) return false;
+            w.fk_scale = static_cast<float>(gg.get_f64(p + "ffn.key.scale", 1.0));
+            w.fv_scale = static_cast<float>(gg.get_f64(p + "ffn.value.scale", 1.0));
+        }
         if (!error_.empty()) return false;
-        w.fk_scale = static_cast<float>(gg.get_f64(p + "ffn.key.scale", 1.0));
-        w.fv_scale = static_cast<float>(gg.get_f64(p + "ffn.value.scale", 1.0));
     }
 
     return true;
@@ -439,6 +465,14 @@ void RwkvModel::project(const Tensor& W, float scale, const float* x,
 void RwkvModel::project(const Tensor& W, const Tensor& scales,
                         float scalar_scale, const float* x, float* y,
                         int64_t out_dim, int64_t in_dim) const {
+    if (W.dtype() == DType::I4G64) {
+        // T120b: scales here IS the [out, in/64] per-group gscale tensor
+        // (validated at load: i4g64_layout_ok). scalar_scale deliberately
+        // ignored — group scales carry all quantisation info.
+        bitnet::bitlinear_forward_i4g64(W.packed(), scales.f32(), x, y,
+                                        out_dim, in_dim);
+        return;
+    }
     if (scales.numel() == out_dim) {
         if (W.dtype() == DType::I8) {
             // int8: dequantize the row on the fly (i8 kernel handles the
