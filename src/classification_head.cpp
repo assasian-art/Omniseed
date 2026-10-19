@@ -86,6 +86,9 @@ const std::vector<DomainLabelSetSpec>& default_domain_label_sets() {
         // --- vision ---------------------------------------------------------
         {"vision.scene", {"indoor", "outdoor", "nature", "urban", "unknown"}},
         {"vision.anomaly", {"normal", "unusual"}},
+        // T113c: next-bar direction of a rendered candlestick window. Labels
+        // match models/modality/vision.candlestick/images.tsv (col "direction").
+        {"vision.candlestick", {"up", "down"}},
         // --- audio ----------------------------------------------------------
         {"audio.wake", {"yes", "no"}},
         {"audio.emotion", {"happy", "sad", "angry", "neutral"}},

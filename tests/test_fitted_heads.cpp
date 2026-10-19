@@ -40,6 +40,21 @@
 //
 //  PART D — set_heads_dir() drops every cache (an old-dir blob must not
 //  answer for a new dir).
+//
+//  PART E — T113c regression: vision bins are PER SET, not one family bin.
+//  bin_for_set() used to map every "vision.*" at vision_head.bin, which
+//  carries only vision.scene — so vision.anomaly (and now vision.candlestick)
+//  refused against a blob that exists on disk.
+//      E1  bin_for_set unit checks: scene -> vision_head.bin, anomaly ->
+//          vision_anomaly_head.bin, candlestick -> vision_candlestick_head.bin,
+//          unmapped vision.* -> "" (refuse, no guess)
+//      E2  real vision_anomaly_head.bin (gated): "vision.anomaly" ANSWERS at
+//          E=768; "vision.scene" against the same blob dir refuses
+//      E3  canonical-list sync: every vision.* set with an explicit bin in
+//          bin_for_set() must exist in default_domain_label_sets() (the same
+//          list tools/train_heads.py parses), with vision.candlestick's labels
+//          pinned to exactly {"up","down"}; the reverse direction too — a
+//          canonical vision set with no mapped bin fails the test.
 // =============================================================================
 #include "omniseed/classification_head.h"
 #include "omniseed/core/platform.h"
@@ -138,6 +153,7 @@ bool write_synthetic_blob(const std::string& path, int32_t E,
 const char* kTmpDir = "build/omniseed_fitted_heads_dir";      // A/B/D
 const char* kBadDir  = "build/omniseed_fitted_heads_dir_bad"; // B3
 const char* kRealDir = "build/omniseed_fitted_heads_dir_real"; // C
+const char* kAnomDir = "build/omniseed_fitted_heads_dir_anom"; // E2
 
 } // namespace
 
@@ -146,6 +162,7 @@ int main() {
     make_dir(kTmpDir);
     make_dir(kBadDir);
     make_dir(kRealDir);
+    make_dir(kAnomDir);
 
     // ===================== PART A — discovery + happy path ==================
     TEST("A1: load() discovers the fitted bins by filename convention");
@@ -338,6 +355,112 @@ int main() {
         // And pointing back restores service (re-read from disk).
         fh.set_heads_dir(kTmpDir);
         CHECK(!is_refusal(fh.classify(hidden.data(), "vision.scene", 3, 8)));
+    }
+
+    // ============ PART E — vision bins are PER SET (T113c regression) =======
+    TEST("E1: bin_for_set maps vision sets to their PER-SET bins");
+    {
+        CHECK(FittedHeads::bin_for_set("vision.scene") == "vision_head.bin");
+        CHECK(FittedHeads::bin_for_set("vision.anomaly") ==
+              "vision_anomaly_head.bin");
+        CHECK(FittedHeads::bin_for_set("vision.candlestick") ==
+              "vision_candlestick_head.bin");
+        // An unmapped vision.* set must refuse (""), NOT be guessed into
+        // vision_head.bin (which carries only vision.scene):
+        CHECK(FittedHeads::bin_for_set("vision.unknown") == "");
+        CHECK(FittedHeads::bin_for_set("vision") == "");
+        // Prefix families and the trading split are unchanged:
+        CHECK(FittedHeads::bin_for_set("language.intent") == "language_head.bin");
+        CHECK(FittedHeads::bin_for_set("audio.wake") == "audio_head.bin");
+        CHECK(FittedHeads::bin_for_set("trading.regime") ==
+              "trading_regime_head.bin");
+        CHECK(FittedHeads::bin_for_set("trading.action") == "trading_head.bin");
+        CHECK(FittedHeads::bin_for_set("general.routing") == "");
+    }
+
+    TEST("E2: real vision_anomaly_head.bin answers vision.anomaly (gated)");
+    {
+        const std::string src = "models/heads/vision_anomaly_head.bin";
+        std::vector<uint8_t> blob;
+        if (!file_bytes(src, blob)) {
+            SKIP("models/heads/vision_anomaly_head.bin absent (clean checkout)");
+        } else {
+            // A dir carrying ONLY the anomaly blob: with the old prefix map,
+            // vision.anomaly -> vision_head.bin (missing here, and carrying
+            // vision.scene anyway) could never answer.
+            const std::string dst = std::string(kAnomDir) + "/vision_anomaly_head.bin";
+            CHECK(write_bytes(dst, blob));
+            FittedHeads fh;
+            fh.set_heads_dir(kAnomDir);
+            CHECK(fh.available("vision.anomaly") == true);
+            const std::vector<float> h768(768, 0.0f);
+            const ClassificationResult ok =
+                fh.classify(h768.data(), "vision.anomaly", 2, 768);
+            CHECK(!is_refusal(ok));
+            CHECK(ok.domain == "vision.anomaly");
+            CHECK(!ok.top_k.empty());
+            // vision.scene maps to vision_head.bin, NOT carried by this dir:
+            // refusal, not a cross-set answer from the anomaly blob.
+            CHECK(is_refusal(fh.classify(h768.data(), "vision.scene", 2, 768)));
+            CHECK(fh.error().find("vision_head.bin") != std::string::npos);
+            // Off-parity guard still holds on the new path:
+            const std::vector<float> h512(512, 0.0f);
+            CHECK(is_refusal(fh.classify(h512.data(), "vision.anomaly", 2, 512)));
+        }
+    }
+
+    TEST("E2b: real vision_candlestick_head.bin answers vision.candlestick (gated)");
+    {
+        const std::string src = "models/heads/vision_candlestick_head.bin";
+        std::vector<uint8_t> blob;
+        if (!file_bytes(src, blob)) {
+            SKIP("models/heads/vision_candlestick_head.bin absent (clean checkout)");
+        } else {
+            const std::string dir = "build/omniseed_fitted_heads_dir_candle";
+            make_dir(dir);
+            CHECK(write_bytes(dir + "/vision_candlestick_head.bin", blob));
+            FittedHeads fh;
+            fh.set_heads_dir(dir);
+            CHECK(fh.available("vision.candlestick") == true);
+            const std::vector<float> h768(768, 0.0f);
+            const ClassificationResult ok =
+                fh.classify(h768.data(), "vision.candlestick", 2, 768);
+            CHECK(!is_refusal(ok));
+            CHECK(ok.domain == "vision.candlestick");
+            CHECK(ok.top_k.size() == 2);  // K=2 blob answers with both labels
+            CHECK(is_refusal(fh.classify(h768.data(), "vision.scene", 2, 768)));
+        }
+    }
+
+    TEST("E3: every vision set with a mapped bin is in the C++ canonical list");
+    {
+        // The canonical list tools/train_heads.py parses lives in
+        // default_domain_label_sets(); a vision set FittedHeads maps but the
+        // list lacks = fit-time "not in the C++ canonical list" failure (the
+        // exact T113c bug). Drift in EITHER direction fails here.
+        bool saw_candlestick = false;
+        for (const DomainLabelSetSpec& spec : default_domain_label_sets()) {
+            const std::string name = spec.name;
+            if (name.rfind("vision.", 0) != 0) continue;
+            CHECK(FittedHeads::bin_for_set(name) != "");
+            if (name == "vision.candlestick") {
+                saw_candlestick = true;
+                CHECK(spec.labels.size() == 2);
+                CHECK(std::string(spec.labels[0]) == "up");
+                CHECK(std::string(spec.labels[1]) == "down");
+            }
+        }
+        CHECK(saw_candlestick == true);
+        // And the reverse: the explicit bins in bin_for_set() must resolve to
+        // a canonical set (walk the map's three known vision entries).
+        const char* kMapped[] = {"vision.scene", "vision.anomaly",
+                                 "vision.candlestick"};
+        for (const char* mapped : kMapped) {
+            bool found = false;
+            for (const DomainLabelSetSpec& spec : default_domain_label_sets())
+                if (std::string(spec.name) == mapped) { found = true; break; }
+            CHECK(found);
+        }
     }
 
     platform::log_info("fitted_heads: %d passed, %d failed, %d skipped",

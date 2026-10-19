@@ -4,8 +4,9 @@
 //  The RUNTIME consumer for fitted ClassificationHead blobs.
 //
 //  tools/train_heads.py writes language_head.bin / vision_head.bin /
-//  audio_head.bin / trading_regime_head.bin / trading_head.bin from dumped
-//  h[E]. Until now NOTHING outside tests ever loaded them: the pipeline's
+//  vision_anomaly_head.bin / vision_candlestick_head.bin / audio_head.bin /
+//  trading_regime_head.bin / trading_head.bin from dumped h[E]. Until now
+//  NOTHING outside tests ever loaded them: the pipeline's
 //  classifier_ was init()-ed (seeded, untrained) and its distributions were
 //  well-formed but meaningless. This class closes that gap with the same
 //  fail-closed stance every head in this repo takes:
@@ -15,9 +16,14 @@
 //      registered blob, or a set the blob does not carry all return the head's
 //      own failure result (`domain = "<error: ...>"`, `top_k` empty). No
 //      uniform distribution, no fallback to the untrained head;
-//    * one bin per set family: "language.*" -> language_head.bin, etc. The
-//      mapping is explicit (trading.regime and trading.action live in
-//      DIFFERENT bins), so a set nobody mapped refuses instead of guessing.
+//    * explicit set->bin mapping, mirroring what tools/train_heads.py
+//      actually writes: "language.*" / "audio.*" are one bin per family, but
+//      vision fits are PER SET (vision.scene -> vision_head.bin,
+//      vision.anomaly -> vision_anomaly_head.bin, vision.candlestick ->
+//      vision_candlestick_head.bin) and trading splits two ways
+//      (trading.regime -> trading_regime_head.bin, trading.action ->
+//      trading_head.bin). A set the map does not name refuses instead of
+//      guessing a bin that cannot carry it.
 //
 //  The load path is ClassificationHead::load, which rebuilds label sets from
 //  the file (sets travel WITH the weights) and leaves the head NOT READY on
@@ -41,8 +47,10 @@ public:
     void set_heads_dir(const std::string& dir);
     const std::string& heads_dir() const { return heads_dir_; }
 
-    // Points at `dir` and eagerly attempts EVERY known classification bin now
-    // (language/vision/audio/trading_regime) instead of lazily on first use.
+    // Points at `dir` and eagerly attempts the family bins now
+    // (language/vision/audio/trading_regime) instead of lazily on first use;
+    // the per-set vision bins (vision_anomaly_head.bin,
+    // vision_candlestick_head.bin) load lazily with their set.
     // True when at least one blob loaded; false means nothing is fitted and
     // every classify() refuses (fail-closed — see the header top). Either way
     // the per-bin reasons land in error(), so an operator sees WHICH blob is
