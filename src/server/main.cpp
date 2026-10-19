@@ -50,6 +50,7 @@
 #include "omniseed/memory/memory.h"
 #include "omniseed/core/tensor.h"
 #include "omniseed/runtime/fitted_heads.h"
+#include "omniseed/runtime/sidecar_hub.h"
 #include "omniseed/server/ws.h"
 
 #ifndef _WIN32
@@ -439,25 +440,65 @@ document.getElementById('f').addEventListener('submit', async e => {
 LoraAdapter* server_lora = nullptr;
 std::string  server_lora_path;
 
-// Whisper-tiny ASR sidecar: loaded lazily on the first /asr request (most
-// deployments never call it — don't pay the 73 MB mmap at boot). Serialized
-// request loop makes the lazy init race-free. Decode-sidecar tensors are
-// optional: encoder-only sidecars answer with the documented fallback text.
+// Whisper-tiny ASR sidecar: T123b hot-swap governed — registered with the
+// SidecarHub, demand-mapped on the first /asr (most deployments never call
+// it), demand-REmapped after a pressure-unmap. The serialized request loop
+// makes hub access race-free (acquire -> transcribe -> release per request,
+// so the sidecar is users==0 between requests and eligible when RSS hits
+// the soft watermark; the hub polls platform::current_rss_bytes() BEFORE
+// each request — the HTTP loop IS the sampling point, no monitor thread).
+// Decode-sidecar tensors are optional: encoder-only sidecars answer with
+// the documented fallback text.
+SidecarHub server_sidecars;
+
+// Request-scoped alias: set by server_asr_ready(), released by
+// server_asr_done() at the end of the /asr branch. NEVER outlives one
+// request (the hub owns the object; this is a non-owning view).
 WhisperTiny* server_whisper = nullptr;
+void server_asr_done() {
+    server_sidecars.release("whisper");
+    server_whisper = nullptr;
+}
 
 bool server_asr_ready() {
-    if (server_whisper) return true;
-    server_whisper = new WhisperTiny();
-    if (!server_whisper->load("models/whisper-tiny-encoder.gguf")) {
-        platform::log_error("asr: whisper sidecar load failed: %s",
-                            server_whisper->error().c_str());
-        delete server_whisper;
-        server_whisper = nullptr;
+    static bool registered = [] {
+        SidecarHub::Spec spec;
+        spec.bytes_hint = 76445082;   // models/whisper-tiny-encoder.gguf
+        spec.load = [](std::string& err) -> std::shared_ptr<void> {
+            auto* w = new WhisperTiny();
+            if (!w->load("models/whisper-tiny-encoder.gguf")) {
+                err = w->error();
+                delete w;
+                return nullptr;
+            }
+            platform::log_info(
+                "asr: whisper sidecar loaded (decoder %s)",
+                w->decoder_loaded() ? "real" : "fallback");
+            return std::shared_ptr<void>(
+                w, [](void* q) { delete static_cast<WhisperTiny*>(q); });
+        };
+        std::string rerr;
+        const bool ok =
+            server_sidecars.register_spec("whisper", std::move(spec), rerr);
+        if (!ok) platform::log_error("asr: hub register failed: %s",
+                                      rerr.c_str());
+        return ok;
+    }();
+    if (!registered) return false;
+    // Pressure poll FIRST: an idle-previous-request sidecar may be unmap-
+    // eligible right now (freeing pages BEFORE this request possibly remaps).
+    const uint64_t zone = 0;
+    server_sidecars.on_rss_pressure(nullptr);
+    (void)zone;
+    std::string err;
+    const std::shared_ptr<void> hold = server_sidecars.acquire("whisper", err);
+    if (!hold) {
+        platform::log_error("asr: %s", err.c_str());
         return false;
     }
-    platform::log_info(
-        "asr: whisper sidecar loaded (decoder %s)",
-        server_whisper->decoder_loaded() ? "real" : "fallback");
+    // Hand the RAW pointer to the request; release() happens in the /asr
+    // branch after transcribe() so users>0 for the whole request span.
+    server_whisper = static_cast<WhisperTiny*>(hold.get());
     return true;
 }
 
@@ -1205,6 +1246,7 @@ int main(int argc, char** argv) {
                     if (!base64_decode(json_field(body, "wav_b64"), wav)) {
                         respond(client,
                                 "{\"error\":\"invalid base64 payload\"}");
+                        server_asr_done();   // T123b: release before continue
                         close_socket(client);
                         continue;
                     }
@@ -1243,6 +1285,7 @@ int main(int argc, char** argv) {
                                 std::to_string(secs) + "}");
                     }
                 }
+                server_asr_done();   // T123b: drop hub ref at request end
             }
         } else if (path.compare(0, 3, "/ws") == 0 &&
                    (path.size() == 3 || path[3] == '?')) {

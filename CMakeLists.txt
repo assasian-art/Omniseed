@@ -57,6 +57,7 @@ set(OMNISEED_CORE_SOURCES
     # audio/trading .bins from tools/train_heads.py): lazy load, fail-closed
     # refusal — nothing loads those files without this.
     src/runtime/fitted_heads.cpp
+    src/runtime/sidecar_hub.cpp
     # "One backbone, multiple heads": the shared heads vocabulary, the router
     # that decides which heads run, and the per-head readouts of h[E].
     src/heads.cpp
@@ -928,6 +929,23 @@ if(OMNISEED_BUILD_TESTS)
     add_test(NAME omniseed_int4_ffn COMMAND omniseed_int4_ffn
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(omniseed_int4_ffn PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+    # T123b sidecar hub: refcount math (incl. double-release clamp),
+    # pressure-unmap only for zero-user >=8MB entries, zone 0 never remaps,
+    # loader-failure purge + retry, real-file leg (whisper, gated).
+    add_executable(omniseed_sidecar_hub tests/test_sidecar_hub.cpp)
+    target_include_directories(omniseed_sidecar_hub PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(omniseed_sidecar_hub PRIVATE omniseed_core)
+    if(MSVC)
+        target_compile_options(omniseed_sidecar_hub PRIVATE /W4 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(omniseed_sidecar_hub PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME omniseed_sidecar_hub COMMAND omniseed_sidecar_hub
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(omniseed_sidecar_hub PRIVATE _CRT_SECURE_NO_WARNINGS)
 
     # The language domain, in C++ with no model and no Python: UTF-8 script
     # detection (Bengali from its own Unicode block), the tokenizer, intent
