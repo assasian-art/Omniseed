@@ -253,7 +253,10 @@ def main(argv=None):
         for s, pix, label in rows:
             name = "chart_%04d.ppm" % s
             write_ppm(os.path.join(args.out_dir, name), pix)
-            f.write("%s\tvision.candlestick\t%s\n" % (name, label))
+            # col2 = LABEL (dump_hidden::read_modality_manifest reads col2 as
+            # the label; header col2 = set-name is correct). col3 = marker
+            # word, mirroring make_vision_anomaly's <label><TAB><kind> shape.
+            f.write("%s\t%s\tdirection\n" % (name, label))
 
     with open(os.path.join(args.out_dir, "LICENCE.txt"), "w",
               encoding="utf-8", newline="\n") as f:

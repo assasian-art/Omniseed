@@ -9,7 +9,8 @@
 #    C. fail-closed      — missing CSV -> 2; bad header -> 2; sentinel
 #                           present -> 2 without --force; param change after
 #                           a sentinel -> STALE refusal -> 2 (even --force)
-#    D. manifest shape   — '#' comment header, path<TAB>set<TAB>label rows,
+#    D. manifest shape   — '#' comment header, path<TAB>label<TAB>direction rows
+#                           (col2=label: dump_hidden reads col2 as label),
 #                           PPMs decode as P6 32x32 with 3072 pixel bytes
 #  Also REPORTS the up/down histogram (never force-balanced).
 #  Plain script: exits nonzero on first failure.  Stdlib only.
@@ -91,8 +92,10 @@ def main():
               "comment header lines all '#' (dump_hidden vision contract)")
         rows = [ln.split("\t") for ln in lines[hdr_i[0] + 1:] if ln]
         check(len(rows) == n, "manifest has n=%d rows (got %d)" % (n, len(rows)))
-        check(all(len(rw) == 3 and rw[1] == "vision.candlestick" for rw in rows),
-              "rows are path<TAB>vision.candlestick<TAB>direction (3 cols)")
+        check(all(len(rw) == 3 and rw[1] in ("up", "down") and rw[2] == "direction"
+                  for rw in rows),
+              "rows are path<TAB>{up,down}<TAB>direction — col2 is the LABEL "
+              "(dump_hidden reads col2 as label) (3 cols)")
         ppm_bad = []
         for rw in rows:                       # bare filenames, PPM decodes
             p = os.path.join(d1, rw[0])
@@ -108,8 +111,8 @@ def main():
             s = int(rw[0][len("chart_"):-len(".ppm")])
             want = "up" if closes[s + window] > closes[s + window - 1] else (
                 "down" if closes[s + window] < closes[s + window - 1] else "tie")
-            if rw[2] != want:
-                bad.append((rw[0], rw[2], want))
+            if rw[1] != want:
+                bad.append((rw[0], rw[1], want))
         check(not bad, "labels = independent next-bar recompute (%s)" % bad[:3])
 
         # --- C. fail-closed ------------------------------------------------
@@ -137,7 +140,7 @@ def main():
         # --- histogram report ----------------------------------------------
         hist = {"up": 0, "down": 0}
         for rw in rows:
-            hist[rw[2]] += 1
+            hist[rw[1]] += 1
         print("HISTOGRAM (n=%d, window=%d, stride=%d): up=%d down=%d  "
               "(NOT force-balanced)"
               % (n, window, stride, hist["up"], hist["down"]))
