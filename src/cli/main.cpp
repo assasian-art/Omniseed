@@ -1369,6 +1369,7 @@ struct Session {
     std::string assistant_lora; // optional LoRA sidecar path
     std::string eval_file;      // ppl: corpus file (else --prompt text)
     int32_t    eval_tokens = 2048;  // ppl: token budget
+    std::string agree_with;     // ppl: second GGUF — report top-1 agreement
     std::vector<std::string> stop_strings;   // --stop (repeatable)
 
     // System-1 decision head ("two heads, one brain"). Off by default so the
@@ -1620,8 +1621,31 @@ int cmd_ppl(Session& s) {
     s.model->init_state(st);
     Tensor logits("logits", {s.model->config().n_vocab}, DType::F32);
 
+    // T121b agreement probe: a SECOND model evaluated on the same teacher-
+    // forced stream; positions where argmax differs are counted. Off by
+    // default — the probe must not change ppl of the primary model.
+    std::unique_ptr<RwkvModel> ref;
+    RwkvState ref_st;
+    Tensor ref_logits;
+    if (!s.agree_with.empty()) {
+        ref = std::make_unique<RwkvModel>();
+        if (!ref->load(s.agree_with)) {
+            std::printf("agree-with model load failed: %s\n",
+                        ref->error().c_str());
+            return 1;
+        }
+        if (ref->config().n_vocab != s.model->config().n_vocab) {
+            std::printf("agree-with vocab mismatch (%d vs %d)\n",
+                        ref->config().n_vocab, s.model->config().n_vocab);
+            return 1;
+        }
+        ref->init_state(ref_st);
+        ref_logits = Tensor("ref_logits", {ref->config().n_vocab}, DType::F32);
+    }
+
     double nll = 0.0;
     int64_t n_pred = 0;
+    int64_t agree_same = 0, agree_total = 0;
     int32_t prev = ids[0];
     const auto t0 = platform::now_ms();
     for (size_t i = 1; i < ids.size(); ++i) {
@@ -1629,13 +1653,24 @@ int cmd_ppl(Session& s) {
         const int32_t tgt = ids[i];
         const float* l = logits.f32();
         float mx = l[0];
+        int32_t argmax = 0;
         for (int32_t v = 1; v < s.model->config().n_vocab; ++v)
-            if (l[v] > mx) mx = l[v];
+            if (l[v] > mx) { mx = l[v]; argmax = v; }
         double sum = 0.0;
         for (int32_t v = 0; v < s.model->config().n_vocab; ++v)
             sum += std::exp(static_cast<double>(l[v] - mx));
         nll -= std::log(std::exp(static_cast<double>(l[tgt] - mx)) / sum);
         ++n_pred;
+        if (ref) {
+            ref->forward(prev, ref_st, ref_logits);
+            const float* rl = ref_logits.f32();
+            float rmx = rl[0];
+            int32_t rarg = 0;
+            for (int32_t v = 1; v < ref->config().n_vocab; ++v)
+                if (rl[v] > rmx) { rmx = rl[v]; rarg = v; }
+            if (argmax == rarg) ++agree_same;
+            ++agree_total;
+        }
         prev = tgt;
     }
     const double ms = platform::now_ms() - t0;
@@ -1647,6 +1682,14 @@ int cmd_ppl(Session& s) {
                 ppl, ms,
                 static_cast<double>(n_pred) / (ms / 1000.0),
                 static_cast<double>(platform::peak_rss_bytes()) / 1048576.0);
+    if (ref) {
+        std::printf("top1-agreement vs %s: %lld/%lld = %.4f\n",
+                    s.agree_with.c_str(),
+                    static_cast<long long>(agree_same),
+                    static_cast<long long>(agree_total),
+                    agree_total ? static_cast<double>(agree_same) /
+                                  static_cast<double>(agree_total) : 0.0);
+    }
     return 0;
 }
 
@@ -1794,6 +1837,7 @@ int main(int argc, char** argv) {
         else if (a == "--calibration-min-acc" && i + 1 < argc)
             s.calibration_min_acc = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--eval-file" && i + 1 < argc) s.eval_file = argv[++i];
+        else if (a == "--agree-with" && i + 1 < argc) s.agree_with = argv[++i];
         else if (a == "--eval-tokens" && i + 1 < argc)
             s.eval_tokens = std::atoi(argv[++i]);
         // §47 dream --nightly

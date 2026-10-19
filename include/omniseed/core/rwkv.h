@@ -236,6 +236,14 @@ private:
     Tensor head_scales_;         // per-row fp32 [n_vocab] (ternary head)
     float  head_scale_ = 1.0f;   // legacy scalar fallback
     bool   head_ternary_ = false;
+    // T121b clustered head (RWKV-Lite route a): logits[v] = centroid[code[v]] . x
+    // centroid [K,E] fp32 (owned — converted from the stored fp16 at load,
+    // decode needs fp32), code [V] I32 zero-copy view. Present only when the
+    // GGUF carries head.centroid+head.code INSTEAD of head.weight (mutually
+    // exclusive by construction: load refuses a file with both).
+    bool          head_clustered_ = false;
+    Tensor        head_centroid_;                  // owned fp32 [K,E]
+    Tensor        head_code_;                      // I32 view [V]
 
     bool valid_ = false;
     std::string error_;

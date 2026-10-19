@@ -229,12 +229,63 @@ bool RwkvModel::load_weights(const GgufLoader& gg) {
                          kk.f32()[0], kk.f32()[1], kk.f32()[2]);
     }
 
-    // Output head: ternary (preferred) or fp16 fallback.
-    if (!gg.has_tensor("head.weight")) {
-        error_ = "missing tensor: head.weight";
+    // Output head: ternary (preferred) or fp16 fallback. T121b: a clustered
+    // head (head.centroid + head.code, no head.weight) is an equally-valid
+    // layout — chosen at load by which tensors are present, fail-closed.
+    const bool have_hw = gg.has_tensor("head.weight");
+    const bool have_cl = gg.has_tensor("head.centroid") &&
+                         gg.has_tensor("head.code");
+    if (!have_hw && !have_cl) {
+        error_ = "missing head: need head.weight or head.centroid+head.code";
         return false;
     }
-    {
+    if (have_hw && have_cl) {
+        error_ = "head: head.weight AND head.centroid both present — "
+                 "ambiguous layout, refusing";
+        return false;
+    }
+    if (have_cl) {
+        // T121b clustered head: centroids [K,E] fp16 -> owned fp32 (decode
+        // is a gather+dot over V rows; fp32 math, no per-step conversion),
+        // codes [V] I32 zero-copy. Fail-closed on every shape mismatch.
+        Tensor c = gg.tensor("head.centroid");
+        Tensor i = gg.tensor("head.code");
+        if (c.dtype() != DType::F16) {
+            error_ = "head.centroid must be fp16";
+            return false;
+        }
+        if (i.dtype() != DType::I32) {
+            error_ = "head.code must be int32";
+            return false;
+        }
+        const int64_t K = c.dim(0), Ec = c.dim(1), Vc = i.dim(0);
+        if (Ec != E || K <= 0 || K > Vc) {
+            error_ = "head.centroid/head.code shape refused (K/E/V)";
+            return false;
+        }
+        if (Vc > cfg_.n_vocab) {
+            error_ = "head.code longer than vocab";
+            return false;
+        }
+        head_centroid_ = Tensor("head.centroid", {K, E}, DType::F32);
+        float* cd = head_centroid_.f32();
+        const uint16_t* cs = c.f16();
+        const int64_t n = K * E;
+        for (int64_t j = 0; j < n; ++j) cd[j] = half_to_float(cs[j]);
+        head_code_ = Tensor("head.code", {Vc}, DType::I32,
+                            const_cast<void*>(i.data()));
+        // codes must index a real cluster — a single OOB read at decode
+        // would be silent memory corruption, so scan ONCE at load.
+        const int32_t* cc = head_code_.i32();
+        for (int64_t v = 0; v < Vc; ++v)
+            if (cc[v] < 0 || cc[v] >= K) {
+                error_ = "head.code contains out-of-range cluster id";
+                return false;
+            }
+        head_clustered_ = true;
+        head_ = Tensor();      // no head.weight — forward() branches on flag
+        head_scales_ = Tensor();
+    } else {
         Tensor t = gg.tensor("head.weight");
         if (t.dtype() == DType::TERNARY) {
             head_ternary_ = true;
@@ -806,7 +857,8 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits,
                     static_cast<size_t>(E) * sizeof(float));
     }
 
-    const int64_t V_head = head_.dim(0);
+    const int64_t V_head = head_clustered_ ? head_code_.dim(0)
+                                           : head_.dim(0);
     const int64_t V_out  = std::min<int64_t>(logits.numel(), V_head);
     logits.zero();
     const double p_head = dbg_prof() ? platform::now_ms() : 0.0;
@@ -824,6 +876,21 @@ void RwkvModel::forward(int32_t token, RwkvState& st, Tensor& logits,
         // fp16 head converted to per-row i8 at load time (see load_weights).
         bitnet::bitlinear_forward_i8(head_.i8(), head_scales_.f32(),
                                      xl3.f32(), logits.f32(), V_out, E);
+    } else if (head_clustered_) {
+        // T121b clustered head: logits[v] = centroid[code[v]] . x. Gather-
+        // then-dot (rows repeat across vocab — dedup via the code array is
+        // possible but this scalar loop is the correctness baseline; an AVX2
+        // gather path only lands if the gate adopts).
+        const float* cd = head_centroid_.f32();
+        const int32_t* cc = head_code_.i32();
+        const float* xv = xl3.f32();
+        float* lg = logits.f32();
+        for (int64_t v = 0; v < V_out; ++v) {
+            const float* row = cd + static_cast<int64_t>(cc[v]) * E;
+            float acc = 0.0f;
+            for (int64_t e = 0; e < E; ++e) acc += row[e] * xv[e];
+            lg[v] = acc;
+        }
     }
     if (dbg_prof()) {
         ProfSections& p = prof();
